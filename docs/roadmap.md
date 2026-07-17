@@ -165,11 +165,11 @@ Phase 0          Phase 1          Phase 2          Phase 3          Phase 4     
 
 | 编号 | 技术债 | 来源阶段 | 处理阶段 | 优先级 |
 |------|--------|----------|----------|--------|
-| TD-001 | Token 计算可能不精确 | Phase 2 | Phase 5 | 中 |
-| TD-002 | Memory 向量索引选型未定 | Phase 3 | Phase 5 | 中 |
-| TD-003 | Plugin 在 Windows 上 Go plugin 限制 | Phase 4 | Phase 5 | 高 |
-| TD-004 | SSE 断线重连机制需完善 | Phase 2 | Phase 5 | 低 |
-| TD-005 | Config 热更新与运行状态一致性 | Phase 1 | Phase 5 | 中 |
+| DEBT-001 | Token 计算可能不精确 | Phase 2 | Phase 5 | 中 |
+| DEBT-002 | Memory 向量索引选型未定 | Phase 3 | Phase 5 | 中 |
+| DEBT-003 | Plugin 在 Windows 上 Go plugin 限制 | Phase 4 | Phase 5 | 高 |
+| DEBT-004 | SSE 断线重连机制需完善 | Phase 2 | Phase 5 | 低 |
+| DEBT-005 | Config 热更新与运行状态一致性 | Phase 1 | Phase 5 | 中 |
 
 ---
 

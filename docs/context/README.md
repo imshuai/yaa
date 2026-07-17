@@ -237,7 +237,7 @@ Agent → Provider（最终回复）
 | [config-ref.md](config-ref.md) | 配置参考 — 全局 Context 策略、Agent 级覆盖、Token 预算分配 |
 | [errors.md](errors.md) | 错误处理 — 错误分类、降级策略、重试 |
 | [observability.md](observability.md) | 可观测性 — 日志、指标、Remote API 事件 |
-| [decisions.md](decisions.md) | 设计决策（CD-001 ~ CD-008）+ 模块关系 |
+| [decisions.md](decisions.md) | 设计决策（CX-001 ~ CX-008）+ 模块关系 |
 | [checklist.md](checklist.md) | 实现检查清单 |
 
 ---

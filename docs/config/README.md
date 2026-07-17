@@ -77,7 +77,7 @@
 | [hot-reload.md](hot-reload.md) | 配置热更新 — 文件监听、变更传播、原子替换、Go 实现 |
 | [formats.md](formats.md) | 多格式支持 — YAML / TOML / JSON 解析、自动检测、格式转换 |
 | [migration.md](migration.md) | 配置迁移与兼容 — 版本化、迁移工具、废弃策略、向后兼容 |
-| [decisions.md](decisions.md) | 设计决策（CD-001 ~ CD-0NN）+ 模块关系 |
+| [decisions.md](decisions.md) | 设计决策（CF-001 ~ CF-008）+ 模块关系 |
 | [checklist.md](checklist.md) | 实现检查清单 |
 
 ---

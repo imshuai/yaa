@@ -436,12 +436,12 @@ func (sp *StaticPlanner) Plan(ctx context.Context, task string, ag *agent.Agent)
 
 | 编号 | 决策 | 说明 |
 |------|------|------|
-| PD-001 | Planner 作为独立层 | 不嵌入 Agent，可独立替换 |
-| PD-002 | LLM 驱动规划 | 通用性强，适配任意任务类型 |
-| PD-005 | Plan 挂载到 Session | 支持跨轮次执行和崩溃恢复 |
-| PD-006 | DAG 依赖 | 支持并行执行 |
-| PD-007 | 接口仅含 `Plan` 方法 | 规划与执行分离 |
-| PD-009 | `StepSkipped` 状态 | 区分依赖失败与自身失败 |
+| PL-001 | Planner 作为独立层 | 不嵌入 Agent，可独立替换 |
+| PL-002 | LLM 驱动规划 | 通用性强，适配任意任务类型 |
+| PL-005 | Plan 挂载到 Session | 支持跨轮次执行和崩溃恢复 |
+| PL-006 | DAG 依赖 | 支持并行执行 |
+| PL-007 | 接口仅含 `Plan` 方法 | 规划与执行分离 |
+| PL-009 | `StepSkipped` 状态 | 区分依赖失败与自身失败 |
 
 ---
 

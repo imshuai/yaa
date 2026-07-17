@@ -167,5 +167,5 @@ Level 3: Bundled Resources（按需加载，无限制）
 | [config.md](config.md) | 配置参考 — 全局配置、Agent 级别、Skill 级别 |
 | [errors.md](errors.md) | 错误处理与重试策略 |
 | [observability.md](observability.md) | 可观测性 — 日志、指标、Remote API 事件 |
-| [decisions.md](decisions.md) | 设计决策（SD-001 ~ SD-NNN） |
+| [decisions.md](decisions.md) | 设计决策（SK-001 ~ SK-013） |
 | [checklist.md](checklist.md) | 实现检查清单 |

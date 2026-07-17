@@ -293,6 +293,7 @@ type ModelConfig struct {
 | `openrouter` | OpenRouter 聚合 | OpenAI 兼容 |
 | `qwen` | 阿里通义千问 | OpenAI 兼容 |
 | `deepseek` | DeepSeek | OpenAI 兼容 |
+| `custom` | 自定义 Provider | 由插件实现 |
 
 ### 5.2 OpenAI 兼容策略
 
@@ -638,37 +639,37 @@ func RegisterProvider(typeName string, factory ProviderFactory)
 
 ## 12. 设计决策
 
-### PD-001: 统一接口而非多接口
+### PV-001: 统一接口而非多接口
 
 - **决策**：所有 Provider 实现同一个 `Provider` 接口
 - **理由**：上层调用方无需关心具体厂商，切换 Provider 零成本
 
-### PD-002: OpenAI 兼容 Provider 复用同一实现
+### PV-002: OpenAI 兼容 Provider 复用同一实现
 
 - **决策**：兼容 OpenAI API 的厂商（DeepSeek、Qwen 等）使用 `type: "openai"` + 不同 `base_url`
 - **理由**：避免重复代码，减少维护成本，新增兼容厂商只需配置
 
-### PD-003: 流式通过 channel 而非回调
+### PV-003: 流式通过 channel 而非回调
 
 - **决策**：`StreamChat` 返回 `<-chan ChatChunk`
 - **理由**：channel 与 Go 并发模型一致，支持 select + ctx 取消，比回调更自然
 
-### PD-004: 非流式不作为流式的简单包装
+### PV-004: 非流式不作为流式的简单包装
 
 - **决策**：`Chat` 独立实现，而非 `StreamChat` 的聚合
 - **理由**：部分厂商非流式 API 有额外优化（如批量 Token 统计），且非流式更简单高效
 
-### PD-005: Models 动态查询 + 静态配置双模式
+### PV-005: Models 动态查询 + 静态配置双模式
 
 - **决策**：`Models()` 优先返回配置中声明的模型列表，未配置时动态查询
 - **理由**：本地模型（Ollama）适合动态查询，云服务（OpenAI）适合静态声明以减少 API 调用
 
-### PD-006: 重试在 Provider 层而非 Agent 层
+### PV-006: 重试在 Provider 层而非 Agent 层
 
 - **决策**：重试逻辑内置在 Provider 实现 / Manager 中
 - **理由**：重试与具体厂商的限流策略相关，Provider 层最了解如何正确重试
 
-### PD-007: reasoning_content 作为一等公民
+### PV-007: reasoning_content 作为一等公民
 
 - **决策**：统一数据模型中原生支持 `reasoning_content`（思维链/深度思考内容）
 - **理由**：DeepSeek、GLM、MiniMax 等主流国产模型均已支持深度思考模式，思维链内容是 Agent 决策的重要上下文，不能丢弃或当作普通文本处理

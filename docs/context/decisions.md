@@ -7,7 +7,7 @@
 
 ## 9. 设计决策
 
-### CD-001: Context Manager 作为独立层，不内嵌于 Session
+### CX-001: Context Manager 作为独立层，不内嵌于 Session
 
 **决策：** Context 管理作为独立模块存在，而非 Session 的内部逻辑。
 
@@ -21,7 +21,7 @@
 
 ---
 
-### CD-002: Token 计算委托给 Provider，不自行实现分词器
+### CX-002: Token 计算委托给 Provider，不自行实现分词器
 
 **决策：** Token 计数由 Provider 层提供估算能力，Context Manager 不内置分词器。
 
@@ -35,7 +35,7 @@
 
 ---
 
-### CD-003: 默认策略为滑动窗口 + 摘要压缩，可插拔扩展
+### CX-003: 默认策略为滑动窗口 + 摘要压缩，可插拔扩展
 
 **决策：** 内置两种策略——滑动窗口（Sliding Window）和摘要压缩（Summary Compression），通过接口可插拔扩展自定义策略。
 
@@ -49,7 +49,7 @@
 
 ---
 
-### CD-004: System Prompt 永不截断，优先级最高
+### CX-004: System Prompt 永不截断，优先级最高
 
 **决策：** System Prompt（含 Skill Prompt）享有最高保留优先级，在任何截断/压缩策略中都不被移除。
 
@@ -62,7 +62,7 @@
 
 ---
 
-### CD-005: Tool 结果按角色分级保留
+### CX-005: Tool 结果按角色分级保留
 
 **决策：** Tool Call 与 Tool Result 消息的保留优先级低于用户消息，高于普通助手消息。
 
@@ -76,7 +76,7 @@
 
 ---
 
-### CD-006: 压缩使用 LLM 异步执行，不阻塞主对话流
+### CX-006: 压缩使用 LLM 异步执行，不阻塞主对话流
 
 **决策：** 摘要压缩通过调用 LLM 异步生成，不阻塞当前对话轮次；压缩完成前使用截断策略兜底。
 
@@ -90,7 +90,7 @@
 
 ---
 
-### CD-007: Context 构建结果缓存，按消息指纹命中
+### CX-007: Context 构建结果缓存，按消息指纹命中
 
 **决策：** 构建后的 Context 以 Session 最后一条消息的 ID 为指纹缓存，相同指纹直接复用。
 
@@ -103,7 +103,7 @@
 
 ---
 
-### CD-008: 支持 Provider 级别的 Token 预算配置
+### CX-008: 支持 Provider 级别的 Token 预算配置
 
 **决策：** 每个 Provider 可配置 `context_budget`（预留 Token 给输出），Context Manager 构建时读取目标 Provider 的预算值。
 

@@ -234,7 +234,7 @@ if ext, ok := mem.(MemoryExtended); ok {
 | [config-ref.md](config-ref.md) | 配置参考 — 全局配置、Agent 级别、存储后端配置 |
 | [errors.md](errors.md) | 错误处理 — 错误分类、传递、降级策略 |
 | [observability.md](observability.md) | 可观测性 — 日志、指标、Remote API 事件、健康检查 |
-| [decisions.md](decisions.md) | 设计决策（MD-001 ~ MD-NNN）+ 模块关系 |
+| [decisions.md](decisions.md) | 设计决策（MM-001 ~ MM-008）+ 模块关系 |
 | [checklist.md](checklist.md) | 实现检查清单 |
 
 ---

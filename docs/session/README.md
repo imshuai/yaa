@@ -20,7 +20,7 @@ Session 是 Yaa! 中**一次完整交互上下文**的管理单元。
 
 一个 Session 封装了：
 - **消息历史** — 完整的多轮对话记录（user / assistant / tool）
-- **状态机** — Active / Paused / Closed 三态生命周期
+- **状态机** — Created / Active / Paused / Closed 四态生命周期
 - **隔离边界** — Session 之间状态完全隔离
 - **持久化单元** — 可保存到 Storage，重启后恢复
 - **元数据** — 自定义键值对，支持业务扩展
@@ -36,7 +36,7 @@ Yaa! 的 Session 系统遵循以下设计原则：
 | **可恢复** | Session 可持久化，Runtime 重启后自动恢复 |
 | **多 Session 并发** | 一个 Agent 可同时管理多个 Session，各 Session 间并行 |
 | **Remote API 驱动** | Session 的创建、查询、恢复、关闭均通过 Remote API |
-| **生命周期明确** | 三态状态机，状态转换有清晰的前置条件和副作用 |
+| **生命周期明确** | 四态状态机（Created / Active / Paused / Closed），状态转换有清晰的前置条件和副作用 |
 | **元数据可扩展** | 通过 `Metadata` 字段支持业务自定义数据，无需修改核心结构 |
 
 ### 1.3 核心特性

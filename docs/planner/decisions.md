@@ -9,7 +9,7 @@
 
 > 完整的设计决策列表，包含架构层面和实现层面的决策。
 
-### PD-001: Planner 作为独立层，不嵌入 Agent
+### PL-001: Planner 作为独立层，不嵌入 Agent
 
 **决策：** Planner 作为 Runtime 的独立模块层存在，而非 Agent 内部逻辑。
 
@@ -22,7 +22,7 @@
 
 ---
 
-### PD-002: 默认使用 LLM 驱动规划
+### PL-002: 默认使用 LLM 驱动规划
 
 **决策：** 默认规划器通过 Prompt 让 LLM 输出结构化执行计划，而非使用硬编码规则。
 
@@ -35,7 +35,7 @@
 
 ---
 
-### PD-003: Plan 以 Step 为最小执行单元
+### PL-003: Plan 以 Step 为最小执行单元
 
 **决策：** Plan 由有序的 Step 组成，每个 Step 是最小执行单元（Tool 调用 / Skill 触发 / LLM 推理）。
 
@@ -48,7 +48,7 @@
 
 ---
 
-### PD-004: 支持自动跳过规划
+### PL-004: 支持自动跳过规划
 
 **决策：** 当任务被判定为简单任务时，自动跳过 Planner，直接进入 Agent Loop。
 
@@ -61,7 +61,7 @@
 
 ---
 
-### PD-005: Plan 挂载到 Session 支持恢复
+### PL-005: Plan 挂载到 Session 支持恢复
 
 **决策：** 生成的 Plan 挂载到 Session 而非 Agent，支持跨轮次执行和崩溃恢复。
 
@@ -74,7 +74,7 @@
 
 ---
 
-### PD-006: Step 依赖使用 DAG 而非线性列表
+### PL-006: Step 依赖使用 DAG 而非线性列表
 
 **决策：** Step 之间通过 `Depends []string` 声明依赖，形成有向无环图（DAG），而非严格线性顺序。
 
@@ -87,7 +87,7 @@
 
 ---
 
-### PD-007: Planner 接口仅含 `Plan` 方法
+### PL-007: Planner 接口仅含 `Plan` 方法
 
 **决策：** Planner 接口仅定义 `Plan(ctx, task, agent)` 方法，执行职责分离到 Executor。
 
@@ -100,7 +100,7 @@
 
 ---
 
-### PD-008: Step 使用 `map[string]any` 作为 Input
+### PL-008: Step 使用 `map[string]any` 作为 Input
 
 **决策：** Step 的 Input 字段类型为 `map[string]any`，兼容不同 Tool/Skill 的异构参数。
 
@@ -112,7 +112,7 @@
 
 ---
 
-### PD-009: 新增 `StepSkipped` 状态
+### PL-009: 新增 `StepSkipped` 状态
 
 **决策：** Step 状态枚举新增 `Skipped`，用于依赖失败时明确标记，区别于 `Failed`。
 
@@ -124,7 +124,7 @@
 
 ---
 
-### PD-010: Plan 携带 Metadata
+### PL-010: Plan 携带 Metadata
 
 **决策：** Plan 结构体包含 `Metadata map[string]any` 字段，支持扩展信息。
 

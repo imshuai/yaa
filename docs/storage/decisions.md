@@ -7,7 +7,7 @@
 
 ## 9. 设计决策
 
-### SD-001: SQLite 为默认存储后端
+### ST-001: SQLite 为默认存储后端
 
 **决策：** 生产环境默认使用 SQLite（modernc.org/sqlite 纯 Go 实现），而非 BoltDB 或其他方案。
 
@@ -21,7 +21,7 @@
 
 ---
 
-### SD-002: TTL 在接口层面原生支持
+### ST-002: TTL 在接口层面原生支持
 
 **决策：** `Set(key, value, ttl...)` 将 TTL 作为接口签名的一部分，而非外层包装。
 
@@ -34,7 +34,7 @@
 
 ---
 
-### SD-003: 上层只依赖 Storage 接口，不绑定实现
+### ST-003: 上层只依赖 Storage 接口，不绑定实现
 
 **决策：** Session、Memory、Config 等模块只依赖 `Storage` 接口，具体后端通过配置切换。
 
@@ -47,7 +47,7 @@
 
 ---
 
-### SD-004: 前缀扫描通过 Keys(prefix) 实现
+### ST-004: 前缀扫描通过 Keys(prefix) 实现
 
 **决策：** 提供 `Keys(prefix string)` 方法支持按命名空间批量查询，而非全量 `Keys()` 或复杂查询。
 
@@ -60,7 +60,7 @@
 
 ---
 
-### SD-005: 可选接口分离 Closer 和 Stats
+### ST-005: 可选接口分离 Closer 和 Stats
 
 **决策：** `Close()` 和 `Stats()` 不放入核心 `Storage` 接口，而是作为可选接口（`Closer`、`Stats`）。
 

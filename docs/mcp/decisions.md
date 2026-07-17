@@ -7,7 +7,7 @@
 
 ## 设计决策
 
-### MD-001: MCP 作为双角色组件——Server 与 Client 并存
+### MC-001: MCP 作为双角色组件——Server 与 Client 并存
 
 **决策：** Yaa! 同时实现 MCP Server 和 MCP Client 两种角色，统一由 MCP Manager 管理。
 
@@ -21,7 +21,7 @@
 
 ---
 
-### MD-002: 传输层默认 stdio，可选 SSE/HTTP
+### MC-002: 传输层默认 stdio，可选 SSE/HTTP
 
 **决策：** MCP Client 连接外部 Server 时默认使用 stdio 传输，同时支持 SSE（Server-Sent Events）和 Streamable HTTP 传输。MCP Server 对外暴露时默认使用 stdio，可选 SSE/HTTP。
 
@@ -35,7 +35,7 @@
 
 ---
 
-### MD-003: 外部 MCP Tool 统一映射为 Yaa! Tool
+### MC-003: 外部 MCP Tool 统一映射为 Yaa! Tool
 
 **决策：** 外部 MCP Server 暴露的 Tool，经 MCP Client 发现后，统一映射为 Yaa! 内部 Tool 格式，注册到 Tool Manager。
 
@@ -48,7 +48,7 @@
 
 ---
 
-### MD-004: Tool 名称使用命名空间前缀防冲突
+### MC-004: Tool 名称使用命名空间前缀防冲突
 
 **决策：** 外部 MCP Tool 映射到 Yaa! 时，使用 `{server_name}.{tool_name}` 格式的命名空间前缀，防止不同 Server 之间的 Tool 名称冲突。
 
@@ -61,7 +61,7 @@
 
 ---
 
-### MD-005: MCP Server 连接失败采用降级策略，不阻断启动
+### MC-005: MCP Server 连接失败采用降级策略，不阻断启动
 
 **决策：** MCP Client 连接外部 Server 失败时，记录错误并跳过该 Server，不阻断 Runtime 启动和其他 Server 的连接。
 
@@ -74,7 +74,7 @@
 
 ---
 
-### MD-006: MCP Server 对外暴露的 Tool 可选择性地声明
+### MC-006: MCP Server 对外暴露的 Tool 可选择性地声明
 
 **决策：** Yaa! 作为 MCP Server 时，不强制暴露全部 Tool，用户可在配置中选择性地声明对外暴露的 Tool 列表。
 
@@ -87,7 +87,7 @@
 
 ---
 
-### MD-007: MCP Resource 和 Prompt 暂不映射，优先支持 Tool
+### MC-007: MCP Resource 和 Prompt 暂不映射，优先支持 Tool
 
 **决策：** MVP 阶段仅实现 MCP Tool 的双向映射，MCP Resource（资源）和 MCP Prompt（提示模板）暂不支持。
 
@@ -100,7 +100,7 @@
 
 ---
 
-### MD-008: MCP Client 连接管理使用连接池 + 心跳检测
+### MC-008: MCP Client 连接管理使用连接池 + 心跳检测
 
 **决策：** MCP Client 为每个外部 Server 维护一个持久连接，通过定期心跳（ping）检测连接健康状态，断线自动重连。
 

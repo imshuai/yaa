@@ -7,7 +7,7 @@
 
 ## 9. 设计决策
 
-### SD-001: Skill 以文件目录组织，不以代码注册
+### SK-001: Skill 以文件目录组织，不以代码注册
 
 **决策：** Skill 以文件系统目录 + SKILL.md 的形式组织，而非通过代码 `Register()` 注册。
 
@@ -21,7 +21,7 @@
 
 ---
 
-### SD-002: Skill 的核心是 Prompt，不是代码
+### SK-002: Skill 的核心是 Prompt，不是代码
 
 **决策：** Skill 的核心能力来自 SKILL.md 中的 Prompt（领域知识），而非可执行代码。
 
@@ -35,7 +35,7 @@
 
 ---
 
-### SD-003: 三级渐进式加载
+### SK-003: 三级渐进式加载
 
 **决策：** Skill 采用三级加载：Metadata（始终在 Context）→ Body（触发时加载）→ Resources（按需加载）。
 
@@ -48,7 +48,7 @@
 
 ---
 
-### SD-004: Skill 触发使用 Function Call 模式
+### SK-004: Skill 触发使用 Function Call 模式
 
 **决策：** 默认使用 Function Call 模式（将 Skill 作为 `use_skill` Function 暴露给 LLM），对不支持的 Provider 回退到文本匹配。
 
@@ -61,7 +61,7 @@
 
 ---
 
-### SD-005: Skill 声明 Tool 依赖但不直接调用
+### SK-005: Skill 声明 Tool 依赖但不直接调用
 
 **决策：** Skill 在 frontmatter 中声明 `tools` 依赖，但不直接调用 Tool。Tool 调用由 LLM 在 Skill Prompt 指导下自主决策。
 
@@ -74,7 +74,7 @@
 
 ---
 
-### SD-006: 支持 Skill 嵌套但限制深度
+### SK-006: 支持 Skill 嵌套但限制深度
 
 **决策：** Skill 可声明依赖其他 Skill（`skills` 字段），最大嵌套深度默认 3 层，禁止循环依赖。
 
@@ -87,7 +87,7 @@
 
 ---
 
-### SD-007: Skill 专属 Tool 支持声明式和编译式两种
+### SK-007: Skill 专属 Tool 支持声明式和编译式两种
 
 **决策：** Skill 的 `tools/` 目录支持两种 Tool：声明式（JSON 定义 + Shell 执行）和编译式（Go plugin）。
 
@@ -100,7 +100,7 @@
 
 ---
 
-### SD-008: Registry 安装支持但不是必需
+### SK-008: Registry 安装支持但不是必需
 
 **决策：** Yaa! 提供 Registry 服务规划，但 Skill 安装不强制依赖 Registry。本地和 Git 来源始终可用。
 
@@ -113,7 +113,7 @@
 
 ---
 
-### SD-009: Skill Prompt 注入为 System Message
+### SK-009: Skill Prompt 注入为 System Message
 
 **决策：** Skill Body 加载后，以 System Message 的形式注入 Context，而非 User Message。
 
@@ -126,7 +126,7 @@
 
 ---
 
-### SD-010: Skill Prompt 注入后默认保留
+### SK-010: Skill Prompt 注入后默认保留
 
 **决策：** Skill Prompt 注入 Context 后默认保留（不自动移除），支持后续追问。
 
@@ -139,7 +139,7 @@
 
 ---
 
-### SD-011: 嵌套 Skill 的 Body 不自动加载
+### SK-011: 嵌套 Skill 的 Body 不自动加载
 
 **决策：** 当 Skill A 依赖 Skill B 时，只自动注入 B 的 Metadata（Level 1），B 的 Body（Level 2）由 Agent 按需触发。
 
@@ -152,7 +152,7 @@
 
 ---
 
-### SD-012: Skill 版本使用语义化版本号
+### SK-012: Skill 版本使用语义化版本号
 
 **决策：** Skill 使用语义化版本号（SemVer）`MAJOR.MINOR.PATCH`。
 
@@ -165,7 +165,7 @@
 
 ---
 
-### SD-013: Skill 安装支持回滚
+### SK-013: Skill 安装支持回滚
 
 **决策：** Skill 更新时保留旧版本备份，更新失败可回滚到上一个版本。
 

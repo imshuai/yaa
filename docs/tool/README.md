@@ -147,5 +147,5 @@ type ToolSchema = json.RawMessage
 | [errors.md](errors.md) | 错误处理（分类、传递、重试策略） |
 | [observability.md](observability.md) | 可观测性（日志、指标、Remote API 事件） |
 | [config-ref.md](config-ref.md) | 配置参考（完整配置、Agent 级别覆盖） |
-| [decisions.md](decisions.md) | 设计决策（PD-001 ~ PD-013） |
+| [decisions.md](decisions.md) | 设计决策（TD-001 ~ TD-013） |
 | [checklist.md](checklist.md) | 实现检查清单 |

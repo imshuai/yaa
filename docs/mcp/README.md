@@ -309,7 +309,7 @@ External MCP Client
 | [config-ref.md](config-ref.md) | 配置参考 — mcp.servers / mcp.expose 完整字段说明 |
 | [errors.md](errors.md) | 错误处理 — 连接失败、超时、重连、降级策略 |
 | [observability.md](observability.md) | 可观测性 — 日志、指标、Remote API 事件 |
-| [decisions.md](decisions.md) | 设计决策（MD-001 ~ MD-NNN）+ 模块关系 |
+| [decisions.md](decisions.md) | 设计决策（MC-001 ~ MC-008）+ 模块关系 |
 | [checklist.md](checklist.md) | 实现检查清单 |
 
 ---

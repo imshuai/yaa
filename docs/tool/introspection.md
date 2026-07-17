@@ -341,7 +341,7 @@ type RuntimeStatusTool struct {
   "providers": [
     {
       "name": "deepseek",
-      "type": "openai-compatible",
+      "type": "openai",
       "base_url": "https://api.deepseek.com/v1",
       "status": "healthy",
       "last_check": "2026-07-15T17:11:00Z",

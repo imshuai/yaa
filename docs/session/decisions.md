@@ -20,12 +20,13 @@
 
 ---
 
-### SSD-002: 三态状态机，Closed 为终态
+### SSD-002: 四态状态机，Closed 为终态
 
-**决策：** Session 采用 Active → Paused → Closed 三态状态机，Closed 为不可逆终态。
+**决策：** Session 采用 Created → Active → Paused → Closed 四态状态机，Closed 为不可逆终态。
 
 **理由：**
-- 三态覆盖了"活跃交互""暂时挂起""彻底结束"三种真实场景
+- 四态覆盖了"刚创建""活跃交互""暂时挂起""彻底结束"四种真实场景
+- Created 状态区分"已创建但尚未交互"的空会话，支持预创建 Session 的场景
 - 不引入更多状态（如 `Error`），异常通过错误返回而非状态表达
 - Closed 不可逆，避免"僵尸 Session"反复复活导致状态不一致
 
