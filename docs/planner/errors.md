@@ -93,7 +93,7 @@ func (a *Agent) executeStepWithRetry(ctx context.Context, step *Step, maxRetry i
             break // 超时不重试
         }
     }
-    step.Status = StepStatusFailed
+    step.Status = StepFailed
     return fmt.Errorf("step %s failed after %d attempts: %w", step.ID, maxRetry+1, lastErr)
 }
 ```
@@ -125,12 +125,12 @@ Planner 不可用 → 跳过规划 → 任务直接进入 Agent Loop → LLM 自
 func (a *Agent) executePlan(ctx context.Context, plan *Plan) error {
     for _, step := range plan.Steps {
         // 跳过已完成的步骤（恢复场景）
-        if step.Status == StepStatusDone {
+        if step.Status == StepDone {
             continue
         }
         // 检查依赖是否满足
         if !a.checkDependencies(step, plan) {
-            step.Status = StepStatusFailed
+            step.Status = StepFailed
             return fmt.Errorf("step %s has unmet dependencies", step.ID)
         }
         if err := a.executeStepWithRetry(ctx, step, 3); err != nil {

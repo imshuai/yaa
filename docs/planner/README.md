@@ -177,7 +177,7 @@ type Step struct {
     Action  string         // 动作类型: tool / skill / llm
     Input   map[string]any // 步骤输入参数
     Depends []string       // 依赖的前置步骤 ID
-    Status  StepStatus     // Pending / Running / Done / Failed
+    Status  StepStatus     // Pending / Running / Done / Failed / Skipped
 }
 ```
 
@@ -200,6 +200,7 @@ const (
     StepRunning StepStatus = "running"
     StepDone    StepStatus = "done"
     StepFailed  StepStatus = "failed"
+    StepSkipped StepStatus = "skipped"  // 依赖失败时跳过（见 PL-009）
 )
 ```
 

@@ -196,7 +196,7 @@ Planner 负责将复杂任务分解为可执行步骤。
 
 ```go
 type Planner interface {
-    Plan(task string, agent *agent.Agent) (*Plan, error)
+    Plan(ctx context.Context, task string, agent *agent.Agent) (*Plan, error)
 }
 
 type Plan struct {
@@ -208,7 +208,7 @@ type Step struct {
     Action   string          // tool call / skill call / llm call
     Input    map[string]any
     Depends  []string        // 依赖的前置步骤
-    Status   StepStatus      // Pending / Running / Done / Failed
+    Status   StepStatus      // Pending / Running / Done / Failed / Skipped
 }
 ```
 
@@ -309,9 +309,11 @@ Provider 层抽象所有 LLM 访问。
 ```go
 type Provider interface {
     ID() string
+    Type() string
     Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error)
     StreamChat(ctx context.Context, req *ChatRequest) (<-chan ChatChunk, error)
     Models() []ModelInfo
+    Close() error
 }
 ```
 

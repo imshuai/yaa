@@ -98,11 +98,11 @@ func (a *Agent) executeStep(ctx context.Context, step *Step) error {
         toolName := strings.TrimPrefix(step.Action, "tool:")
         result, err := a.toolMgr.Execute(ctx, toolName, step.Input)
         if err != nil {
-            step.Status = StepStatusFailed
+            step.Status = StepFailed
             return fmt.Errorf("step %s failed: %w", step.ID, err)
         }
         step.Output = result
-        step.Status = StepStatusDone
+        step.Status = StepDone
     case strings.HasPrefix(step.Action, "skill:"):
         // 见下文 Skill 集成
     }
@@ -122,10 +122,10 @@ func (a *Agent) executeStep(ctx context.Context, step *Step) error {
         skillName := strings.TrimPrefix(step.Action, "skill:")
         // 激活 Skill → 注入 Prompt → 进入 Agent Loop 执行
         if err := a.skillMgr.Activate(skillName, a); err != nil {
-            step.Status = StepStatusFailed
+            step.Status = StepFailed
             return err
         }
-        step.Status = StepStatusDone
+        step.Status = StepDone
     }
     return nil
 }
