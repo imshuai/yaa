@@ -2,7 +2,7 @@
 
 > Yaa! Yet Another Agent Runtime
 > 文档路径: `docs/memory/` (原计划单文件 `docs/memory.md`，拆分为多文件)
-> 依赖: `docs/architecture.md` §3.6, `docs/session.md`, `docs/context.md`
+> 依赖: `docs/architecture.md` §3.6, `docs/session/`, `docs/context/`
 
 ---
 
@@ -239,4 +239,4 @@ if ext, ok := mem.(MemoryExtended); ok {
 
 ---
 
-*最后更新: 2025-07-16*
+*最后更新: 2025-07-17*

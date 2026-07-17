@@ -243,4 +243,4 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 
 ---
 
-*最后更新: 2025-07-16*
+*最后更新: 2025-07-17*
