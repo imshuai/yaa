@@ -165,19 +165,147 @@ yaa/
 └── docs/                          # 设计文档
     ├── architecture.md            # 整体架构设计
     ├── directory.md               # 目录结构说明（本文件）
-    ├── remote-api.md              # Remote API 设计
     ├── provider.md                # Provider 层设计
-    ├── tool.md                    # Tool 系统设计
-    ├── skill.md                   # Skill 系统设计
-    ├── mcp.md                     # MCP 设计
-    ├── memory.md                  # Memory 设计
-    ├── session.md                 # Session 设计
-    ├── context.md                 # Context 设计
-    ├── task.md                    # Task 调度设计
-    ├── planner.md                 # Planner 设计
-    ├── config.md                  # 配置系统设计
-    ├── auth.md                    # 认证授权设计
-    ├── storage.md                 # 存储层设计
-    ├── plugin.md                  # 插件系统设计
+    │
+    ├── remote-api/               # Remote API 设计（多文件）
+    │   ├── INDEX.md              # 索引 + 概述
+    │   ├── agent.md              # Agent 管理 API
+    │   ├── session.md            # Session 管理 API
+    │   ├── conversation.md       # 对话 API
+    │   ├── tool.md               # Tool 管理 API
+    │   ├── skill.md              # Skill 管理 API
+    │   ├── memory.md             # Memory 管理 API
+    │   ├── provider.md           # Provider 管理 API
+    │   ├── mcp.md                # MCP 管理 API
+    │   ├── auth.md               # 认证 API
+    │   └── system.md             # 系统管理 API
+    │
+    ├── tool/                     # Tool 系统设计（13 files）
+    │   ├── README.md             # 索引 + 设计目标 + 核心接口
+    │   ├── manager.md            # Tool Manager
+    │   ├── provider.md           # Tool 与 Provider 衔接
+    │   ├── builtin.md            # 内置 Tool 总览
+    │   ├── config-tools.md       # Config 系列工具
+    │   ├── introspection.md      # 内视与管理系列工具
+    │   ├── custom.md             # 自定义 Tool
+    │   ├── context.md            # Tool 与 Context 交互
+    │   ├── errors.md             # 错误处理
+    │   ├── observability.md      # 可观测性
+    │   ├── config-ref.md         # 配置参考
+    │   ├── decisions.md          # 设计决策 + 模块关系
+    │   └── checklist.md          # 实现检查清单
+    │
+    ├── skill/                     # Skill 系统设计（9 files）
+    │   ├── README.md              # 索引 + 概述 + 三级加载
+    │   ├── manager.md            # Skill Manager
+    │   ├── invocation.md         # Skill 调用流程
+    │   ├── registry.md           # Skill Registry
+    │   ├── config.md             # 配置参考
+    │   ├── errors.md             # 错误处理
+    │   ├── observability.md      # 可观测性
+    │   ├── decisions.md          # 设计决策 + 模块关系
+    │   └── checklist.md          # 实现检查清单
+    │
+    ├── memory/                   # Memory 系统设计（10 files）
+    │   ├── README.md             # 索引 + 概述 + 核心接口
+    │   ├── architecture.md       # 三层记忆架构
+    │   ├── lifecycle.md          # 记忆生命周期管理
+    │   ├── storage.md            # 存储后端与向量索引
+    │   ├── integration.md        # 与 Session/Context/Agent 集成
+    │   ├── config-ref.md        # 配置参考
+    │   ├── errors.md             # 错误处理
+    │   ├── observability.md      # 可观测性
+    │   ├── decisions.md          # 设计决策 + 模块关系
+    │   └── checklist.md          # 实现检查清单
+    │
+    ├── session/                  # Session 系统设计（11 files）
+    │   ├── README.md             # 索引 + 概述 + 核心接口
+    │   ├── lifecycle.md          # 生命周期管理
+    │   ├── persistence.md        # 持久化
+    │   ├── messaging.md         # 消息管理
+    │   ├── concurrency.md        # 并发模型
+    │   ├── integration.md        # 与 Agent/Context/Memory 集成
+    │   ├── config-ref.md        # 配置参考
+    │   ├── errors.md             # 错误处理
+    │   ├── observability.md      # 可观测性
+    │   ├── decisions.md          # 设计决策 + 模块关系
+    │   └── checklist.md          # 实现检查清单
+    │
+    ├── config/                    # Config 系统设计（11 files）
+    │   ├── README.md             # 索引 + 概述
+    │   ├── overview.md           # 设计理念 + 核心接口
+    │   ├── loading.md            # 配置加载流程
+    │   ├── reference.md          # 完整配置参考
+    │   ├── envvar.md             # 环境变量引用机制
+    │   ├── validation.md         # 配置校验与默认值
+    │   ├── hot-reload.md         # 配置热更新
+    │   ├── formats.md            # 多格式支持
+    │   ├── migration.md          # 配置迁移与兼容
+    │   ├── decisions.md          # 设计决策 + 模块关系
+    │   └── checklist.md          # 实现检查清单
+    │
+    ├── context/                  # Context 系统设计（7 files）
+    │   ├── README.md             # 索引 + 概述 + 核心接口
+    │   ├── manager.md            # Context Manager 详解
+    │   ├── config-ref.md        # 配置参考
+    │   ├── errors.md             # 错误处理
+    │   ├── observability.md      # 可观测性
+    │   ├── decisions.md          # 设计决策 + 模块关系
+    │   └── checklist.md          # 实现检查清单
+    │
+    ├── planner/                  # Planner 系统设计（10 files）
+    │   ├── README.md             # 索引 + 概述 + 核心接口
+    │   ├── planner.md            # Planner 接口与实现
+    │   ├── task.md               # Task 调度系统
+    │   ├── execution.md          # 计划执行流程
+    │   ├── integration.md        # 与 Agent/Tool/Skill 集成
+    │   ├── config-ref.md        # 配置参考
+    │   ├── errors.md             # 错误处理
+    │   ├── observability.md      # 可观测性
+    │   ├── decisions.md          # 设计决策 + 模块关系
+    │   └── checklist.md          # 实现检查清单
+    │
+    ├── storage/                  # Storage 系统设计（7 files）
+    │   ├── README.md             # 索引 + 概述 + 核心接口
+    │   ├── sqlite.md             # SQLite 实现
+    │   ├── alternatives.md       # BoltDB 与内存存储
+    │   ├── integration.md        # 与各模块集成
+    │   ├── config-ref.md        # 配置参考
+    │   ├── decisions.md          # 设计决策 + 模块关系
+    │   └── checklist.md          # 实现检查清单
+    │
+    ├── auth/                     # Auth 系统设计（7 files）
+    │   ├── README.md             # 索引 + 概述 + 核心接口
+    │   ├── authentication.md     # 认证机制
+    │   ├── authorization.md      # 授权机制（RBAC）
+    │   ├── integration.md        # 与 Remote API 中间件集成
+    │   ├── config-ref.md        # 配置参考
+    │   ├── decisions.md          # 设计决策 + 模块关系
+    │   └── checklist.md          # 实现检查清单
+    │
+    ├── mcp/                     # MCP 系统设计（10 files）
+    │   ├── README.md             # 索引 + 概述 + 核心接口 + 双角色说明
+    │   ├── client.md             # MCP Client（连接外部 Server、Tool 映射）
+    │   ├── server.md             # MCP Server（暴露 Yaa! 能力）
+    │   ├── transport.md          # 传输层（stdio/SSE/WS）
+    │   ├── integration.md        # 与 Tool/Agent/Config 集成
+    │   ├── config-ref.md        # 配置参考
+    │   ├── errors.md             # 错误处理
+    │   ├── observability.md      # 可观测性
+    │   ├── decisions.md          # 设计决策 + 模块关系
+    │   └── checklist.md          # 实现检查清单
+    │
+    ├── plugin/                  # Plugin 系统设计（10 files）
+    │   ├── README.md             # 索引 + 概述 + 核心接口
+    │   ├── interface.md         # Plugin 接口详解
+    │   ├── manager.md            # Plugin Manager
+    │   ├── loader.md             # Plugin Loader
+    │   ├── integration.md        # 与各模块集成
+    │   ├── config-ref.md        # 配置参考
+    │   ├── errors.md             # 错误处理
+    │   ├── observability.md      # 可观测性
+    │   ├── decisions.md          # 设计决策 + 模块关系
+    │   └── checklist.md          # 实现检查清单
+    │
     └── roadmap.md                 # 开发路线图
 ```
