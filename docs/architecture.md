@@ -156,7 +156,7 @@ type Session struct {
     ID        string
     AgentID   string
     Messages  []Message        // 消息历史
-    State     SessionState     // Active / Paused / Closed
+    State     SessionState     // Created / Active / Paused / Closed
     CreatedAt time.Time
     UpdatedAt time.Time
     Metadata  map[string]any   // 自定义元数据

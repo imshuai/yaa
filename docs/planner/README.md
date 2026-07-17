@@ -152,7 +152,7 @@ Planner 是接口，默认提供 LLM 驱动规划器，但支持多种实现：
 ```go
 // Planner 负责将复杂任务分解为可执行步骤。
 type Planner interface {
-    Plan(task string, agent *agent.Agent) (*Plan, error)
+    Plan(ctx context.Context, task string, agent *agent.Agent) (*Plan, error)
 }
 ```
 
@@ -216,7 +216,7 @@ const (
 | [config-ref.md](config-ref.md) | 配置参考 — Planner 配置、调度器参数 |
 | [errors.md](errors.md) | 错误处理 — 规划失败、执行失败、重试策略 |
 | [observability.md](observability.md) | 可观测性 — 日志、指标、Remote API 事件 |
-| [decisions.md](decisions.md) | 设计决策（PD-001 ~ PD-006）+ 模块关系 |
+| [decisions.md](decisions.md) | 设计决策（PD-001 ~ PD-010）+ 模块关系 |
 | [checklist.md](checklist.md) | 实现检查清单 |
 
 ---

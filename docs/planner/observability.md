@@ -171,8 +171,8 @@ func (p *Plan) Snapshot() PlanSnapshot {
             StepID: s.ID, Status: s.Status, Action: s.Action,
             StartedAt: s.StartedAt, EndedAt: s.EndedAt,
         }
-        if s.Err != nil {
-            ss.Error = s.Err.Error()
+        if s.Error != "" {
+            ss.Error = s.Error
         }
         if s.Status == StepRunning {
             snap.ActiveStepIDs = append(snap.ActiveStepIDs, s.ID)
@@ -185,4 +185,4 @@ func (p *Plan) Snapshot() PlanSnapshot {
 
 ---
 
-*最后更新: 2026-07-17*
+*最后更新: 2025-07-17*

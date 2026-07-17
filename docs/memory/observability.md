@@ -149,4 +149,4 @@ func (m *MemoryManager) HealthCheck() MemoryHealthReport {
 
 ---
 
-*最后更新: 2026-07-17*
+*最后更新: 2025-07-17*

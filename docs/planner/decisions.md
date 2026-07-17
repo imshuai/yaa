@@ -7,6 +7,8 @@
 
 ## 设计决策
 
+> 完整的设计决策列表，包含架构层面和实现层面的决策。
+
 ### PD-001: Planner 作为独立层，不嵌入 Agent
 
 **决策：** Planner 作为 Runtime 的独立模块层存在，而非 Agent 内部逻辑。
@@ -82,6 +84,55 @@
 - DAG 表达力更强，线性列表是 DAG 的特例
 
 **影响：** 需要实现 DAG 依赖检查和循环检测；执行引擎需支持拓扑排序。
+
+---
+
+### PD-007: Planner 接口仅含 `Plan` 方法
+
+**决策：** Planner 接口仅定义 `Plan(ctx, task, agent)` 方法，执行职责分离到 Executor。
+
+**理由：**
+- 最小接口原则，降低实现门槛
+- 规划与执行是不同关注点，应分离
+- Executor 可独立替换或测试
+
+**影响：** 需要单独的 Executor 组件负责 Plan 执行。
+
+---
+
+### PD-008: Step 使用 `map[string]any` 作为 Input
+
+**决策：** Step 的 Input 字段类型为 `map[string]any`，兼容不同 Tool/Skill 的异构参数。
+
+**理由：**
+- 不同 Tool/Skill 的参数结构差异大，强类型约束会限制灵活性
+- `map[string]any` 与 JSON 天然兼容，便于 LLM 输出解析
+
+**影响：** 参数校验延迟到执行阶段，由 Tool 的 JSON Schema 校验。
+
+---
+
+### PD-009: 新增 `StepSkipped` 状态
+
+**决策：** Step 状态枚举新增 `Skipped`，用于依赖失败时明确标记，区别于 `Failed`。
+
+**理由：**
+- `Failed` 表示步骤自身执行失败，`Skipped` 表示因上游失败而未执行
+- 区分两者有助于错误诊断和恢复策略
+
+**影响：** 状态机需处理 `Skipped` 状态的转换。
+
+---
+
+### PD-010: Plan 携带 Metadata
+
+**决策：** Plan 结构体包含 `Metadata map[string]any` 字段，支持扩展信息。
+
+**理由：**
+- 扩展字段（如重试次数、规划耗时、规划策略）不需要修改核心结构
+- Metadata 透传，核心层不解析其内容
+
+**影响：** Plan 的序列化/反序列化需处理 Metadata。
 
 ---
 

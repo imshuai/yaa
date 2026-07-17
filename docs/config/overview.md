@@ -111,6 +111,12 @@ type Config struct {
 
     // Skills 是 Skill 系统配置。
     Skills SkillsConfig `yaml:"skills" json:"skills"`
+
+    // Memory 是 Memory 系统配置。
+    Memory MemoryConfig `yaml:"memory" json:"memory"`
+
+    // Log 是日志配置。
+    Log LogConfig `yaml:"log" json:"log"`
 }
 ```
 

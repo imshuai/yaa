@@ -342,4 +342,4 @@ func (a *AgentMemory) Search(query string, limit int) ([]*MemoryItem, error) {
 
 ---
 
-*最后更新: 2026-07-17*
+*最后更新: 2025-07-17*

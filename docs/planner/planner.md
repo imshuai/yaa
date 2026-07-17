@@ -22,7 +22,7 @@ import "github.com/imshuai/yaa/pkg/agent"
 type Planner interface {
     // Plan 接收原始任务描述和当前 Agent 上下文，
     // 返回一个结构化的执行计划。
-    Plan(task string, ag *agent.Agent) (*Plan, error)
+    Plan(ctx context.Context, task string, ag *agent.Agent) (*Plan, error)
 }
 ```
 
@@ -55,14 +55,16 @@ type Plan struct {
 ```go
 // Step 表示计划中的一个执行步骤。
 type Step struct {
-    ID       string            `json:"id"`        // 步骤唯一标识（如 "s1", "s2"）
-    Action   string            `json:"action"`    // 动作类型: "tool" / "skill" / "llm"
-    Target   string            `json:"target"`    // 目标名称: Tool 名 / Skill 名 / 空表示纯 LLM
-    Input    map[string]any    `json:"input"`     // 步骤输入参数
-    Depends  []string          `json:"depends"`   // 依赖的前置步骤 ID 列表
-    Status   StepStatus        `json:"status"`    // 步骤状态
-    Output   map[string]any     `json:"output,omitempty"`  // 执行结果
-    Error    string            `json:"error,omitempty"`   // 错误信息（失败时）
+    ID        string            `json:"id"`        // 步骤唯一标识（如 "s1", "s2"）
+    Action    string            `json:"action"`    // 动作类型: "tool" / "skill" / "llm"
+    Target    string            `json:"target"`    // 目标名称: Tool 名 / Skill 名 / 空表示纯 LLM
+    Input     map[string]any    `json:"input"`     // 步骤输入参数
+    Depends   []string          `json:"depends"`   // 依赖的前置步骤 ID 列表
+    Status    StepStatus        `json:"status"`    // 步骤状态
+    Output    map[string]any    `json:"output,omitempty"`  // 执行结果
+    Error     string            `json:"error,omitempty"`   // 错误信息（失败时）
+    StartedAt *time.Time        `json:"started_at,omitempty"` // 开始执行时间
+    EndedAt   *time.Time        `json:"ended_at,omitempty"`   // 完成或失败时间
 }
 ```
 
@@ -175,7 +177,7 @@ func NewLLMPlanner(p provider.Provider, model string) *LLMPlanner {
 
 ```go
 // Plan 实现 Planner 接口。
-func (lp *LLMPlanner) Plan(task string, ag *agent.Agent) (*Plan, error) {
+func (lp *LLMPlanner) Plan(ctx context.Context, task string, ag *agent.Agent) (*Plan, error) {
     // 1. 构建规划 Prompt
     sysPrompt := lp.prompt.BuildSystemPrompt(ag)
     userPrompt := lp.prompt.BuildUserPrompt(task, ag)
@@ -388,7 +390,7 @@ func exampleUsage() {
 
     // 规划任务
     task := "搜索 Go 1.25 新特性，总结后保存到文件"
-    plan, err := planner.Plan(task, ag)
+    plan, err := planner.Plan(ctx, task, ag)
     if err != nil {
         log.Fatal("plan failed: ", err)
     }
@@ -413,7 +415,7 @@ type StaticPlanner struct {
     templates map[string]*Plan // 任务关键词 → 预定义 Plan
 }
 
-func (sp *StaticPlanner) Plan(task string, ag *agent.Agent) (*Plan, error) {
+func (sp *StaticPlanner) Plan(ctx context.Context, task string, ag *agent.Agent) (*Plan, error) {
     for keyword, plan := range sp.templates {
         if strings.Contains(task, keyword) {
             // 深拷贝 Plan，避免修改模板
@@ -437,6 +439,8 @@ func (sp *StaticPlanner) Plan(task string, ag *agent.Agent) (*Plan, error) {
 | PD-005 | 规划与执行分离 | 可审查、可修改、可重放 |
 | PD-006 | 新增 `StepSkipped` 状态 | 依赖失败时明确标记，区别于 `Failed` |
 | PD-007 | Plan 携带 Metadata | 支持扩展字段（如重试次数、规划耗时） |
+
+> 完整的设计决策（含模块关系图）见 [decisions.md](decisions.md)。
 
 ---
 
