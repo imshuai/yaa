@@ -18,6 +18,7 @@ Session 系统的错误按来源分为五大类：**生命周期错误**、**消
 | Session 不存在 | `ErrSessionNotFound` | 指定 ID 的 Session 未找到 | 返回 404 给 Remote API Client |
 | Session 已关闭 | `ErrSessionClosed` | 对已 Closed 的 Session 操作 | 返回 409 Conflict |
 | Session 已暂停 | `ErrSessionPaused` | 对已 Paused 的 Session 发送消息 | 返回 409，提示 Resume |
+| Session 非活跃 | `ErrSessionNotActive` | Session 未处于 Active 状态 | 返回 409，提示激活或恢复 |
 | 非法状态转换 | `ErrInvalidStateTransition` | 如 Closed → Active | 返回 409，记录 Warn 日志 |
 | Agent 不存在 | `ErrAgentNotFound` | 创建 Session 时 AgentID 无效 | 返回 400 |
 | **消息** | | | |
@@ -47,6 +48,7 @@ var (
     ErrSessionNotFound       = errors.New("session: not found")
     ErrSessionClosed         = errors.New("session: already closed")
     ErrSessionPaused         = errors.New("session: paused, resume first")
+    ErrSessionNotActive      = errors.New("session: not active")
     ErrInvalidStateTransition = errors.New("session: invalid state transition")
     ErrAgentNotFound         = errors.New("session: agent not found")
 )
@@ -201,6 +203,7 @@ func (m *Manager) RestoreAll() error {
 | `ErrSessionNotFound` | 404 | 资源不存在 |
 | `ErrSessionClosed` | 409 | 状态冲突 |
 | `ErrSessionPaused` | 409 | 状态冲突，提示 Resume |
+| `ErrSessionNotActive` | 409 | 状态冲突，提示激活 |
 | `ErrInvalidStateTransition` | 409 | 非法转换 |
 | `ErrSessionBusy` | 429 | 限流，建议重试 |
 | `ErrLockTimeout` | 503 | 服务暂不可用 |

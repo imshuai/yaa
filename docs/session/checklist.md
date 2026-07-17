@@ -108,6 +108,7 @@
 - [ ] `ErrSessionAlreadyExists` — Session ID 冲突
 - [ ] `ErrSessionClosed` — 操作已关闭的 Session
 - [ ] `ErrSessionPaused` — 向暂停的 Session 追加消息
+- [ ] `ErrSessionNotActive` — Session 未处于 Active 状态
 - [ ] `ErrInvalidAgentID` — 无效的 AgentID
 - [ ] `ErrInvalidStateTransition` — 非法状态转换
 - [ ] `ErrMaxSessionsReached` — 超过最大 Session 数
