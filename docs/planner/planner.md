@@ -430,17 +430,18 @@ func (sp *StaticPlanner) Plan(ctx context.Context, task string, ag *agent.Agent)
 
 ## 6. 设计决策
 
-| 编号 | 决策 | 理由 |
-|------|------|------|
-| PD-001 | Planner 接口仅含 `Plan` 方法 | 最小接口，执行职责分离到 Executor |
-| PD-002 | 默认使用 LLM 驱动规划 | 通用性强，适配任意任务类型 |
-| PD-003 | Step 使用 `map[string]any` 作为 Input | 兼容不同 Tool/Skill 的异构参数 |
-| PD-004 | 依赖通过 Step ID 字符串声明 | 解耦步骤顺序，支持并行调度 |
-| PD-005 | 规划与执行分离 | 可审查、可修改、可重放 |
-| PD-006 | 新增 `StepSkipped` 状态 | 依赖失败时明确标记，区别于 `Failed` |
-| PD-007 | Plan 携带 Metadata | 支持扩展字段（如重试次数、规划耗时） |
-
 > 完整的设计决策（含模块关系图）见 [decisions.md](decisions.md)。
+
+关键决策摘要：
+
+| 编号 | 决策 | 说明 |
+|------|------|------|
+| PD-001 | Planner 作为独立层 | 不嵌入 Agent，可独立替换 |
+| PD-002 | LLM 驱动规划 | 通用性强，适配任意任务类型 |
+| PD-005 | Plan 挂载到 Session | 支持跨轮次执行和崩溃恢复 |
+| PD-006 | DAG 依赖 | 支持并行执行 |
+| PD-007 | 接口仅含 `Plan` 方法 | 规划与执行分离 |
+| PD-009 | `StepSkipped` 状态 | 区分依赖失败与自身失败 |
 
 ---
 

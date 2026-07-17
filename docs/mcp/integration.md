@@ -44,17 +44,17 @@ func (a *MCPToolAdapter) Description() string {
     return a.client.GetToolDescription(a.serverName, a.toolName)
 }
 
-func (a *MCPToolAdapter) Parameters() ToolSchema {
-    return ToolSchema{JSONSchema: a.schema}
+func (a *MCPToolAdapter) Parameters() json.RawMessage {
+    return a.info.InputSchema
 }
 
-func (a *MCPToolAdapter) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
+func (a *MCPToolAdapter) Execute(ctx context.Context, params map[string]any) (tool.ToolResult, error) {
     // 将参数转发给 MCP Server 执行
     rawResult, err := a.client.CallTool(ctx, a.serverName, a.toolName, params)
     if err != nil {
-        return ToolResult{IsError: true, Content: fmt.Sprintf("MCP 调用失败: %v", err)}, nil
+        return tool.ToolResult{IsError: true, Content: fmt.Sprintf("MCP 调用失败: %v", err)}, nil
     }
-    return ToolResult{Content: rawResult.Content}, nil
+    return tool.ToolResult{Content: rawResult.Content}, nil
 }
 ```
 
@@ -156,8 +156,8 @@ Agent Loop (每轮迭代):
 ### 3.2 MCP Tool 调用的错误处理
 
 ```go
-func (a *MCPToolAdapter) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-    // 设置 MCP 调用超时
+// Execute 的完整实现，含超时控制与重连逻辑。
+func (a *MCPToolAdapter) Execute(ctx context.Context, params map[string]any) (tool.ToolResult, error) {
     callCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
     defer cancel()
 
@@ -170,13 +170,13 @@ func (a *MCPToolAdapter) Execute(ctx context.Context, params map[string]any) (To
             }
         }
         if err != nil {
-            return ToolResult{
+            return tool.ToolResult{
                 IsError: true,
                 Content: fmt.Sprintf("[MCP] %s 调用失败: %v", a.Name(), err),
             }, nil
         }
     }
-    return ToolResult{Content: rawResult.Content}, nil
+    return tool.ToolResult{Content: rawResult.Content}, nil
 }
 ```
 
