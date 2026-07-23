@@ -413,6 +413,7 @@ v1 的 `builtin` 配置键固定为：`shell`、`http`、`file`、`config_query`
 | 字段 | 类型 | 默认值 | 热更新 | 说明 |
 |------|------|--------|:------:|------|
 | `enabled` | `bool` | `true` | ❌ | 是否启用 File Tool |
+| `timeout` | `duration` | `0` | ✅ | 文件操作超时；`0` 继承 `tools.default_timeout` |
 | `options.allowed_paths` | `[]string` | `[]` | ✅ | 允许访问的绝对路径前缀；空表示不额外限制 |
 | `options.blocked_paths` | `[]string` | `[]` | ✅ | 禁止访问的路径前缀，优先于 allowed_paths |
 | `options.max_file_size` | `string` | `"10MB"` | ✅ | 单次读写最大文件大小 |

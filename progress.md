@@ -15,6 +15,7 @@ Phase 1：核心骨架。
 - 配置格式检测与 YAML/JSON/TOML raw Map 解析已实现。
 - 完整配置 DTO 与序列化标签已按各模块权威文档实现。
 - 已明确 `tools.builtin` 的 14 个 v1 配置键及 `file` 共享配置组语义。
+- 已补充 File Tool `timeout: 0` 继承全局超时的 canonical 说明。
 
 ## 下一步
 
