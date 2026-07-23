@@ -66,8 +66,12 @@ func ParseToMap(data []byte, format Format) (map[string]any, error) {
             return nil, fmt.Errorf("%w: json: multiple top-level values", ErrConfigParseFailed)
         }
     case FormatTOML:
-        if _, err := toml.Decode(string(data), &out); err != nil {
+        metadata, err := toml.Decode(string(data), &out)
+        if err != nil {
             return nil, fmt.Errorf("%w: toml: %v", ErrConfigParseFailed, err)
+        }
+        if undecoded := metadata.Undecoded(); len(undecoded) != 0 {
+            return nil, fmt.Errorf("%w: toml: undecoded keys: %v", ErrConfigParseFailed, undecoded)
         }
     default:
         return nil, fmt.Errorf("%w: %s", ErrConfigFormatUnsupported, format)
