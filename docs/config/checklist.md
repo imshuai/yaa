@@ -78,11 +78,11 @@
 
 - [ ] 配置版本字段（`config_version: "1.0"`）
 - [ ] 版本检测与迁移触发（加载时比较文件版本与当前版本）
-- [ ] 迁移函数注册表（`map[uint]MigrationFunc`）
-- [ ] 逐版本迁移执行（v1 → v2 → ... → vN，不跳级）
-- [ ] 迁移前自动备份原配置文件（`.bak` 后缀）
-- [ ] 迁移后写回新版本号
-- [ ] 迁移失败回滚（恢复备份文件）
+- [ ] 迁移函数注册表（`[]Migration` 显式版本边，拒绝重复起点与隐式路径）
+- [ ] 按显式迁移边逐步执行，不推测 `nextVersion` 或跳过缺失路径
+- [ ] 仅显式迁移 CLI 在写回前备份原配置文件（`.bak` 后缀）；启动加载不写盘
+- [ ] 显式迁移 CLI 写回成功后更新版本号；启动加载只更新内存中的 raw Map
+- [ ] CLI 写回失败时保留原文件；启动加载迁移失败不启动 Runtime
 - [ ] 废弃字段警告（字段已废弃但仍可读，warn 日志提示替代方案）
 - [ ] 移除字段报错（字段已移除，fatal 并提示迁移）
 - [ ] 迁移日志记录（from version → to version，变更明细）
@@ -90,7 +90,7 @@
 ## 默认值
 
 - [ ] `Default()` 函数 — 返回内置默认配置
-- [ ] 默认值注入时机（加载管线第 1 步，作为合并基础）
+- [ ] 默认值注入时机（先以 `Default()` 建立根基底，再在 typed decode 前应用元素默认）
 - [ ] 通过 presence-aware Map 区分缺失与显式 `false`/`0`/`[]`，显式值不得被默认值覆盖
 - [ ] `Default()` 递归初始化根结构；`ApplyElementDefaults(raw)` 在 typed decode 前为每个新切片/动态 Map 元素逐项注入缺失默认值
 - [ ] 最小元素用例覆盖 Agent `max_tokens=4096`、Provider timeout/retry/type URL、Token `roles=[viewer]`、MCP `transport/auto_start` 和 Skill `enabled=true`
