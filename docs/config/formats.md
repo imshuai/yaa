@@ -92,7 +92,7 @@ func ParseFileToMap(path string) (map[string]any, error) {
 }
 ```
 
-JSON number 保持为 `json.Number`，最终由统一解码器按目标字段转换；超出目标整数范围时必须报错。YAML map key 必须是字符串。BurntSushi TOML 会把 array-of-tables 解为 `[]map[string]any`，`normalizeRawValue` 必须在返回前递归统一为 `[]any`，使迁移、环境变量展开和默认值注入只处理一种容器表示。TOML 解到 raw Map 时不能使用 `Undecoded()` 判错，因为 `any` 值会被该库标记为未解码；所有格式的未知字段统一由后续 `DecodeInto(... ErrorUnused=true)` 拒绝。
+JSON number 保持为 `json.Number`，最终由统一解码器按目标字段转换；超出目标整数范围时必须报错。YAML map key 必须是字符串。BurntSushi TOML 会把 array-of-tables 解为 `[]map[string]any`，`normalizeRawValue` 必须在返回前递归统一为 `[]any`，使迁移、环境变量展开和默认值注入只处理一种容器表示。TOML 解到 raw Map 时不能使用 `Undecoded()` 判错，因为 `any` 值会被该库标记为未解码；所有格式的结构体边界未知字段统一由后续 `DecodeInto(... ErrorUnused=true)` 拒绝，开放 `map[string]any` 的内部 key 由对应 Provider/Tool/Skill/Plugin 专用 decoder 校验。
 
 ## 3. 跨格式语义
 
