@@ -200,7 +200,7 @@ Provider 的 `base_url` 是唯一 type-dependent 默认值：先读取同一 raw
 
 ### 2.3 Presence-aware 解码
 
-`DecodeInto` 只遍历原始 Map 中存在的字段，并将其写入已经带默认值的 `cfg`。它必须支持 `time.Duration` 转换、未知字段检测和字段路径错误；不要先解码为零值 `Config` 再做非零值合并。`ApplyElementDefaults` 不覆盖显式 `null`；若 `null` 进入非 pointer/non-nullable 字段，`DecodeInto` 必须返回带完整路径的类型错误，不能静默保留默认值。
+`DecodeInto` 只遍历原始 Map 中存在的字段，并将其写入已经带默认值的 `cfg`。它必须支持 `time.Duration` 转换、未知字段检测和字段路径错误；不要先解码为零值 `Config` 再做非零值合并。由于 `mapstructure` 在 `ZeroFields=false` 时会保留旧 slice 尾部并忽略 `nil`，`DecodeInto` 必须先执行 presence 预处理：已出现的 slice 清零后整体替换，非 null map 按 key 合并，nullable 的 `null` 清零，非 pointer/slice/map/interface 的 `null` 以完整路径返回类型错误。`ApplyElementDefaults` 不覆盖显式 `null`；预处理失败时不得进入 typed decoder。
 
 ```go
 cfg := Default()

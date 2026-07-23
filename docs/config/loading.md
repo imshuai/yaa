@@ -217,6 +217,12 @@ func (l *Loader) Load() (*Config, error) {
 
 ```go
 func DecodeInto(raw map[string]any, dst *Config) error {
+    // 在 mapstructure 前执行 presence 预处理：未知键报完整路径；
+    // 已出现的 slice 先清零以实现整体替换；nullable 的 null 清零，
+    // 非 nullable 的 null 返回类型错误。Map 非 null 仍按 key 合并。
+    if err := prepareDecodeTarget(raw, dst); err != nil {
+        return err
+    }
     dec, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
         Result:           dst,
         TagName:          "yaml",
@@ -233,6 +239,8 @@ func DecodeInto(raw map[string]any, dst *Config) error {
     return dec.Decode(raw)
 }
 ```
+
+`prepareDecodeTarget` 是 `DecodeInto` 的必需前置步骤，不能省略。`mapstructure` 在 `ZeroFields=false` 时会保留目标 slice 的尾部元素，也会静默忽略 `nil`；预处理必须只遍历 raw 中实际存在的字段，按 canonical YAML tag 生成完整路径（数组使用 `[n]`），并执行以下规则：出现的 slice 先设为零值；`null` 只允许写入 pointer、slice、map 或 interface 并设为零值；写入 string、number、bool、struct 等非 nullable 字段时报错；非 null map 保留目标 map 并递归合并。预处理失败时不得调用 decoder。
 
 `parseFileToMap` 按扩展名选择解析器：YAML 使用 `yaml.v3` 解到 `map[string]any`；JSON 使用 `json.Decoder` + `UseNumber` 并拒绝第二个顶层值；TOML 使用 `BurntSushi/toml` 解到 raw Map，并在返回前把 array-of-tables 的 `[]map[string]any` 递归规范化为 `[]any`。TOML 不在此阶段调用 `Undecoded()`（`any` 值会被该库标记为未解码）。所有格式的未知字段统一由后续 `DecodeInto(... ErrorUnused=true)` 检查。无扩展名按 YAML。解析器不得直接解到 `Config`，否则会绕过迁移、环境变量和统一 unknown-field 检查。完整格式约定见 [`formats.md`](formats.md)。
 
