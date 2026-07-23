@@ -103,7 +103,7 @@ JSON number 保持为 `json.Number`，最终由统一解码器按目标字段转
 | 空数组 | `items: []` | `items = []` | `"items": []` |
 | null | `null` | 不支持 | `null` |
 
-非零 `duration` 使用 Go duration 字符串，不接受不同格式各自的整数单位；文档明确默认值为 `0` 的可选超时字段允许使用数值 `0` 表示禁用/继承。TOML 无 null，因此可空字段只能省略；YAML/JSON 的 null 只允许写入 pointer、slice、map 或 interface，写入其他字段时报错。
+非零 `duration` 使用 Go duration 字符串，不接受不同格式各自的整数单位；所有 `duration` 字段都允许使用数值 `0` 表示零值，非零数值必须拒绝。TOML 无 null，因此可空字段只能省略；YAML/JSON 的 null 只允许写入 pointer、slice、map 或 interface，写入其他字段时报错。
 
 ## 4. 格式转换
 
