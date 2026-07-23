@@ -19,6 +19,12 @@
 未写 `config_version` 的旧文件按 `1.0` 解释。该规则只适用于当前仍兼容 `1.0` 的文件；一旦未来引入无法推断的旧格式，必须新增明确的 legacy 版本。
 
 ```go
+import (
+    "fmt"
+    "strconv"
+    "strings"
+)
+
 type ConfigSchema struct {
     Major int
     Minor int
@@ -27,11 +33,32 @@ type ConfigSchema struct {
 var CurrentSchemaVersion = ConfigSchema{Major: 1, Minor: 0}
 
 func ParseVersion(raw string) (ConfigSchema, error) {
-    var v ConfigSchema
-    if _, err := fmt.Sscanf(raw, "%d.%d", &v.Major, &v.Minor); err != nil || v.Major < 0 || v.Minor < 0 {
+    parts := strings.Split(raw, ".")
+    if len(parts) != 2 {
         return ConfigSchema{}, fmt.Errorf("invalid config_version %q", raw)
     }
-    return v, nil
+    major, ok := parseVersionPart(parts[0])
+    if !ok {
+        return ConfigSchema{}, fmt.Errorf("invalid config_version %q", raw)
+    }
+    minor, ok := parseVersionPart(parts[1])
+    if !ok {
+        return ConfigSchema{}, fmt.Errorf("invalid config_version %q", raw)
+    }
+    return ConfigSchema{Major: major, Minor: minor}, nil
+}
+
+func parseVersionPart(raw string) (int, bool) {
+    if raw == "" {
+        return 0, false
+    }
+    for i := 0; i < len(raw); i++ {
+        if raw[i] < '0' || raw[i] > '9' {
+            return 0, false
+        }
+    }
+    value, err := strconv.Atoi(raw)
+    return value, err == nil
 }
 
 func (v ConfigSchema) Compare(other ConfigSchema) int {
