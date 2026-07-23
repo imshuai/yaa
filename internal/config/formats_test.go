@@ -63,9 +63,10 @@ func TestParseToMapAllFormats(t *testing.T) {
 		{
 			name:   "toml",
 			format: FormatTOML,
-			data:   "[runtime]\naddr = \"127.0.0.1:8080\"\n",
+			data:   "[runtime]\naddr = \"127.0.0.1:8080\"\n[[items]]\nname = \"one\"\n",
 			want: map[string]any{
 				"runtime": map[string]any{"addr": "127.0.0.1:8080"},
+				"items":   []any{map[string]any{"name": "one"}},
 			},
 		},
 	}

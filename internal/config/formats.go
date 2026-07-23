@@ -70,7 +70,28 @@ func ParseToMap(data []byte, format Format) (map[string]any, error) {
 	if out == nil {
 		out = map[string]any{}
 	}
+	normalizeRawValue(out)
 	return out, nil
+}
+
+func normalizeRawValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, item := range typed {
+			typed[key] = normalizeRawValue(item)
+		}
+	case []any:
+		for i, item := range typed {
+			typed[i] = normalizeRawValue(item)
+		}
+	case []map[string]any:
+		items := make([]any, len(typed))
+		for i, item := range typed {
+			items[i] = normalizeRawValue(item)
+		}
+		return items
+	}
+	return value
 }
 
 // ParseFileToMap reads and parses one configuration file.

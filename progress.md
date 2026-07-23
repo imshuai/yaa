@@ -17,10 +17,11 @@ Phase 1：核心骨架。
 - 已明确 `tools.builtin` 的 14 个 v1 配置键及 `file` 共享配置组语义。
 - 已补充 File Tool `timeout: 0` 继承全局超时的 canonical 说明。
 - 根配置及各子系统 canonical 默认值已实现，所有容器按调用独立初始化。
+- 配置文件中的数组和动态 Map 元素默认值已实现，并统一规范化 TOML 的对象数组。
 
 ## 下一步
 
-- 实现元素默认值、typed decode 与基础校验。
+- 实现 typed decode 与基础校验。
 - 实现配置路径发现和统一 Loader，再接入健康检查与 Runtime。
 
 每个可独立验收的功能完成后单独提交并推送到 `gitea/main`。
