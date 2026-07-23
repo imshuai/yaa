@@ -1,246 +1,121 @@
 # Session 并发模型
 
-> 文档路径: `docs/session/concurrency.md`
-> 上级: `docs/session/README.md` §2
-> 参考: `docs/architecture.md` §5 并发模型
+> 上级: [Session 系统设计](README.md)
+> 总体原则: 同一 Session 串行，不同 Session 并行
 
 ---
 
-## 1. 概述
+## 1. 并发边界
 
-Yaa! 的并发模型遵循「每 Session 串行处理，多 Session 并行执行」的原则。这确保了单个 Session 内消息顺序一致性，同时允许多个 Session 并发处理。
-
----
-
-## 2. 设计原则
-
-| 原则 | 说明 |
-|------|------|
-| **每 Session 串行** | 同一 Session 内，消息按到达顺序依次处理 |
-| **多 Session 并行** | 不同 Session 完全独立，可并行处理 |
-| **无共享状态** | Session 之间不共享可变状态，仅通过 Manager 读取索引 |
-| **锁最小化** | Manager 使用 RWMutex 保护索引，Session 内部使用独立锁 |
-
----
-
-## 3. 消息队列机制
-
-每个 Active Session 拥有一个独立的处理队列，消息按 FIFO 顺序串行处理：
-
-```go
-type sessionRunner struct {
-    sessionID string
-    queue     chan messageTask
-    done      chan struct{}
-}
-
-type messageTask struct {
-    msg      Message
-    result   chan error
-}
-
-func (m *Manager) startRunner(sessionID string) *sessionRunner {
-    r := &sessionRunner{
-        sessionID: sessionID,
-        queue:     make(chan messageTask, 256),
-        done:      make(chan struct{}),
-    }
-    go r.run(m)
-    return r
-}
-
-func (r *sessionRunner) run(m *Manager) {
-    defer close(r.done)
-
-    for task := range r.queue {
-        // 串行处理每条消息
-        err := m.processMessage(r.sessionID, task.msg)
-        task.result <- err
-    }
-}
-```
+同一 Session 的一个任务必须覆盖完整 Agent turn：接受 user、构建 Context、调用 Provider、执行全部 Tool、追加 Tool unit、再次调用 Provider、提交 final assistant。Pause、Resume、Close、Delete、消息删除和 cleanup 转换也进入同一个 gate，不能插入 turn 中间。`RunTurn` callback 获得只在该 task 中有效的 `*Turn`；其 `Snapshot` 和 `Append` 不会二次排队。
 
 ```text
-                  Manager
-                    │
-    ┌───────────────┼───────────────┐
-    │               │               │
-    ▼               ▼               ▼
- Session A       Session B       Session C
- ┌────────┐     ┌────────┐     ┌────────┐
- │ Queue  │     │ Queue  │     │ Queue  │
- │ [msg1] │     │ [msg3] │     │ [msg5] │
- │ [msg2] │     │ [msg4] │     │        │
- └───┬────┘     └───┬────┘     └───┬────┘
-     │              │              │
-   串行            串行           串行
-   goroutine     goroutine      goroutine
-     │              │              │
-     └──────────────┴──────────────┘
-                    │
-                 并行执行
+Session A queue: turn-1 → pause → turn-2
+Session B queue: turn-9 ──────────────────►
+                  串行       不同 Session 并行
 ```
 
----
+排队顺序以 Manager 接受任务的顺序为准。队列满时提交方等待；`ctx.Done()` 可以取消尚未开始的任务。v1 不返回 `ErrSessionBusy`、`ErrLockTimeout` 或自定义排队超时。
 
-## 4. 锁策略
-
-### 4.1 锁层级
-
-```text
-Manager.mu (RWMutex)         ← 保护 sessions map 和 agentIdx map
-  └─ Session 串行队列         ← 每个 Session 独立 goroutine，无需锁
-      └─ subscribers.mu (RWMutex)  ← 保护订阅者列表
-```
-
-### 4.2 Manager 锁
+## 2. Manager 结构
 
 ```go
 type Manager struct {
-    mu         sync.RWMutex   // 保护索引
-    sessions   map[string]*Session
-    agentIdx   map[string][]string
-    runners    map[string]*sessionRunner
-    subMu      sync.RWMutex   // 保护订阅者
-    subscribers map[string][]Subscriber
+    mu          sync.RWMutex
+    sessions    map[string]*Session
+    agentIdx    map[string]map[string]struct{}
+    runners     map[string]*runner
+    activeTurns map[turnKey]*turnControl
+    usedTurnIDs map[string]map[string]struct{} // session ID -> committed IDs
+    store       storage.Storage
+}
+
+type runner struct {
+    tasks chan task
+    done  chan struct{}
+}
+
+type task struct {
+    key    turnKey // zero value for lifecycle/cleanup tasks
+    ctx    context.Context
+    run    func(context.Context) error
+    out    chan error
+}
+
+type turnControl struct {
+    agentID string
+    ctx     context.Context
+    cancel  context.CancelCauseFunc
+    done    chan struct{}
 }
 ```
 
-| 操作 | 锁类型 | 持锁范围 |
-|------|--------|---------|
-| `Create` | Write Lock | 插入索引 |
-| `Get` | Read Lock | 查找 Session |
-| `List` | Read Lock | 遍历索引 |
-| `Delete` | Write Lock | 删除索引 |
-| `AppendMessage` | Read Lock → 释放 | 获取 Session 引用后释放，由 Runner 串行处理 |
+这不是公开扩展接口。固定容量只用于背压，不形成配置项；容量选择由实现测试确定。Runner 每次只执行一个 task，task 内可以进行耗时 Provider 调用，因此不同 Session 必须拥有不同 runner。每个 runner 用一个小 mutex/counter 记录 running + queued 数量，从而在接受时生成 position；`onQueued(position)` 在所有 Manager/runner 锁外调用，position 只是接受时前方任务数，不随后更新。
 
-### 4.3 Session 内部无锁
+## 3. 锁与快照规则
 
-```go
-// AppendMessage 通过 Runner 串行处理，无需 Session 级锁
-func (m *Manager) AppendMessage(sessionID string, msg Message) error {
-    m.mu.RLock()
-    runner, ok := m.runners[sessionID]
-    m.mu.RUnlock()
+| 资源 | 保护方式 | 禁止事项 |
+|------|----------|----------|
+| `sessions`、`agentIdx`、`runners` | `Manager.mu` | 持锁调用 Storage、Provider、Tool 或 Event Bus |
+| 单 Session 写顺序 | runner FIFO | 绕过 runner 直接修改 Session |
+| Session 读取 | Manager 下的不可变 snapshot | 向调用方返回内部 slice/map |
+| Event subscribers | Event Bus 自身锁 | 在 Session 锁内阻塞发布 |
 
-    if !ok {
-        return ErrSessionNotFound
-    }
+写 task 从当前 snapshot 深拷贝候选值；Storage 成功后只在短暂的 `Manager.mu` 临界区替换指针。`Get` 因而只能看到旧的完整 snapshot 或新的完整 snapshot，不能看到部分 Tool unit。
 
-    task := messageTask{
-        msg:    msg,
-        result: make(chan error, 1),
-    }
-    runner.queue <- task
+锁顺序固定为：先取得 runner 执行权，再短暂取得 `Manager.mu`。任何路径不得在持有 `Manager.mu` 时等待 runner，以免 Delete、cleanup 和查询形成死锁。
 
-    return <-task.result
-}
-```
+`Turn` handle 记录 runner 身份、Turn ID 和派生 `turnCtx`，仅供 callback 同步调用。callback 退出后调用其方法必须返回内部错误；实现不得通过 context value 判断“是否已持锁”，也不得允许 handle 跨 goroutine 并发使用。
 
----
+## 4. Turn 取消与失败
 
-## 5. 多 Session 并行
+- `RunTurn` 接受时先在 `activeTurns` 预留 key，并用 `context.WithCancelCause(ctx)` 保存真实 `CancelCauseFunc`；与 queued/running 或 `usedTurnIDs` 冲突时不入队。
+- 排队阶段取消：runner 跳过 task；若 user 尚未提交则释放预留且不消费 Turn ID，返回 `context.Cause(turnCtx)`。
+- Provider/Tool 阶段取消：向下游传播同一个 context；已提交 snapshot 保留，未提交 batch 丢弃。
+- `CancelTurn` 查找精确 `(sessionID, turnID)` 并调用保存的 cancel；`CancelAgentTurns(ctx, agentID, cause)` 收集该 Agent 的全部 handle 后逐一取消，并等待它们从 registry 移除或 ctx 到期。它是管理型收拢操作，Manager 进入 `closing`/`closed` 后仍可调用；快照为空时幂等返回 `nil`，有 handle 时等待 context 到期则返回 `context.Cause(ctx)`。二者都不得在 `Manager.mu` 内执行 cancel 或等待。
+- `RunTurn` 在预留成功后立即安装唯一 defer；无论 enqueue 失败、queued cancel、Session Delete、panic、callback error 或成功，该 defer 都从 `activeTurns` 删除并 `close(done)`。`CancelAgentTurns` 只等待这些 done channel，不轮询 map。
+- callback 或下游观察到的是 `turnCtx.Err()`；`RunTurn` 对调用方返回非 nil `context.Cause(turnCtx)`，业务层不得把所有取消压扁为 `context.Canceled`。
+- `AppendUser` 已提交的 ID 已在同一 snapshot 和 `usedTurnIDs` 中，不能因失败或取消释放；未提交 ID 只由上述 defer 释放预留。
+- Storage 失败：当前 task 返回 `ErrPersistenceFailed`，runner 继续处理下一个任务。
+- panic：runner 捕获、记录 `session.error`，使当前 task 失败并继续服务；不得让单个 Session 终止整个 Runtime。
 
-```go
-// processMessage 处理单条消息（在 Session 的专属 goroutine 中执行）。
-func (m *Manager) processMessage(sessionID string, msg Message) error {
-    sess, err := m.Get(sessionID)
-    if err != nil {
-        return err
-    }
+Tool calls 可以在当前 turn 内并发执行，但必须等待全部完成并按原始 call 顺序组成原子 Tool unit。并行 Tool 不允许启动同一 Session 的第二个 turn。
 
-    // 1. 追加用户消息
-    sess.Messages = append(sess.Messages, msg)
+## 5. 生命周期与容量竞争
 
-    // 2. 构建 Context（可能涉及 Memory、Skill 等）
-    ctx, err := m.contextMgr.Build(sess)
-    if err != nil {
-        return err
-    }
+Create 在 Manager 全局临界区预留该 Agent 的容量和新 ID，随后持久化；失败时释放预留。这样两个并发 Create 不会同时越过 `max_sessions_per_agent`。
 
-    // 3. 调用 Agent → Provider（流式返回）
-    // 此步骤可能耗时较长，但不阻塞其他 Session
-    resp, err := m.agentMgr.Chat(sess.AgentID, ctx)
-    if err != nil {
-        return err
-    }
+Close 提交后立即不再计入容量。Delete 必须在自己的 runner task 中完成，然后从索引摘除并停止 runner；已排队但尚未执行的任务统一返回 `ErrSessionNotFound`。Cleanup 与手动状态操作共用同一 task 路径。
 
-    // 4. 追加助手消息
-    sess.Messages = append(sess.Messages, resp)
+## 6. Runtime 关闭
 
-    // 5. 持久化
-    return m.persist(sess)
-}
-```
+Runtime 只调用一次 `Manager.Shutdown(ctx)`。该方法幂等，拥有 cleanup context、所有 Session runner 和它们的 WaitGroup：
 
-**关键点：**
-- `processMessage` 在 Session 专属 goroutine 中执行
-- 不同 Session 的 goroutine 互不阻塞
-- Provider 调用是 I/O 密集型，Go 协程天然并发
+关闭顺序：
+
+1. Runtime 停止 Remote API 接入并调用 `Agent.Manager.Quiesce()`；此后没有新 turn 入队，已登记 turn 保持运行。
+2. Manager 原子标记 closing，并立即取消 cleanup context、停止 cleanup timer；此后不得再生成 cleanup task，新提交返回 `ErrManagerClosed`。`CancelAgentTurns` 不属于新提交，仍可用于收拢 registry；没有活动 turn 时返回 `nil`。
+3. 已经进入 runner 队列的 cleanup 与普通 task 一样 drain；等待已开始和已排队 task 完成，直到 shutdown context 到期。
+4. 到期时收集所有 `turnControl.cancel`，以 shutdown deadline cause 逐一调用，再等待 runner 退出。Provider、Tool 和 callback 必须遵守派生 context；Go 无法强制终止忽略 context 的 goroutine，这种实现属于接口违约并记录 fatal shutdown 日志。
+5. 因每次变更已同步持久化，不执行额外 `persistAll`。
+6. 所有 cleanup/runner goroutine 退出后 `Shutdown` 才返回；若 shutdown context 曾结束，返回捕获的 `context.Cause(ctx)`。
+7. Storage 最后由 Runtime 关闭。
+
+禁止直接关闭仍可能被发送的 task channel；实现可用 closing flag + WaitGroup 避免 send-on-closed-channel。
+
+## 7. 最小并发验证
+
+实现至少覆盖：
+
+- 同一 Session 100 个并发提交按接受顺序完成；
+- 不同 Session 的阻塞 Provider 调用可重叠；
+- 排队 context 取消不会执行 task；
+- queued 取消前未提交 user 时 Turn ID 可重用；提交 user 后取消、Clear、DeleteMessage 和 Restore 后均拒绝重复 ID；
+- CancelTurn、Agent Stop 和 shutdown deadline 都能取消保存的 handle；
+- Tool unit 对并发读者始终全有或全无；
+- Close/Delete/cleanup 不会插入正在运行的 turn；
+- `go test -race ./...` 无数据竞争。
 
 ---
 
-## 6. 并发场景分析
-
-### 6.1 同一 Session 多消息快速到达
-
-```text
-Client 发送 msg1 → queue: [msg1]
-Client 发送 msg2 → queue: [msg1, msg2]
-                       │
-                  串行处理 msg1 → 完成后处理 msg2
-```
-
-- msg2 等待 msg1 处理完成
-- 队列容量 256，超出则阻塞调用方
-
-### 6.2 多 Session 同时活跃
-
-```text
-Session A: 处理 msg1 (Provider 调用中, ~2s)
-Session B: 处理 msg3 (Provider 调用中, ~3s)  ← 并行
-Session C: 处理 msg5 (Provider 调用中, ~1s)  ← 并行
-```
-
-- 三个 Session 独立 goroutine，完全并行
-- Provider 层负责连接池和限流
-
-### 6.3 Runtime 关闭
-
-```go
-func (m *Manager) Shutdown(ctx context.Context) error {
-    // 1. 停止接收新消息
-    m.mu.Lock()
-    for _, runner := range m.runners {
-        close(runner.queue)
-    }
-    m.mu.Unlock()
-
-    // 2. 等待所有 Runner 完成
-    for _, runner := range m.runners {
-        select {
-        case <-runner.done:
-        case <-ctx.Done():
-            return ctx.Err()
-        }
-    }
-
-    // 3. 持久化所有 Session
-    return m.persistAll()
-}
-```
-
----
-
-## 7. 性能考量
-
-| 指标 | 目标 | 说明 |
-|------|------|------|
-| 单 Session 消息吞吐 | 10 msg/s | 受 Provider 延迟限制 |
-| 并发 Session 数 | 1000+ | 受内存和文件描述符限制 |
-| 队列等待时间 | <100ms | 正常负载下 |
-| 锁竞争 | 极低 | RWMutex 读多写少 |
-
----
-
-*最后更新: 2025-07-17*
+*最后更新: 2026-07-22*

@@ -1,300 +1,131 @@
-# 多格式支持
+# 配置格式
 
-> Yaa! Yet Another Agent Runtime
-> 依赖: [README.md](README.md) §1.1, [loading.md](loading.md)
-
----
-
-## 1. 概述
-
-Yaa! 配置系统主推 YAML，同时兼容 TOML 和 JSON。通过统一的解析接口和文件扩展名自动检测，用户可自由选择格式，Runtime 内部统一转换为 Go 结构体。
-
-### 1.1 支持矩阵
-
-| 格式 | 扩展名 | 库 | 场景 |
-|------|--------|----|------|
-| **YAML** | `.yaml` `.yml` | `gopkg.in/yaml.v3` | 主推格式，人类友好 |
-| **TOML** | `.toml` | `github.com/BurntSushi/toml` | 运维场景，语义清晰 |
-| **JSON** | `.json` | `encoding/json` (标准库) | 程序生成、API 交互 |
-
-### 1.2 设计原则
-
-- **统一接口**：不同格式解析为同一个 `Config` 结构体
-- **自动检测**：根据文件扩展名选择解析器，无需手动指定
-- **格式等价**：三种格式表达能力对齐，任意格式可无损转换
-- **零 CGO**：所有解析库均为纯 Go 实现
+> 文档路径: `docs/config/formats.md`
+> 上级: [README.md](README.md)
 
 ---
 
-## 2. 文件扩展名自动检测
+## 1. 支持范围
+
+| 格式 | 扩展名 | 解析器 |
+|------|--------|--------|
+| YAML | `.yaml`, `.yml` | `gopkg.in/yaml.v3` |
+| JSON | `.json` | 标准库 `encoding/json` |
+| TOML | `.toml` | `github.com/BurntSushi/toml` |
+
+主格式是 YAML。路径没有扩展名时按 YAML；存在未知扩展名时返回 `ErrConfigFormatUnsupported`，不做内容嗅探。
 
 ```go
-package config
-
-import (
-	"fmt"
-	"path/filepath"
-	"strings"
-)
-
 type Format string
 
 const (
-	FormatYAML Format = "yaml"
-	FormatTOML Format = "toml"
-	FormatJSON Format = "json"
+    FormatYAML Format = "yaml"
+    FormatJSON Format = "json"
+    FormatTOML Format = "toml"
 )
 
-// DetectFormat 根据文件扩展名自动检测配置格式
 func DetectFormat(path string) (Format, error) {
-	ext := strings.ToLower(filepath.Ext(path))
-	switch ext {
-	case ".yaml", ".yml":
-		return FormatYAML, nil
-	case ".toml":
-		return FormatTOML, nil
-	case ".json":
-		return FormatJSON, nil
-	default:
-		return "", fmt.Errorf("unsupported config format: %s (supported: .yaml, .yml, .toml, .json)", ext)
-	}
+    switch strings.ToLower(filepath.Ext(path)) {
+    case "", ".yaml", ".yml":
+        return FormatYAML, nil
+    case ".json":
+        return FormatJSON, nil
+    case ".toml":
+        return FormatTOML, nil
+    default:
+        return "", fmt.Errorf("%w: %s", ErrConfigFormatUnsupported, path)
+    }
 }
 ```
 
----
+## 2. 统一中间表示
 
-## 3. 统一解析接口
+解析器只产生 `map[string]any`，不直接写 `Config`。后续统一执行迁移、环境变量展开、默认值注入、presence-aware 解码和校验。
 
 ```go
-package config
-
-import (
-	"encoding/json"
-	"fmt"
-	"os"
-
-	"github.com/BurntSushi/toml"
-	"gopkg.in/yaml.v3"
-)
-
-// Parser 是所有格式解析器的统一接口
-type Parser interface {
-	Parse(data []byte, v any) error
-	Marshal(v any) ([]byte, error)
+func ParseToMap(data []byte, format Format) (map[string]any, error) {
+    out := map[string]any{}
+    switch format {
+    case FormatYAML:
+        if err := yaml.Unmarshal(data, &out); err != nil {
+            return nil, fmt.Errorf("parse yaml: %w", err)
+        }
+    case FormatJSON:
+        dec := json.NewDecoder(bytes.NewReader(data))
+        dec.UseNumber()
+        if err := dec.Decode(&out); err != nil {
+            return nil, fmt.Errorf("parse json: %w", err)
+        }
+        var extra any
+        if err := dec.Decode(&extra); err != io.EOF {
+            return nil, errors.New("parse json: multiple top-level values")
+        }
+    case FormatTOML:
+        if _, err := toml.Decode(string(data), &out); err != nil {
+            return nil, fmt.Errorf("parse toml: %w", err)
+        }
+    default:
+        return nil, fmt.Errorf("%w: %s", ErrConfigFormatUnsupported, format)
+    }
+    if out == nil {
+        out = map[string]any{}
+    }
+    return out, nil
 }
 
-// --- YAML ---
-
-type YAMLParser struct{}
-
-func (YAMLParser) Parse(data []byte, v any) error  { return yaml.Unmarshal(data, v) }
-func (YAMLParser) Marshal(v any) ([]byte, error)  { return yaml.Marshal(v) }
-
-// --- TOML ---
-
-type TOMLParser struct{}
-
-func (TOMLParser) Parse(data []byte, v any) error { return toml.Unmarshal(data, v) }
-func (TOMLParser) Marshal(v any) ([]byte, error) { return toml.Marshal(v) }
-
-// --- JSON ---
-
-type JSONParser struct{}
-
-func (JSONParser) Parse(data []byte, v any) error { return json.Unmarshal(data, v) }
-func (JSONParser) Marshal(v any) ([]byte, error) { return json.MarshalIndent(v, "", "  ") }
-
-// NewParser 根据格式创建对应的解析器
-func NewParser(format Format) (Parser, error) {
-	switch format {
-	case FormatYAML:
-		return YAMLParser{}, nil
-	case FormatTOML:
-		return TOMLParser{}, nil
-	case FormatJSON:
-		return JSONParser{}, nil
-	default:
-		return nil, fmt.Errorf("unsupported format: %s", format)
-	}
-}
-
-// ParseFile 根据文件扩展名自动选择解析器并解析
-func ParseFile(path string, v any) error {
-	format, err := DetectFormat(path)
-	if err != nil {
-		return err
-	}
-	parser, err := NewParser(format)
-	if err != nil {
-		return err
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("read config file: %w", err)
-	}
-	if err := parser.Parse(data, v); err != nil {
-		return fmt.Errorf("parse %s config: %w", format, err)
-	}
-	return nil
+func ParseFileToMap(path string) (map[string]any, error) {
+    format, err := DetectFormat(path)
+    if err != nil {
+        return nil, err
+    }
+    data, err := os.ReadFile(path)
+    if err != nil {
+        return nil, fmt.Errorf("read config %s: %w", path, err)
+    }
+    return ParseToMap(data, format)
 }
 ```
 
----
+JSON number 保持为 `json.Number`，最终由统一解码器按目标字段转换；超出目标整数范围时必须报错。YAML map key 必须是字符串。各解析器的未知字段都由 `DecodeInto(... ErrorUnused=true)` 在同一阶段拒绝。
+
+## 3. 跨格式语义
+
+| 值 | YAML | TOML | JSON |
+|----|------|------|------|
+| duration | `timeout: 30s` | `timeout = "30s"` | `"timeout": "30s"` |
+| 环境变量 | `api_key: "${API_KEY}"` | `api_key = "${API_KEY}"` | `"api_key": "${API_KEY}"` |
+| 空数组 | `items: []` | `items = []` | `"items": []` |
+| null | `null` | 不支持 | `null` |
+
+`duration` 始终是 Go duration 字符串，不接受不同格式各自的整数单位。TOML 无 null，因此可空字段只能省略；YAML/JSON 的 null 只允许写入指针、slice 或 map，写入标量字段时报错。
 
 ## 4. 格式转换
 
-### 4.1 转换流程
-
-```text
-源文件 ──Parse──▶ Config 结构体 ──Marshal──▶ 目标格式
- (YAML)           (Go struct)               (TOML/JSON)
-```
-
-### 4.2 转换实现
+`yaa config convert` 转换原始 Map，不调用环境变量展开，也不输出 Effective Config，避免把 Secret 展开后写入磁盘。目标文件使用临时文件 + `fsync` + `Rename` 原子替换，权限固定为 `0600`。
 
 ```go
-package config
-
-import (
-	"fmt"
-	"os"
-	"path/filepath"
-)
-
-// Convert 将配置文件从一种格式转换为另一种格式
 func Convert(srcPath, dstPath string) error {
-	// 1. 解析源文件
-	cfg := &Config{}
-	if err := ParseFile(srcPath, cfg); err != nil {
-		return fmt.Errorf("parse source: %w", err)
-	}
-
-	// 2. 检测目标格式
-	dstFormat, err := DetectFormat(dstPath)
-	if err != nil {
-		return fmt.Errorf("detect dst format: %w", err)
-	}
-
-	// 3. 序列化为目标格式
-	parser, err := NewParser(dstFormat)
-	if err != nil {
-		return err
-	}
-	data, err := parser.Marshal(cfg)
-	if err != nil {
-		return fmt.Errorf("marshal to %s: %w", dstFormat, err)
-	}
-
-	// 4. 写入目标文件
-	if err := os.WriteFile(dstPath, data, 0644); err != nil {
-		return fmt.Errorf("write dst file: %w", err)
-	}
-	return nil
+    raw, err := ParseFileToMap(srcPath)
+    if err != nil {
+        return err
+    }
+    dstFormat, err := DetectFormat(dstPath)
+    if err != nil {
+        return err
+    }
+    data, err := MarshalMap(raw, dstFormat)
+    if err != nil {
+        return err
+    }
+    return atomicWriteFile(dstPath, data, 0o600)
 }
 ```
 
-### 4.3 CLI 用法
+转换前应以源路径执行一次完整 `config.Load` 做 schema 校验；转换写出的仍是未展开环境变量、未注入默认值的原始配置。TOML 无法表达的 null 会返回明确错误，不静默删除。
 
 ```bash
-# YAML → TOML
-yaa config convert --from config.yaml --to config.toml
-
-# YAML → JSON
-yaa config convert --from config.yaml --to config.json
-
-# TOML → YAML
-yaa config convert --from config.toml --to config.yaml
+yaa config convert --from ./yaa.yaml --to ./yaa.toml
 ```
-
----
-
-## 5. 格式等价性
-
-三种格式对同一配置的表达对照：
-
-| 特性 | YAML | TOML | JSON |
-|------|------|------|------|
-| 注释 | `# 注释` | `# 注释` | ❌ 不支持 |
-| 嵌套对象 | 缩进 | `[section]` | `{}` 嵌套 |
-| 数组 | `- item` | `item = [...]` | `[...]` |
-| 多行字符串 | `|` 或 `>` | `"""..."""` | 需转义 `\n` |
-| 布尔值 | `true`/`false` | `true`/`false` | `true`/`false` |
-| 空值 | `null` 或 `~` | 不支持 | `null` |
-| 人类可读 | ⭐⭐⭐ | ⭐⭐⭐ | ⭐ |
-
-### 等价配置示例
-
-**YAML (`config.yaml`):**
-
-```yaml
-runtime:
-  api:
-    http:
-      addr: ":8080"
-      read_timeout: 30s
-log:
-  level: info
-  format: json
-providers:
-  - name: openai
-    model: gpt-4o
-    api_key: ${OPENAI_API_KEY}
-```
-
-**TOML (`config.toml`):**
-
-```toml
-[runtime.api.http]
-addr = ":8080"
-read_timeout = "30s"
-
-[log]
-level = "info"
-format = "json"
-
-[[providers]]
-name = "openai"
-model = "gpt-4o"
-api_key = "${OPENAI_API_KEY}"
-```
-
-**JSON (`config.json`):**
-
-```json
-{
-  "runtime": {
-    "api": {
-      "http": {
-        "addr": ":8080",
-        "read_timeout": "30s"
-      }
-    }
-  },
-  "log": {
-    "level": "info",
-    "format": "json"
-  },
-  "providers": [
-    {
-      "name": "openai",
-      "model": "gpt-4o",
-      "api_key": "${OPENAI_API_KEY}"
-    }
-  ]
-}
-```
-
----
-
-## 6. 注意事项
-
-| 注意点 | 说明 |
-|--------|------|
-| **TOML 限制** | TOML 不支持 `null` 值，可选字段需使用零值或指针 |
-| **JSON 注释** | JSON 标准不支持注释，建议用 YAML/TOML 编写人工维护的配置 |
-| **类型保真** | YAML 整数 `1` 和字符串 `"1"` 需注意类型推断，建议显式标注 |
-| **环境变量** | 三种格式均支持 `${VAR_NAME}` 引用，在解析后统一展开 |
-| **推荐格式** | 新项目推荐 YAML，运维团队偏好 TOML，程序生成用 JSON |
 
 ---
 

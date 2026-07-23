@@ -1,211 +1,143 @@
 # Plugin 配置参考
 
-> Yaa! Yet Another Agent Runtime
-> 文档路径: docs/plugin/config-ref.md
-> 上级: [README.md](../README.md)
-> 依赖: [architecture.md](../architecture.md) §3.12, [config/reference.md](../config/reference.md)
+> 文档路径: `docs/plugin/config-ref.md`
+> 上级: [README.md](README.md)
 
 ---
 
-## 1. 概述
+## 1. Runtime 配置
 
-Plugin 是 Yaa! 的扩展机制，允许在不修改核心代码的前提下注册自定义 Tool、Provider、Hook 等能力。Plugin 配置位于 `yaa.yaml` 的 `plugins` 节点，支持目录扫描、按名启用/禁用、以及插件级配置传递。
-
----
-
-## 2. 顶层结构
+配置 DTO 由 `internal/config` 持有，Plugin 模块接收 `config.PluginsConfig`，不重复声明反序列化类型。
 
 ```go
 type PluginsConfig struct {
-    Dir     string         `yaml:"dir"      json:"dir"`      // 插件扫描目录
-    Entries []PluginEntry  `yaml:"entries"  json:"entries"`  // 插件条目列表
+    Paths          []string      `yaml:"paths" json:"paths"`
+    AutoStart      bool          `yaml:"auto_start" json:"auto_start"`
+    StartupTimeout time.Duration `yaml:"startup_timeout" json:"startup_timeout"`
+    StopTimeout    time.Duration `yaml:"stop_timeout" json:"stop_timeout"`
+    HealthInterval time.Duration `yaml:"health_interval" json:"health_interval"`
+    HealthTimeout  time.Duration `yaml:"health_timeout" json:"health_timeout"`
+    Restart        RestartConfig `yaml:"restart" json:"restart"`
+    Entries        []PluginEntry `yaml:"entries" json:"entries"`
 }
-```
 
-| 字段 | 类型 | 默认值 | 热更新 | 说明 |
-|------|------|--------|:------:|------|
-| `dir` | `string` | `"./plugins"` | ✅ | 插件扫描目录，Runtime 启动时递归扫描 |
-| `entries` | `[]PluginEntry` | `[]` | ✅ | 显式声明的插件条目，覆盖扫描结果 |
+type RestartConfig struct {
+    Enabled     bool          `yaml:"enabled" json:"enabled"`
+    MaxAttempts int           `yaml:"max_attempts" json:"max_attempts"`
+    Backoff     time.Duration `yaml:"backoff" json:"backoff"`
+}
 
----
-
-## 3. 插件条目
-
-```go
 type PluginEntry struct {
-    Name    string         `yaml:"name"     json:"name"`     // 插件名称（唯一标识）
-    Enabled bool           `yaml:"enabled"  json:"enabled"`  // 是否启用
-    Config  map[string]any `yaml:"config"   json:"config"`   // 传递给插件的配置
+    ID      string         `yaml:"id" json:"id"`
+    Enabled *bool          `yaml:"enabled" json:"enabled"`
+    Config  map[string]any `yaml:"config" json:"config"`
 }
 ```
 
-| 字段 | 类型 | 默认值 | 热更新 | 说明 |
-|------|------|--------|:------:|------|
-| `name` | `string` | — | ✅ | 插件唯一标识，需与插件 `plugin.yaml` 中 `name` 一致 |
-| `enabled` | `bool` | `true` | ✅ | 是否启用该插件；设为 `false` 可临时禁用 |
-| `config` | `map[string]any` | `{}` | ✅ | 传递给插件的自由配置，由插件自行解析 |
+| 字段 | 默认值 | 规则 |
+|------|--------|------|
+| `paths` | `["./plugins"]` | 相对路径以主配置文件目录为基准，规范化后扫描 |
+| `auto_start` | `true` | false 时只发现/校验 Manifest，不启动进程 |
+| `startup_timeout` | `30s` | 覆盖进程启动、Dial、Handshake、Init、Ready |
+| `stop_timeout` | `10s` | 覆盖 Stop RPC 和等待退出；超时 Kill |
+| `health_interval` | `30s` | Health 调用周期 |
+| `health_timeout` | `5s` | 单次 Health RPC 超时；失败不自动重启 |
+| `restart.enabled` | `true` | Runtime 未进入 Stop 时进程退出后是否重启 |
+| `restart.max_attempts` | `3` | 每个 Plugin 每次 Runtime 生命周期的重启上限 |
+| `restart.backoff` | `1s` | 首次等待，之后指数退避，最大 60s |
+| `entries[].id` | 无 | 必须与 Manifest ID 唯一匹配 |
+| `entries[].enabled` | 未设置 | 显式 true/false 优先；未设置时使用 `default_enabled` |
+| `entries[].config` | `{}` | 启动前按 Manifest `config_schema` 校验，再通过 Init 传递 |
 
----
-
-## 4. 完整 YAML 示例
+所有 `plugins.*` 都需要重启，不能通过 config reload 改变正在运行的 Plugin。
 
 ```yaml
-# yaa.yaml — plugins 节点
 plugins:
-  dir: "./plugins"
+  paths: ["./plugins"]
+  auto_start: true
+  startup_timeout: 30s
+  stop_timeout: 10s
+  health_interval: 30s
+  health_timeout: 5s
+  restart:
+    enabled: true
+    max_attempts: 3
+    backoff: 1s
   entries:
-    # 天气插件：启用 + 自定义配置
-    - name: "weather"
+    - id: weather
       enabled: true
       config:
         api_key: "${WEATHER_API_KEY}"
-        default_unit: "celsius"
-        cache_ttl: 600s
-
-    # 日志增强插件：启用，无额外配置
-    - name: "log-enhancer"
-      enabled: true
-
-    # 实验性插件：显式禁用
-    - name: "experiment-feature"
-      enabled: false
-      config:
-        flag: "preview"
+        default_unit: celsius
 ```
 
----
+## 2. Manifest
 
-## 5. 插件目录结构
-
-扫描目录下每个子目录视为一个独立插件，需包含 `plugin.yaml` 声明文件：
-
-```text
-plugins/
-├── weather/
-│   ├── plugin.yaml        # 插件声明
-│   ├── main.so            # Go 插件（.so / .dll）
-│   └── assets/            # 插件资源文件
-├── log-enhancer/
-│   ├── plugin.yaml
-│   └── main.so
-└── experiment-feature/
-    ├── plugin.yaml
-    └── main.so
-```
-
-`plugin.yaml` 示例：
+每个直接子目录包含一个 `plugin.yaml` 和同目录可执行文件。MVP 不支持远程 endpoint，也不加载动态库。
 
 ```yaml
-# plugins/weather/plugin.yaml
-name: "weather"
-version: "0.1.0"
-author: "Yaa! Team"
-description: "Weather query tool plugin"
-type: "tool"          # tool / provider / hook / mixed
-entry: "main.so"      # 入口文件（相对路径）
+id: weather
+display_name: Weather
+description: Weather query capability
+version: 0.1.0
+protocol_version: "1"
+requires_runtime: ">=0.1.0 <1.0.0"
+entry: yaa-plugin-weather
+default_enabled: false
+dependencies:
+  - id: shared-cache
+    version: ">=1.0.0 <2.0.0"
+    optional: true
 provides:
-  tools: ["weather"]
+  - type: tool
+    name: weather
+    description: Query current weather by city
+    schema:
+      type: object
+      properties:
+        city: {type: string}
+      required: [city]
+config_schema:
+  type: object
+  additionalProperties: false
+  properties:
+    api_key: {type: string}
+    default_unit: {type: string, enum: [celsius, fahrenheit]}
+  required: [api_key]
 ```
 
----
+| 字段 | 必填 | 规则 |
+|------|:----:|------|
+| `id` | 是 | 小写字母、数字和 `-`；全局唯一 |
+| `display_name`, `description` | 否 | 展示信息，不参与身份校验 |
+| `version` | 是 | Plugin 业务 SemVer |
+| `protocol_version` | 是 | Plugin RPC major 字符串；MVP 只接受 `"1"` |
+| `requires_runtime` | 否 | Runtime 业务版本 SemVer range |
+| `entry` | 是 | Manifest 目录内的可执行文件；规范化后不得逃逸目录 |
+| `default_enabled` | 否 | 默认 false |
+| `dependencies[]` | 否 | `id`、SemVer `version`、`optional` |
+| `provides[]` | 是 | typed capability list；Tool 的 name、description、schema 必填 |
+| `config_schema` | 否 | JSON Schema；省略时只接受空 config |
 
-## 6. 插件级配置传递
+`provides[].type` 的 v1 枚举只有 `tool`，且 `name`、`description`、`schema` 必填。Skill 继续由 SKILL.md 目录加载；Hook/Middleware、Provider 和 Memory 不使用 v1 Plugin RPC。出现其他 type 时 Manifest 校验直接失败。
 
-Runtime 在加载插件时，将 `entries[].config` 原样传递给插件入口函数。插件自行解析所需字段。
+JSON Schema 的 `default` 仅是说明，不由 Runtime 注入。Plugin 在 Init 内对未配置字段应用自己的默认值；Runtime 只校验用户提供的值。
 
-```go
-// 插件入口函数签名
-type PluginInit func(ctx context.Context, cfg PluginContext) error
-
-type PluginContext struct {
-    Name    string
-    Config  map[string]any   // 来自 yaa.yaml entries[].config
-    Runtime *Runtime          // Runtime 引用，可注册 Tool / Provider 等
-    Logger  *slog.Logger
-}
-```
-
-插件实现示例：
-
-```go
-package main
-
-import (
-    "context"
-    "fmt"
-    "log/slog"
-    "time"
-)
-
-// WeatherPlugin 天气插件
-type WeatherPlugin struct {
-    apiKey      string
-    defaultUnit string
-    cacheTTL    time.Duration
-    logger      *slog.Logger
-}
-
-// Init 插件入口函数，由 Runtime 调用
-func Init(ctx context.Context, pctx PluginContext) error {
-    p := &WeatherPlugin{
-        apiKey:      getString(pctx.Config, "api_key", ""),
-        defaultUnit: getString(pctx.Config, "default_unit", "celsius"),
-        cacheTTL:    getDuration(pctx.Config, "cache_ttl", 300*time.Second),
-        logger:      pctx.Logger,
-    }
-
-    if p.apiKey == "" {
-        return fmt.Errorf("weather plugin: api_key is required")
-    }
-
-    // 注册 Tool
-    pctx.Runtime.Tools.Register(&WeatherTool{plugin: p})
-    pctx.Logger.Info("weather plugin loaded", "unit", p.defaultUnit)
-    return nil
-}
-
-func getString(cfg map[string]any, key, def string) string {
-    if v, ok := cfg[key].(string); ok {
-        return v
-    }
-    return def
-}
-
-func getDuration(cfg map[string]any, key string, def time.Duration) time.Duration {
-    if v, ok := cfg[key].(string); ok {
-        if d, err := time.ParseDuration(v); err == nil {
-            return d
-        }
-    }
-    return def
-}
-```
-
----
-
-## 7. 启用/禁用机制
-
-| 场景 | 行为 |
-|------|------|
-| `entries` 中声明 `enabled: false` | 插件被跳过，不加载、不注册 |
-| `entries` 中声明 `enabled: true` | 正常加载并传递 `config` |
-| 目录扫描但 `entries` 未声明 | 按 `plugin.yaml` 默认启用 |
-| `entries` 声明但目录不存在 | 启动报错，提示插件缺失 |
-| 热更新 `enabled` 字段 | 运行时动态加载/卸载插件 |
-
----
-
-## 8. 配置优先级
+## 3. 合并与启动
 
 ```text
-命令行参数 --plugin.<name>.<key>=<value>
-    ↓ 覆盖
-yaa.yaml entries[].config
-    ↓ 覆盖
-plugin.yaml 默认值
+discover Manifest
+  → resolve explicit entry by id
+  → enabled = entry.enabled ?? manifest.default_enabled
+  → validate requires_runtime/dependencies
+  → validate entry.config against config_schema
+  → start local process
+  → Handshake → Init → Ready
 ```
 
-环境变量引用同样支持：`config` 字段值中使用 `${VAR_NAME}` 语法，Runtime 加载时自动替换。
+目录扫描但无显式 entry 时按 `default_enabled`；显式 entry 找不到 Manifest 是配置错误。多个 `paths` 发现相同 ID 时拒绝启动该 ID，不采用“第一个获胜”。
+
+环境变量只由主 Config Loader 展开一次。Plugin RPC、日志、错误、Health 和观测端点不得回显展开后的 Secret。
 
 ---
 

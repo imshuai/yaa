@@ -1,330 +1,167 @@
-# MCP 与其他模块集成
+# MCP 集成设计
 
 > 文档路径: `docs/mcp/integration.md`
-> 上级: `docs/mcp/README.md`
+> 上级: [`README.md`](README.md)
 
 ---
 
-## 1. 概述
+## 1. Tool 集成
 
-MCP 在 Yaa! 中并非孤立模块——它深度嵌入 Runtime 的初始化链路、Tool 注册体系、Agent 执行循环和 Config 加载流程。本文档描述 MCP 与四大核心模块的集成方式。
-
-Yaa! 的初始化顺序为：
+MCP Client 完成 `tools/list` 后，将每个 Tool 转换为 Yaa! Tool Definition，并注册带命名空间的 Proxy：
 
 ```text
-Config → Storage → Provider → Memory → Tool → Skill → MCP →
-Session → Context → Planner → Agent → Auth → API → Runtime Ready
+MCP Server: search
+MCP Tool:   query
+Yaa! Tool:  mcp.search.query
 ```
 
-MCP 排在 Tool 和 Skill 之后初始化，这保证了 MCP Client 可以将外部 Server 的 Tool 直接注册到已经就绪的 Tool Manager 中。
-
----
-
-## 2. 与 Tool Manager 集成
-
-### 2.1 外部 MCP Tool → Yaa! Tool 适配
-
-MCP Server 暴露的 Tool 通过适配器（Adapter）转换为 Yaa! 的 `Tool` 接口，注册到 Tool Manager 后与内置 Tool 无差别使用。
+同一上游的所有 Proxy 共享一个稳定 handle：
 
 ```go
-// MCPToolAdapter 将 MCP Server 的 Tool 适配为 Yaa! Tool 接口。
-type MCPToolAdapter struct {
-    serverName string   // MCP Server 名称，用作命名空间前缀
-    toolName   string   // MCP Tool 原始名称
-    schema     json.RawMessage // MCP Tool 的 JSON Schema
-    client     *mcp.Client    // 关联的 MCP Client 连接
+import (
+    "context"
+    "encoding/json"
+    "strings"
+    "sync/atomic"
+    "time"
+)
+
+type ProxyHandle struct {
+    client atomic.Pointer[Client]
 }
 
-func (a *MCPToolAdapter) Name() string {
-    return fmt.Sprintf("mcp.%s.%s", a.serverName, a.toolName)
+type MCPToolProxy struct {
+    server     string
+    remoteName string
+    schema     json.RawMessage
+    timeout    time.Duration // 0 表示只使用 Tool Manager 的 caller deadline
+    handle     *ProxyHandle
 }
 
-func (a *MCPToolAdapter) Description() string {
-    // 从 MCP Tool 元数据中获取描述
-    return a.client.GetToolDescription(a.serverName, a.toolName)
+func (p *MCPToolProxy) Execute(ctx context.Context, scope tool.ExecutionScope, params map[string]any) (tool.ToolResult, error) {
+    client := p.handle.client.Load()
+    if client == nil {
+        return tool.ToolResult{}, ErrMCPUnavailable
+    }
+    callCtx := ctx
+    stopTimeout := func() {}
+    if p.timeout > 0 {
+        var cancel context.CancelCauseFunc
+        callCtx, cancel = context.WithCancelCause(ctx)
+        timer := time.AfterFunc(p.timeout, func() {
+            cancel(ErrMCPToolTimeout)
+        })
+        stopTimeout = func() {
+            timer.Stop()
+            cancel(nil)
+        }
+    }
+    defer stopTimeout()
+    result, err := client.CallTool(callCtx, p.remoteName, params)
+    if ctx.Err() != nil {
+        return tool.ToolResult{}, context.Cause(ctx)
+    }
+    if callCtx.Err() != nil {
+        return tool.ToolResult{}, context.Cause(callCtx)
+    }
+    return toToolResult(result, err)
 }
 
-func (a *MCPToolAdapter) Parameters() json.RawMessage {
-    return a.info.InputSchema
-}
-
-func (a *MCPToolAdapter) Execute(ctx context.Context, params map[string]any) (tool.ToolResult, error) {
-    // 将参数转发给 MCP Server 执行
-    rawResult, err := a.client.CallTool(ctx, a.serverName, a.toolName, params)
+func toToolResult(result *CallToolResult, err error) (tool.ToolResult, error) {
     if err != nil {
-        return tool.ToolResult{IsError: true, Content: fmt.Sprintf("MCP 调用失败: %v", err)}, nil
+        return tool.ToolResult{}, err
     }
-    return tool.ToolResult{Content: rawResult.Content}, nil
+    if result == nil {
+        return tool.ToolResult{}, ErrMCPProtocolError
+    }
+    parts := make([]string, 0, len(result.Content))
+    total := 0
+    for _, content := range result.Content {
+        if content.Type != "text" {
+            return tool.ToolResult{}, ErrMCPUnsupportedContent
+        }
+        total += len(content.Text)
+        if total > 4<<20 {
+            return tool.ToolResult{}, ErrMCPProtocolError
+        }
+        parts = append(parts, content.Text)
+    }
+    return tool.ToolResult{
+        Content: strings.Join(parts, "\n"),
+        IsError: result.IsError,
+    }, nil
+}
+
+func toMCPResult(result tool.ToolResult) *CallToolResult {
+    return &CallToolResult{
+        Content: []Content{{Type: "text", Text: result.Content}},
+        IsError: result.IsError,
+    }
 }
 ```
 
-### 2.2 注册流程
+Proxy 保存 Server 名称、远端 Tool 名称、不可变 Schema 和可选 MCP hard timeout；参数校验在调用前执行，结果统一转换为 `tool.ToolResult`。Go 1.20 没有 `context.WithTimeoutCause`，因此非零 hard cap 使用 `WithCancelCause` + `time.AfterFunc`；返回前先检查 caller、再检查 child cause，cleanup 最后停止 timer 并调用 `cancel(nil)`。空 content 映射为空文本；多个 text block 按 wire 顺序以单个换行连接；`isError` 原样保留；内部 Meta 不上 wire。v1 Client 遇到 image/audio/resource block 返回 `ErrMCPUnsupportedContent`，但不关闭一条语法合法的连接。反向映射始终产生一个 text block，即使 Content 为空。首次发现成功后 Proxy 注册一次；暂时断线对共享 handle 执行 `Store(nil)`，不从 Tool Manager 注销。`scope` 只用于 Yaa! 权限/审计，不得塞进远端 Tool arguments。
 
-MCP Manager 初始化时，连接所有配置的 MCP Server，枚举其 Tool，逐一注册到 Tool Manager：
+## 2. Agent / Session 集成
 
-```go
-func (m *Manager) Init(toolMgr *tool.Manager) error {
-    for _, serverCfg := range m.config.Servers {
-        client, err := m.connect(serverCfg)
-        if err != nil {
-            m.logger.Warn("MCP server 连接失败，跳过", "server", serverCfg.Name, "err", err)
-            continue
-        }
-        m.clients[serverCfg.Name] = client
+Agent 的 `tools` 白名单引用完整名称 `mcp.<server>.<tool>`。每次 Agent 请求从当前 Tool Manager 和 Agent allowlist 投影可用 Tool；Session snapshot 不保存 Tool 集合。Server 断线后不改写历史 Tool unit，下一次调用返回 `ErrMCPUnavailable`。
 
-        // 枚举 Server 暴露的 Tool
-        tools, err := client.ListTools(ctx)
-        if err != nil {
-            m.logger.Warn("MCP tool 枚举失败", "server", serverCfg.Name, "err", err)
-            continue
-        }
-
-        // 将每个 MCP Tool 注册为 Yaa! Tool
-        for _, t := range tools {
-            adapter := &MCPToolAdapter{
-                serverName: serverCfg.Name,
-                toolName:  t.Name,
-                schema:     t.InputSchema,
-                client:     client,
-            }
-            toolMgr.Register(adapter, tool.ToolConfig{
-                Enabled: true,
-                Timeout: 60 * time.Second,
-            })
-            m.logger.Info("MCP Tool 已注册", "tool", adapter.Name())
-        }
-    }
-    return nil
-}
-```
-
-### 2.3 命名空间与 ToolInfo
-
-MCP Tool 在 Tool Manager 中使用 `mcp.<server>.<tool>` 命名格式，避免与内置 Tool 冲突。
-
-| 字段 | 值 |
-|------|-----|
-| `ToolInfo.Name` | `mcp.filesystem.read_file` |
-| `ToolInfo.Source` | `"mcp"` |
-| `ToolInfo.Description` | MCP Server 提供的描述 |
-| `ToolInfo.Parameters` | MCP Server 返回的 JSON Schema |
-
-Agent 的 Tool 白名单中可以直接引用 MCP Tool：
-
-```yaml
-agents:
-  - id: "fs-agent"
-    tools: ["mcp.filesystem.read_file", "mcp.filesystem.write_file"]
-```
-
----
-
-## 3. 与 Agent Loop 集成
-
-### 3.1 执行循环中的 MCP Tool 调用
-
-MCP Tool 注册到 Tool Manager 后，Agent Loop 无需感知 MCP 的存在——所有 Tool 调用统一走 `ToolManager.Execute` / `ExecuteBatch`。
-
-```text
-Agent Loop (每轮迭代):
-  │
-  ├─ 1. 获取 Agent 可用 Tool 列表
-  │     └─ ToolManager.ListForAgent(agentID)
-  │     └─ 结果包含内置 Tool + 插件 Tool + MCP Tool
-  │
-  ├─ 2. 转换为 ToolDef，注入 ChatRequest
-  │     └─ ToolManager.ToToolDefs(toolNames)
-  │     └─ MCP Tool 的 JSON Schema 直接透传
-  │
-  ├─ 3. 调用 Provider (LLM)
-  │     └─ LLM 看到统一的 Tool 定义，不区分来源
-  │
-  ├─ 4. LLM 返回 Tool Call
-  │     └─ FinishReason = "tool_calls"
-  │
-  ├─ 5. 执行 Tool
-  │     └─ ToolManager.ExecuteBatch(ctx, agentID, toolCalls)
-  │     └─ MCP Tool → MCPToolAdapter.Execute → MCP Client → 外部 Server
-  │     └─ 内置 Tool → 直接本地执行
-  │
-  ├─ 6. 将结果注入 Context
-  │     └─ 每个 ToolCall 生成 Role="tool" 的 Message
-  │
-  └─ 7. 回到步骤 3
-```
-
-### 3.2 MCP Tool 调用的错误处理
-
-```go
-// Execute 的完整实现，含超时控制与重连逻辑。
-func (a *MCPToolAdapter) Execute(ctx context.Context, params map[string]any) (tool.ToolResult, error) {
-    callCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-    defer cancel()
-
-    rawResult, err := a.client.CallTool(callCtx, a.serverName, a.toolName, params)
-    if err != nil {
-        // MCP 连接断开 — 尝试重连一次
-        if isConnectionError(err) {
-            if reconnErr := a.client.Reconnect(callCtx); reconnErr == nil {
-                rawResult, err = a.client.CallTool(callCtx, a.serverName, a.toolName, params)
-            }
-        }
-        if err != nil {
-            return tool.ToolResult{
-                IsError: true,
-                Content: fmt.Sprintf("[MCP] %s 调用失败: %v", a.Name(), err),
-            }, nil
-        }
-    }
-    return tool.ToolResult{Content: rawResult.Content}, nil
-}
-```
-
-| 错误类型 | 处理策略 |
-|----------|----------|
-| 连接断开 | 自动重连 1 次后重试 |
-| 超时 | 返回 `IsError=true`，Agent Loop 继续下一轮 |
-| 参数校验失败 | 由 Tool Manager 统一拦截，不转发到 MCP Server |
-| Server 返回错误 | 透传错误内容到 LLM，由 LLM 决定后续行动 |
-
----
-
-## 4. 与 Config 集成
-
-### 4.1 配置结构
-
-MCP Server 的配置在 `yaa.yaml` 的 `mcp` 段定义，由 Config Manager 加载后传递给 MCP Manager：
+## 3. Config 集成
 
 ```yaml
 mcp:
   servers:
-    - name: "filesystem"
-      command: "npx"
-      args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-      transport: "stdio"
-      env:
-        NODE_ENV: "production"
-
-    - name: "github"
-      transport: "sse"
-      url: "http://localhost:3001/sse"
-      timeout: 30s
-
-    - name: "remote-tools"
-      transport: "websocket"
-      url: "ws://10.0.0.5:8080/mcp"
-      headers:
-        Authorization: "Bearer ${MCP_TOKEN}"
-      reconnect:
-        enabled: true
-        interval: 5s
-        max_attempts: 10
+    - name: filesystem
+      transport: stdio
+      command: npx
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
+      auto_start: true
 ```
 
-### 4.2 配置加载流程
+`command` 是字符串，参数必须放在 `args` 数组；远程标准传输使用 `streamable_http`，旧版 Server 才使用 `sse`。配置字段的完整定义见 [config-ref.md](config-ref.md)。
+
+## 4. Runtime 启动顺序
+
+完整 Runtime 顺序中 Plugin Proxy 先于 MCP Proxy 注册，二者都先于 Skill binding；本节只展开 MCP 子流程：
 
 ```text
-Config Manager
-  │
-  ├─ 1. 读取 yaa.yaml → 解析 mcp.servers[]
-  │
-  ├─ 2. 环境变量替换
-  │     └─ ${MCP_TOKEN} → os.Getenv("MCP_TOKEN")
-  │
-  ├─ 3. 配置校验
-  │     ├─ name 必填且唯一
-  │     ├─ transport 必须为 stdio | sse | websocket
-  │     └─ stdio 类型必须有 command
-  │
-  ├─ 4. 合并默认值
-  │     └─ timeout 默认 30s
-  │     └─ reconnect.enabled 默认 false
-  │
-  └─ 5. 传递给 MCP Manager
-        └─ mcpManager.Init(config.MCP, toolMgr)
+Config.Parse → Config.Validate
+  → Tool Manager
+  → MCP Manager.Prepare
+  → Transport.Start
+  → initialize（按 transport 选择版本）
+  → tools/list(cursor)
+  → Register Stable Tool Proxy
+  → Skill Load
+  → Config.Activate(binding)
+  → MCP Manager.Activate（本地 Serve）
 ```
 
-### 4.3 配置热更新
+任一外部 Server 连接失败只影响对应连接；Manager 记录错误并继续启动其他 Server。若配置引用了因此未能首次注册的 Tool，统一 binding 校验会拒绝启动。配置缺失、未知 transport 或协议版本不兼容属于启动连接错误，状态为 `error`。本地 expose Server 在 `Prepare` 阶段完成配置、principal、Tool allowlist 和 listener 校验，但 `Config.Activate` 成功前不调用 `Serve`。
 
-Config Manager 检测到 `mcp.servers` 变更时，通知 MCP Manager 执行增量更新：
+关闭时 Runtime 先调用 `MCP Manager.Stop(ctx)`；即使 Stop 因 caller deadline 返回，也必须继续等待 `MCP Manager.Done()`，再调用 `Stop(context.Background())` 取得缓存的最终 teardown error，之后才继续 [Runtime 既定的逆序关闭链](../architecture.md#31-runtime)。
 
-```go
-func (m *Manager) OnConfigUpdate(newCfg *config.MCPConfig) {
-    oldNames := m.listServerNames()
-    newNames := make(map[string]bool)
-    for _, s := range newCfg.Servers {
-        newNames[s.Name] = true
-    }
+## 5. Retry 与幂等
 
-    // 移除已删除的 Server — 先从 Tool Manager 注销其 Tool
-    for _, name := range oldNames {
-        if !newNames[name] {
-            m.unregisterServerTools(name)
-            m.clients[name].Close()
-            delete(m.clients, name)
-            m.logger.Info("MCP Server 已移除", "server", name)
-        }
-    }
+- Manager 对连接失败按 1s、2s、4s 退避创建新 Client；Client 自身不重连。
+- 任何已经发送的 `tools/call` 都不自动重放；断线或 timeout 后向调用方返回结果不确定错误，重连只服务新请求。
+- 重连成功后重新 initialize 和完整分页 tools/list；只有名称、description 和 input schema 与既有 Proxy 快照精确一致时才原子替换 handle，差异需要重启 Runtime。
+- `mcp.*` 的结构性变更由文件 watcher 检测为 `restart_required`，重启后按 `auto_start` 重新连接；正在执行的请求不迁移到新连接。Remote API 不拥有 MCP 配置。
 
-    // 新增或更新的 Server — 重连并重新注册 Tool
-    for _, s := range newCfg.Servers {
-        if m.clients[s.Name] == nil || configChanged(m.configs[s.Name], s) {
-            if m.clients[s.Name] != nil {
-                m.unregisterServerTools(s.Name)
-                m.clients[s.Name].Close()
-            }
-            m.connectAndRegister(s)
-            m.logger.Info("MCP Server 已更新", "server", s.Name)
-        }
-    }
-}
-```
+## 6. Yaa! 作为 MCP Server
 
----
+Yaa! Server 只暴露 `mcp.server.exposed_tools` 中的 Tool。MVP 响应 `initialize`、`tools/list`、`tools/call` 和 `ping`；Resource/Prompt 方法返回 `-32601`。
 
-## 5. 完整集成流程图
+本地 `Serve` 意外退出时 Manager 必须原子标记 unhealthy，使 `Ready()` 返回 false；不得只写日志后继续报告 Runtime Ready。`Stop` 引起的 context 取消和 transport close 不算运行期故障。
 
-```text
- Runtime 初始化
- ─────────────────────────────────────────────────────────────────
- Config          Storage        Provider       Memory
-   │               │               │              │
-   ▼               ▼               ▼              ▼
- Tool Manager ──► Skill Manager ──► MCP Manager ──► Session ──► ... ──► Ready
-   │                                  │
-   │  (已注册内置 Tool)                │  connect servers
-   │                                  │  enumerate MCP Tools
-   │  ◄────────────────────────────────┘  register as Tool
-   │
-   │  Tool Manager 现在持有:
-   │    builtin tools + plugin tools + MCP tools
-   │
-   ▼
- Agent Loop (运行时)
- ─────────────────────────────────────────────────────────────────
-   │
-   ├─ ListForAgent(agentID) → [shell, http, mcp.fs.read_file, ...]
-   ├─ ToToolDefs(...) → 注入 ChatRequest.Tools
-   ├─ Provider.Chat(ctx, request) → LLM 返回 Tool Call
-   ├─ ExecuteBatch(ctx, agentID, toolCalls)
-   │    ├─ shell → 本地执行
-   │    └─ mcp.fs.read_file → MCPToolAdapter → MCP Client → 外部 Server
-   ├─ 将 Tool 结果注入 Context
-   └─ 回到 Provider.Chat (下一轮)
-```
+## 7. 安全
 
----
-
-## 6. 集成关系总结
-
-| 集成对象 | 集成方式 | 关键接口 |
-|----------|----------|----------|
-| Tool Manager | MCP Tool 适配为 `Tool` 接口并注册 | `tool.Manager.Register()` |
-| Agent Loop | 通过 Tool Manager 统一调度，无需感知 MCP | `ToolManager.ExecuteBatch()` |
-| Config | `mcp.servers[]` 配置由 Config Manager 加载 | `config.MCPConfig` |
-| Config 热更新 | 监听配置变更，增量增删 Server 和 Tool | `Manager.OnConfigUpdate()` |
-
-MCP 的设计哲学是**透明集成**：外部 MCP Tool 注册后，对 Agent Loop、Provider 和 Context Manager 完全透明，它们只与统一的 Tool 接口交互。这保证了 MCP 能力的加入不会引入任何特殊路径，降低了系统复杂度。
+- `stdio` 子进程继承经过过滤的 `env`，不继承 Runtime 全部环境。
+- 远程 HTTP 使用 TLS 时校验证书；Token 不写入 URL 日志。
+- HTTP Header 值通过 `${VAR}` 注入，配置读回、日志和错误中必须脱敏。
+- Streamable HTTP Server 默认只绑定 loopback。无 `Origin` 的非浏览器请求允许；请求携带 `Origin` 时必须精确命中非空 allowlist，否则返回 403。
+- MCP Tool 与内置 Tool 使用相同 Agent/RBAC 检查，不因来自外部 Server 而绕过权限。
+- Tool 结果中的 HTML/二进制内容按不可信数据处理并受大小限制。
 
 ---
 

@@ -1,329 +1,200 @@
 # 配置迁移与兼容
 
-> Yaa! Yet Another Agent Runtime
 > 文档路径: `docs/config/migration.md`
-> 依赖: `docs/architecture.md` §3.12, §7, §8
+> 上级: [README.md](README.md)
 
 ---
 
-## 1. 概述
+## 1. 版本规则
 
-Yaa! 遵循 **向后兼容优先** 原则。配置文件在版本升级时应尽可能无需手动修改即可继续使用。当不可避免的破坏性变更发生时，通过版本化机制和迁移工具平滑过渡。
+配置根字段 `config_version` 使用 `major.minor` 字符串。当前版本是 `1.0`，由 `CurrentSchemaVersion` 唯一声明。
 
-### 1.1 核心原则
+| 变更 | 版本 | 处理 |
+|------|------|------|
+| 新增可选字段或调整默认值 | minor +1 | 可自动迁移 |
+| 重命名、删除或改变字段语义 | major +1 | 必须有显式迁移函数 |
+| 文件版本高于 Runtime | 无 | 拒绝加载，不降级解析 |
+| 文件版本低于当前版本但无迁移路径 | 无 | 拒绝加载并指出缺失边 |
 
-| 原则 | 说明 |
-|------|------|
-| **向后兼容** | 新版本能直接加载旧版本配置，新增字段使用默认值 |
-| **版本化** | 配置文件通过 `version` 字段标识 schema 版本 |
-| **渐进式废弃** | 废弃字段先标记 `deprecated`，至少保留一个 LTS 周期后移除 |
-| **自动迁移** | 提供内置迁移工具，自动升级配置格式 |
-| **透明告警** | 废弃字段使用时输出 Warning 日志，不中断运行 |
-
----
-
-## 2. 配置版本化
-
-### 2.1 版本字段
-
-每个配置文件应在根级别声明 `version` 字段：
-
-```yaml
-# yaa.yaml
-version: "1.2"          # schema 版本，格式: major.minor
-runtime:
-  api:
-    http:
-      addr: ":8080"
-```
-
-**版本规则：**
-
-| 变更类型 | 版本变化 | 兼容性 | 示例 |
-|----------|----------|--------|------|
-| 新增字段 | minor +1 | 完全兼容 | `1.0` → `1.1` |
-| 字段重命名 | major +1 | 需迁移 | `1.2` → `2.0` |
-| 字段移除 | major +1 | 需迁移 | `1.5` → `2.0` |
-| 默认值调整 | minor +1 | 兼容 | `1.1` → `1.2` |
-| 结构重组 | major +1 | 需迁移 | `1.8` → `2.0` |
-
-### 2.2 版本解析
+未写 `config_version` 的旧文件按 `1.0` 解释。该规则只适用于当前仍兼容 `1.0` 的文件；一旦未来引入无法推断的旧格式，必须新增明确的 legacy 版本。
 
 ```go
-package config
-
-import "fmt"
-
-// ConfigSchema 版本信息
 type ConfigSchema struct {
-    Major int `yaml:"major"`
-    Minor int `yaml:"minor"`
+    Major int
+    Minor int
 }
 
-// ParseVersion 从 "1.2" 解析为 ConfigSchema
-func ParseVersion(v string) (ConfigSchema, error) {
-    var s ConfigSchema
-    if _, err := fmt.Sscanf(v, "%d.%d", &s.Major, &s.Minor); err != nil {
-        return s, fmt.Errorf("invalid version format: %s", v)
+var CurrentSchemaVersion = ConfigSchema{Major: 1, Minor: 0}
+
+func ParseVersion(raw string) (ConfigSchema, error) {
+    var v ConfigSchema
+    if _, err := fmt.Sscanf(raw, "%d.%d", &v.Major, &v.Minor); err != nil || v.Major < 0 || v.Minor < 0 {
+        return ConfigSchema{}, fmt.Errorf("invalid config_version %q", raw)
     }
-    return s, nil
+    return v, nil
 }
 
-// IsCompatible 判断目标版本是否与当前版本兼容（同 major）
-func (s ConfigSchema) IsCompatible(target ConfigSchema) bool {
-    return s.Major == target.Major
+func (v ConfigSchema) Compare(other ConfigSchema) int {
+    if v.Major != other.Major {
+        if v.Major < other.Major {
+            return -1
+        }
+        return 1
+    }
+    if v.Minor < other.Minor {
+        return -1
+    }
+    if v.Minor > other.Minor {
+        return 1
+    }
+    return 0
+}
+
+func (v ConfigSchema) String() string {
+    return fmt.Sprintf("%d.%d", v.Major, v.Minor)
 }
 ```
 
----
+## 2. 迁移注册表
 
-## 3. 迁移工具
-
-### 3.1 迁移命令
-
-Yaa! CLI 内置配置迁移命令：
-
-```bash
-# 检查配置是否需要迁移（dry-run）
-yaa config migrate --dry-run
-
-# 执行迁移，备份原文件
-yaa config migrate --backup
-
-# 迁移到指定版本
-yaa config migrate --target 2.0
-
-# 批量迁移目录下所有配置
-yaa config migrate --dir /etc/yaa/ --recursive
-```
-
-### 3.2 迁移注册表
+迁移函数接收 presence-aware 的 `map[string]any`，返回新的 Map；它不得直接操作已经解码的 `Config`，否则无法区分显式零值。
 
 ```go
-package config
-
-import "fmt"
-
-// MigrationFunc 单个版本的迁移函数
 type MigrationFunc func(map[string]any) (map[string]any, error)
 
-// migrationRegistry 注册所有迁移路径
-var migrationRegistry = map[string]MigrationFunc{
-    "1.0->1.1": migrateV10ToV11,
-    "1.1->1.2": migrateV11ToV12,
-    "1.2->2.0": migrateV12ToV20,
+type Migration struct {
+    From ConfigSchema
+    To   ConfigSchema
+    Run  MigrationFunc
 }
 
-// Migrate 逐步迁移配置到目标版本
+var migrations = []Migration{
+    // 当前版本为 1.0；未来新增边时在这里追加，不自动推测路径。
+}
+
 func Migrate(raw map[string]any, from, to ConfigSchema) (map[string]any, error) {
+    if from.Compare(to) > 0 {
+        return nil, fmt.Errorf("config downgrade is not supported: %s -> %s", from, to)
+    }
     result := raw
     current := from
-
-    for current.LessThan(to) {
-        key := fmt.Sprintf("%d.%d->%d.%d",
-            current.Major, current.Minor,
-            nextVersion(current).Major, nextVersion(current).Minor)
-
-        fn, ok := migrationRegistry[key]
-        if !ok {
-            return nil, fmt.Errorf("no migration path from %s", key)
+    for current.Compare(to) < 0 {
+        var step *Migration
+        for i := range migrations {
+            candidate := &migrations[i]
+            if candidate.From.Compare(current) == 0 {
+                if step != nil {
+                    return nil, fmt.Errorf("multiple migrations start at %s", current)
+                }
+                step = candidate
+            }
         }
-
-        migrated, err := fn(result)
+        if step == nil || step.To.Compare(current) <= 0 || step.To.Compare(to) > 0 {
+            return nil, fmt.Errorf("no migration path from %s to %s", current, to)
+        }
+        var err error
+        result, err = step.Run(result)
         if err != nil {
-            return nil, fmt.Errorf("migration %s failed: %w", key, err)
+            return nil, fmt.Errorf("migration %s->%s failed: %w", step.From, step.To, err)
         }
-        result = migrated
-        current = nextVersion(current)
+        current = step.To
     }
-
-    result["version"] = fmt.Sprintf("%d.%d", to.Major, to.Minor)
+    result["config_version"] = to.String()
     return result, nil
 }
 ```
 
-### 3.3 迁移函数示例
+### 2.1 示例迁移
 
 ```go
-// migrateV12ToV20: 1.2 → 2.0
-// 变更: runtime.http.addr → runtime.api.http.addr
-func migrateV12ToV20(raw map[string]any) (map[string]any, error) {
+// migrateV10ToV11 将旧 runtime.http.addr 移到 runtime.api.http.addr。
+func migrateV10ToV11(raw map[string]any) (map[string]any, error) {
     runtime, ok := raw["runtime"].(map[string]any)
     if !ok {
-        return raw, nil // 无需迁移
+        return raw, nil
     }
-
-    // 旧字段 http.addr 迁移到新结构 api.http.addr
-    if http, ok := runtime["http"].(map[string]any); ok {
-        api, _ := runtime["api"].(map[string]any)
-        if api == nil {
-            api = make(map[string]any)
-        }
-        if apiHTTP, _ := api["http"].(map[string]any); apiHTTP == nil {
-            api["http"] = http
-        }
-        api["http"] = http
-        runtime["api"] = api
-        delete(runtime, "http")
-        raw["runtime"] = runtime
+    oldHTTP, ok := runtime["http"].(map[string]any)
+    if !ok {
+        return raw, nil
     }
-
+    api, _ := runtime["api"].(map[string]any)
+    if api == nil {
+        api = map[string]any{}
+    }
+    if _, exists := api["http"]; !exists {
+        api["http"] = oldHTTP
+    }
+    runtime["api"] = api
+    delete(runtime, "http")
+    raw["runtime"] = runtime
     return raw, nil
 }
 ```
 
----
+迁移函数只在目标路径不存在时写入，避免覆盖用户已经同时填写的新字段；迁移成功后旧路径必须删除，未知字段检查才能发现拼写错误。
 
-## 4. 废弃字段策略
+## 3. 加载管线集成
 
-### 4.1 废弃生命周期
+配置包只有一个公开加载入口：`(*Loader).Load()`（详见 [loading.md](loading.md)）。迁移是该入口中的一个步骤，不再定义第二个 `LoadConfig` 或让迁移模块自行反序列化。
+
+```go
+func migrateRaw(raw map[string]any, logger *slog.Logger) (map[string]any, error) {
+    versionText, ok := raw["config_version"].(string)
+    if !ok || versionText == "" {
+        versionText = CurrentSchemaVersion.String()
+        raw["config_version"] = versionText
+    }
+    from, err := ParseVersion(versionText)
+    if err != nil {
+        return nil, err
+    }
+    cmp := from.Compare(CurrentSchemaVersion)
+    if cmp > 0 {
+        return nil, fmt.Errorf("config_version %s is newer than Runtime %s", from, CurrentSchemaVersion)
+    }
+    if cmp == 0 {
+        return raw, nil
+    }
+
+    migrated, err := Migrate(raw, from, CurrentSchemaVersion)
+    if err != nil {
+        return nil, err
+    }
+    logger.Info("config migrated", "from", from.String(), "to", CurrentSchemaVersion.String())
+    return migrated, nil
+}
+```
+
+完整顺序固定为：
 
 ```text
-┌─────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────┐
-│  Active  │ →  │  Deprecated  │ →  │  Deprecated+  │ →  │ Removed  │
-│          │    │  (Warning)   │    │  Error        │    │          │
-└─────────┘    └──────────────┘    └──────────────┘    └──────────┘
-   当前版本       下一 minor          下一 major          下下 major
+resolve path
+  → cfg := Default()
+  → parse to map
+  → migrate raw map
+  → expand ${VAR} / ${VAR:-default}
+  → ApplyElementDefaults(raw)
+  → DecodeInto(presence-aware, reject unknown)
+  → apply CLI flags
+  → Validate
 ```
 
-| 阶段 | 行为 | 日志级别 | 运行影响 |
-|------|------|----------|----------|
-| Active | 正常使用 | 无 | 无 |
-| Deprecated | 可用，建议迁移 | `WARN` | 无 |
-| Deprecated+Error | 可用但报错 | `ERROR` | 无（仍继续运行） |
-| Removed | 解析失败 | — | 启动失败 |
+迁移失败不写回磁盘，也不启动 Runtime。
 
-### 4.2 废弃声明
+## 4. 备份与 CLI
 
-```go
-package config
+自动启动迁移只改变内存中的 raw Map。`yaa config migrate --backup` 才写回文件：先把原文件复制为 `<path>.bak`，使用临时文件写新内容、`fsync` 后 `Rename` 替换；配置文件权限保持 `0600`，备份也保持 `0600`。`--dry-run` 只输出变更摘要，不写任何文件。
 
-// DeprecatedField 记录废弃字段信息
-type DeprecatedField struct {
-    OldPath     string // 旧字段路径，如 "runtime.http.addr"
-    NewPath     string // 新字段路径，如 "runtime.api.http.addr"
-    Since       string // 废弃起始版本
-    RemoveIn    string // 计划移除版本
-    Reason      string // 废弃原因
-}
-
-var deprecatedFields = []DeprecatedField{
-    {
-        OldPath:  "runtime.http.addr",
-        NewPath:  "runtime.api.http.addr",
-        Since:    "1.2",
-        RemoveIn: "2.0",
-        Reason:   "HTTP 配置移入 api 子结构，统一管理",
-    },
-}
-
-// CheckDeprecated 扫描配置中的废弃字段并输出告警
-func CheckDeprecated(raw map[string]any) []string {
-    var warnings []string
-    for _, d := range deprecatedFields {
-        if hasPath(raw, d.OldPath) {
-            warnings = append(warnings, fmt.Sprintf(
-                "[DEPRECATED] %s is deprecated since v%s, "+
-                    "use %s instead. Will be removed in v%s. Reason: %s",
-                d.OldPath, d.Since, d.NewPath, d.RemoveIn, d.Reason,
-            ))
-        }
-    }
-    return warnings
-}
+```bash
+yaa config migrate --dry-run --config ./yaa.yaml
+yaa config migrate --backup --config ./yaa.yaml
 ```
 
----
+## 5. 别名与废弃字段
 
-## 5. 向后兼容规则
+别名是迁移函数的一部分，不维护一个会绕过版本图的全局 alias Map。每条迁移必须声明旧路径、新路径、来源版本和目标版本，并在日志中记录。当前唯一规划中的别名是 `runtime.http.addr -> runtime.api.http.addr`；`runtime.http.port`、`runtime.log.*` 等未在 schema 中定义的路径不得自动猜测。
 
-### 5.1 兼容性矩阵
-
-| 变更场景 | 兼容策略 | 用户操作 |
-|----------|----------|----------|
-| 新增可选字段 | 自动使用默认值 | 无需修改 |
-| 新增必填字段 | 必须有合理默认值 | 无需修改 |
-| 字段重命名 | 旧名保留为别名，旧名优先 | 建议迁移 |
-| 字段移除 | 经过完整废弃周期后移除 | 迁移后删除旧字段 |
-| 结构嵌套调整 | 迁移工具自动重组 | 运行 `migrate` |
-| 枚举值新增 | 旧值保持有效 | 无需修改 |
-| 枚举值移除 | 旧值映射到最接近的新值 | 检查日志告警 |
-
-### 5.2 加载时兼容处理
-
-```go
-// LoadConfig 加载配置时自动处理兼容性
-func LoadConfig(path string) (*Config, error) {
-    raw, err := loadRawConfig(path)
-    if err != nil {
-        return nil, err
-    }
-
-    // 1. 解析版本
-    versionStr, _ := raw["version"].(string)
-    if versionStr == "" {
-        versionStr = "1.0" // 无版本号视为 1.0
-    }
-    schema, err := ParseVersion(versionStr)
-    if err != nil {
-        return nil, err
-    }
-
-    // 2. 检查废弃字段（输出 Warning）
-    for _, w := range CheckDeprecated(raw) {
-        log.Warn(w)
-    }
-
-    // 3. 自动应用别名兼容
-    applyAliases(raw)
-
-    // 4. 版本不匹配时提示迁移
-    if !schema.IsCompatible(CurrentSchemaVersion) {
-        log.Warnf("config version %s is outdated, "+
-            "run 'yaa config migrate' to upgrade", versionStr)
-    }
-
-    // 5. 反序列化为最终配置结构
-    var cfg Config
-    if err := decode(raw, &cfg); err != nil {
-        return nil, err
-    }
-    return &cfg, nil
-}
-```
-
-### 5.3 别名兼容
-
-```go
-// aliasMap 旧字段名 → 新字段名的映射
-var aliasMap = map[string]string{
-    "runtime.http.addr":  "runtime.api.http.addr",
-    "runtime.http.port":  "runtime.api.http.port",
-    "log.level":         "runtime.log.level",
-}
-
-// applyAliases 将旧字段值复制到新字段路径（仅当新路径不存在时）
-func applyAliases(raw map[string]any) {
-    for oldPath, newPath := range aliasMap {
-        if val, ok := getPath(raw, oldPath); ok {
-            if !hasPath(raw, newPath) {
-                setPath(raw, newPath, val)
-            }
-        }
-    }
-}
-```
-
----
-
-## 6. 最佳实践
-
-1. **永远不要静默删除用户配置** — 废弃字段至少保留一个 major 周期
-2. **迁移工具先 dry-run** — 让用户预览变更再确认
-3. **备份优先** — 迁移前自动备份原文件到 `.bak`
-4. **日志驱动** — 废弃告警写入结构化日志，方便 grep 和监控
-5. **版本号写在配置里** — 不依赖外部推断，配置自描述
-6. **迁移路径线性** — 不跳跃版本，逐步迁移每一步有注册函数
+旧字段在迁移前可输出一次 `WARN`，迁移后若仍残留则按未知字段错误处理。新字段优先级高于旧字段，冲突时拒绝迁移而不是静默覆盖。
 
 ---
 

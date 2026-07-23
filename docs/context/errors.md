@@ -1,114 +1,86 @@
 # Context 错误处理
 
 > 文档路径: `docs/context/errors.md`
-> 上级: `docs/context/README.md` §7
+> 上级: [README.md](README.md)
 
 ---
 
-## 7. 错误处理
+## 1. 错误类型
 
-### 7.1 错误分类
-
-| 错误类型 | 说明 | 处理方式 |
-|---------|------|---------|
-| `ErrContextBuildFailed` | Context 构建失败（段缺失或序列化错误） | 返回给 Agent，终止本轮推理 |
-| `ErrTokenBudgetExceeded` | Token 预算超限且无法通过策略降级 | 返回给 LLM，提示减少输入 |
-| `ErrTokenEstimationFailed` | Token 估算失败（模型未加载或编码器异常） | 回退到字符数近似估算，记录警告 |
-| `ErrCompressionFailed` | 压缩失败（LLM 总结失败或截断异常） | 回退到 `truncate` 策略，保留最近消息 |
-| `ErrCompressionTimeout` | 压缩超时（LLM 总结耗时过长） | 取消压缩，改用 `overflow_strategy` |
-| `ErrSegmentUnavailable` | 关键段不可用（如系统提示词加载失败） | 返回致命错误，终止会话 |
-| `ErrOverflowStrategyUnknown` | 未知的超出策略 | 回退到默认策略 `compress` |
-| `ErrContextEmpty` | 构建后 Context 为空（无有效消息） | 返回给 Agent，提示检查输入 |
-
-### 7.2 错误传递
-
-```text
-Context 错误 → Context Builder → Agent → LLM
-                                    │
-                                    ├─ 可降级错误 → 自动回退策略，继续推理
-                                    └─ 不可降级错误 → 终止本轮，告知用户
-```
-
-**Agent 层错误处理：**
+错误 sentinel 位于 Context 包；配置校验错误仍使用 `config.ValidationError`。所有错误都应使用 `%w` 包装原因，供 Agent、Remote API 和日志通过 `errors.Is`/`errors.As` 识别。
 
 ```go
-func (a *Agent) buildContext(session *Session) (*Context, error) {
-    ctx, err := a.ctxBuilder.Build(session)
-    if err != nil {
-        switch {
-        case errors.Is(err, ErrTokenBudgetExceeded):
-            // 尝试强制压缩
-            ctx, err = a.ctxBuilder.BuildWithForce(session, ForceCompress)
-            if err != nil {
-                return nil, fmt.Errorf("context budget exceeded, compression also failed: %w", err)
-            }
-        case errors.Is(err, ErrCompressionFailed):
-            // 回退到截断策略
-            a.logger.Warn("compression failed, fallback to truncate",
-                "session", session.ID, "error", err)
-            ctx, err = a.ctxBuilder.BuildWithStrategy(session, "truncate")
-            if err != nil {
-                return nil, fmt.Errorf("context build failed after fallback: %w", err)
-            }
-        case errors.Is(err, ErrSegmentUnavailable):
-            // 关键段不可用，终止
-            return nil, fmt.Errorf("critical context segment unavailable: %w", err)
-        default:
-            return nil, fmt.Errorf("context build failed: %w", err)
-        }
+var (
+    ErrContextBuildFailed       = errors.New("context build failed")
+    ErrContextConfigInvalid     = errors.New("context config invalid")
+    ErrProviderWindowUnknown    = errors.New("provider model window unknown")
+    ErrTokenEstimationFailed    = errors.New("input token estimation failed")
+    ErrInvalidMessageSequence   = errors.New("invalid message sequence")
+    ErrContextOverflow          = errors.New("context input exceeds budget")
+    ErrCompressionFailed        = errors.New("context compression failed")
+    ErrCompressionTimeout       = errors.New("context compression timed out")
+)
+```
+
+| 错误 | 触发条件 | 是否可降级 |
+|------|----------|------------|
+| `ErrContextConfigInvalid` | 策略、范围或 reserve/output/window 关系非法 | 否，拒绝启动或拒绝该 Agent |
+| `ErrProviderWindowUnknown` | 目标 Model 没有正的 `ContextWindow` 或 `MaxOutput` | 否，不能假设无限窗口 |
+| `ErrTokenEstimationFailed` | Provider 无法估算完整 `ChatRequest` | 否，不能用字符数近似保证上限 |
+| `ErrInvalidMessageSequence` | Tool chain、role 或当前 turn 标记非法 | 否，先修复输入 |
+| `ErrContextOverflow` | 受保护输入超限，或没有可删除 unit | 否，返回调用方 |
+| `ErrCompressionFailed` | 摘要调用返回空、格式非法或网络错误 | 是，若截断能满足预算 |
+| `ErrCompressionTimeout` | 摘要超过 `compression.timeout` | 是，若截断能满足预算 |
+| `ErrContextBuildFailed` | 对外包装无法归类的构建错误 | 按 wrapped cause 判断 |
+
+## 2. 降级边界
+
+```text
+hybrid + under budget + compression failure -> 原请求成功返回，记录 metadata
+hybrid + over budget + compression failure  -> truncate
+truncate 无可删除 unit                     -> ErrContextOverflow
+reject 超限                                -> ErrContextOverflow
+任何 token estimation failure              -> ErrTokenEstimationFailed
+```
+
+压缩失败不触发第二个公开构建入口；所有分支都在同一次 `Build` 内完成，且每次变换后重新估算。
+
+## 3. Agent 处理示例
+
+```go
+out, err := a.contextManager.Build(ctx, input)
+if err != nil {
+    switch {
+    case errors.Is(err, stdcontext.Canceled), errors.Is(err, stdcontext.DeadlineExceeded):
+        return err
+    case errors.Is(err, ErrContextOverflow),
+        errors.Is(err, ErrContextConfigInvalid),
+        errors.Is(err, ErrProviderWindowUnknown),
+        errors.Is(err, ErrTokenEstimationFailed),
+        errors.Is(err, ErrInvalidMessageSequence):
+        return fmt.Errorf("cannot send model request: %w", err)
+    default:
+        return fmt.Errorf("context build: %w", err)
     }
-    return ctx, nil
 }
+return a.provider.Chat(ctx, &out.Request)
 ```
 
-### 7.3 降级策略
+`ErrCompressionFailed`/`ErrCompressionTimeout` 在截断成功时只写入 `BuildMetadata` 和指标，不作为成功 Build 的返回错误；截断失败时作为 `ErrContextOverflow` 的 wrapped cause 保留。
 
-当 Context 构建或压缩出错时，按以下优先级降级：
+## 4. API 映射
 
-```text
-1. summarize 压缩    → 失败
-2. truncate 截断     → 失败
-3. 保留最近 N 条消息  → 最后兜底
-```
+Remote API 不把内部错误文本直接暴露给客户端：
 
-| 原始策略 | 降级后策略 | 触发条件 |
-|---------|-----------|---------|
-| `summarize` | `truncate` | LLM 总结失败或超时 |
-| `truncate` | 保留 `preserve_recent` 条 | 截断后仍超限 |
-| `compress` | `reject` | 所有降级均失败 |
-| `reject` | — | 直接返回错误给 LLM |
+| 内部错误 | HTTP 语义 | 建议业务码 |
+|----------|-----------|------------|
+| 配置/模型窗口未知 | `409` | `40901` |
+| 消息序列非法或 Context 超限 | `422` | `42201` |
+| Provider Token 估算失败 | `500` | `50001` |
+| 调用方取消 | `499` 或连接关闭 | 不生成业务重试 |
 
-### 7.4 重试策略
+具体 envelope 遵循 [Remote API 错误码](../remote-api/INDEX.md#7-错误码)；SSE/WS 使用各自 frame，不套 REST JSON envelope。
 
-| 操作 | 重试条件 | 重试次数 |
-|------|---------|---------|
-| Token 估算 | 编码器异常 | 1 次（回退近似估算） |
-| 压缩（summarize） | LLM 返回空或格式错误 | 2 次（指数退避） |
-| 压缩（truncate） | 截断后仍超限 | 不重试，直接降级 |
-| 段加载 | 临时 I/O 错误 | 3 次（1s 间隔） |
-| 整体构建 | 预算超限 | 1 次（强制压缩） |
+---
 
-### 7.5 错误日志
-
-```go
-// Context 相关日志事件
-builder.logger.Error("context build failed",
-    "session", sessionID,
-    "agent", agentID,
-    "total_tokens", estimated,
-    "max_tokens", cfg.MaxTokens,
-    "error", err,
-)
-
-builder.logger.Warn("token budget exceeded, triggering compression",
-    "session", sessionID,
-    "current_tokens", current,
-    "threshold", threshold,
-)
-
-builder.logger.Error("compression failed, fallback to truncate",
-    "session", sessionID,
-    "method", "summarize",
-    "error", err,
-)
-```
+*最后更新: 2026-07-22*

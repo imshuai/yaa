@@ -1,313 +1,144 @@
-# Memory 集成设计
+# Memory 集成
 
-> Memory 与 Session / Context / Agent 的集成方案
-> 依赖: `architecture.md` §3.2/§3.3/§3.4/§3.6, `memory/README.md` §2
-
----
-
-## 1. 集成总览
-
-Memory 系统不是孤立模块，它深度嵌入 Agent Loop 的各个阶段。下表展示各模块与 Memory 的交互关系：
-
-| 模块 | 交互方向 | 时机 | 操作 |
-|------|----------|------|------|
-| **Agent** | 双向 | Agent 创建时 | 获取/懒加载 Memory 实例 |
-| **Session** | 读+写 | Session 创建/关闭 | 加载关联记忆；关闭时持久化短期记忆 |
-| **Context** | 读 | Context 构建时 | 检索长期记忆并注入上下文窗口 |
-| **Agent Loop** | 读+写 | 每轮对话 | 读：构建前检索；写：回复后提取记忆 |
+> 上级: [Memory 系统设计](README.md)
+> 相关: [Session](../session/README.md)、[Context](../context/README.md)、[Architecture](../architecture.md)
 
 ---
 
-## 2. Agent Loop 中的记忆读写时机
+## 1. 依赖关系
 
 ```text
-┌─────────────────────────────────────────────────────────┐
-│                    Agent Loop (单轮)                     │
-│                                                         │
-│  ① 用户消息到达                                          │
-│     │                                                   │
-│     ▼                                                   │
-│  ② Session 追加用户消息                                  │
-│     │                                                   │
-│     ▼                                                   │
-│  ③ Memory 检索（读）                                     │
-│     │  query = 用户最新消息                               │
-│     │  results = memory.Search(query, limit)              │
-│     ▼                                                   │
-│  ④ Context 构建                                         │
-│     │  System Prompt + 历史消息 + Memory 结果 + Tool 结果  │
-│     │  → 截断/压缩至 Token 限制                            │
-│     ▼                                                   │
-│  ⑤ Provider 调用 (LLM)                                  │
-│     │                                                   │
-│     ├──── 有 Tool Call ──→ 执行 Tool ──→ 回到 ④          │
-│     │                                                   │
-│     ▼                                                   │
-│  ⑥ LLM 返回最终回复                                      │
-│     │                                                   │
-│     ▼                                                   │
-│  ⑦ Session 追加助手消息                                  │
-│     │                                                   │
-│     ▼                                                   │
-│  ⑧ Memory 写入（写）                                     │
-│     │  提取关键信息 → memory.Add(...)                      │
-│     │  短期记忆自动存储                                   │
-│     ▼                                                   │
-│  ⑨ 返回给 Client                                        │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
+Config -> ContentStore -> Memory Manager -> Agent
+                                      |
+                                      +-> Context Build
+                                      +-> Remote API
+                                      +-> events/metrics
+Session ------------------------------+
 ```
 
-### 2.1 读时机详解
+Memory 依赖 Agent ID 和有效 policy；它不拥有 Session，也不从 Session 自动提取内容。Session 只在 Agent loop 中提供 `SessionID` 和当前用户问题。
 
-| 步骤 | 触发条件 | 检索策略 | 注入位置 |
-|------|----------|----------|----------|
-| ③ | 每轮 Context 构建前 | 语义搜索用户最新消息 | 作为 System 消息的补充段 |
-| ④ | Context 压缩时 | 检索 Summary 层记忆 | 替换被压缩的历史消息 |
+## 2. Agent turn 顺序
 
-### 2.2 写时机详解
+同一 Session 的完整 turn 已由 Session Manager 的 FIFO gate 串行化。Agent callback 内按以下顺序执行：
 
-| 步骤 | 触发条件 | 写入层级 | 写入内容 |
-|------|----------|----------|----------|
-| ② | 用户消息到达 | Short-term | 原始用户消息 |
-| ⑦ | 助手回复完成 | Short-term | 原始助手消息 |
-| ⑧ | 助手回复后 | Long-term | 提取的关键事实/偏好 |
-| Session 关闭 | Session 结束 | Summary | Session 对话摘要 |
-
----
-
-## 3. 记忆检索注入 Context
-
-Memory 检索结果以结构化方式注入 Context，而非简单拼接文本。
-
-### 3.1 注入格式
-
-检索到的记忆被包装为一段 system 角色的补充消息，注入到 Context 中：
-
-```text
-[System Prompt]
-
---- Relevant Memories ---
-[1] (score: 0.92) 用户偏好: 喜欢用中文交流
-[2] (score: 0.87) 项目信息: 正在开发 Yaa! Agent Runtime
-[3] (score: 0.81) 历史决策: 选择了 SQLite 作为默认存储
---- End Memories ---
-
-[历史消息...]
-```
-
-### 3.2 注入策略
-
-| 策略 | 说明 | 适用场景 |
-|------|------|----------|
-| **Top-K 语义检索** | 按相似度取前 K 条 | 默认策略，K=5 |
-| **元数据过滤** | 按 tag/layer/time 过滤后再检索 | 需要 scope 隔离时 |
-| **混合检索** | 语义 + 关键词，去重合并 | 向量搜索召回不足时 |
-| **摘要优先** | 优先注入 Summary 层记忆 | Context 被压缩时 |
-
-### 3.3 Token 预算
-
-Memory 注入受 Token 预算约束，不会无限制占用上下文窗口：
+1. 读取一次 `ReloadManager.Current()`，从该不可变 Config snapshot 解析本轮 `config.MemoryPolicy`；从 Session `Snapshot()` 取得本轮输入和历史。
+2. 把同一个 policy 显式传给本轮全部 Memory 调用。用本轮 user content 组成 `SearchRequest`，scope 为该 Agent + 当前 Session + `LayerLongTerm`，并设置 `IncludeGlobal=true`；因此只读取当前来源和 Agent 全局 Memory，不读其他 Session 来源。
+3. 将返回的 `SearchResult.Item` 转为受控的 system message 文本，限制注入数量和字节数；Memory Content 不可直接改变 role、ToolCalls 或系统配置。
+4. 把 system prompt、受控 Memory system message、Session 消息和 Tool definitions 组装成完整 `provider.ChatRequest`。
+5. 调用唯一的 `context.Manager.Build`；Context 决定预算、压缩和截断，不主动访问 Memory。
+6. 执行 Provider/Tool loop；assistant Tool call 与全部 tool result 作为一个 Session 原子单元追加。
+7. 将最终 assistant 消息提交到 Session 后再返回远端客户端。
+8. 只有业务代码明确识别出应长期保存的事实时，才调用 Memory `Put` 或 `Promote`。
 
 ```go
-// Memory 注入的 Token 预算计算
-memoryBudget := totalTokenLimit
-    - systemPromptTokens     // System Prompt 固定开销
-    - minHistoryTokens       // 保留的最小历史消息
-    - toolResultTokens       // 当前轮 Tool 结果
-    - reservedForResponse    // 预留给 LLM 回复的空间
-```
-
----
-
-## 4. Go 代码示例
-
-### 4.1 Agent Loop 集成
-
-```go
-// agent_loop.go — Agent 主循环中的 Memory 读写集成
-
-func (a *Agent) handleMessage(ctx context.Context, sess *session.Session, userMsg string) (string, error) {
-    // ② 追加用户消息到 Session
-    sess.AppendMessage(session.RoleUser, userMsg)
-
-    // ③ Memory 检索：用用户消息作为查询
-    memResults, err := a.Memory.Search(userMsg, 5)
-    if err != nil {
-        a.logger.Warn("memory search failed, degrading", "error", err)
-        memResults = nil // 优雅降级：搜索失败不阻塞对话
-    }
-
-    // ④ 构建 Context（注入 Memory 检索结果）
-    context, err := a.ContextMgr.Build(sess,
-        context.WithMemory(memResults),
-        context.WithTools(a.Tools),
-    )
-    if err != nil {
-        return "", fmt.Errorf("context build: %w", err)
-    }
-
-    // ⑤ 调用 LLM（含 Tool Loop）
-    response, err := a.runWithTools(ctx, context)
-    if err != nil {
-        return "", err
-    }
-
-    // ⑦ 追加助手消息到 Session
-    sess.AppendMessage(session.RoleAssistant, response)
-
-    // ⑧ Memory 写入：异步提取并存储关键信息
-    go a.persistMemory(response, userMsg)
-
-    return response, nil
-}
-```
-
-### 4.2 Context 构建中的记忆注入
-
-```go
-// context_builder.go — Context 构建器注入 Memory
-
-func (b *ContextBuilder) Build(sess *session.Session, opts ...ContextOption) (*Context, error) {
-    ctx := &Context{Session: sess}
-    for _, opt := range opts {
-        opt(ctx)
-    }
-
-    // 构建 System Prompt
-    parts := []string{ctx.SystemPrompt}
-
-    // 注入 Memory 检索结果
-    if len(ctx.Memories) > 0 {
-        parts = append(parts, formatMemories(ctx.Memories))
-    }
-
-    // 组装消息列表
-    ctx.Messages = []Message{
-        {Role: RoleSystem, Content: strings.Join(parts, "\n\n")},
-    }
-    ctx.Messages = append(ctx.Messages, sess.Messages...)
-
-    // Token 截断
-    return b.truncate(ctx)
-}
-
-// formatMemories 将检索结果格式化为注入文本
-func formatMemories(items []*memory.MemoryItem) string {
-    var b strings.Builder
-    b.WriteString("--- Relevant Memories ---\n")
-    for i, item := range items {
-        fmt.Fprintf(&b, "[%d] (score: %.2f) %s\n", i+1, item.Score, item.Content)
-    }
-    b.WriteString("--- End Memories ---")
-    return b.String()
-}
-```
-
-### 4.3 Session 关闭时的记忆持久化
-
-```go
-// session_close.go — Session 关闭时晋升短期记忆、生成摘要
-
-func (m *SessionManager) Close(sessID string) error {
-    sess, err := m.get(sessID)
+func (a *Agent) RunTurn(ctx context.Context, sessionID string, user provider.Message) error {
+    snapshot := a.Config.Current()
+    policy, err := a.resolveMemoryPolicy(snapshot)
     if err != nil {
         return err
     }
+    results, err := a.Memory.Search(ctx, policy, memory.SearchRequest{
+        Scope: memory.Scope{AgentID: a.ID, SessionID: sessionID, Layer: memory.LayerLongTerm},
+        Query: user.Content,
+        Limit: 0, // Manager 从该 Agent 的 effective vector.top_k 解析默认值
+        IncludeGlobal: true,
+    })
+    if err != nil && !errors.Is(err, memory.ErrMemoryDisabled) {
+        return fmt.Errorf("recall memory: %w", err)
+    }
 
-    // 生成 Session 摘要
-    summary, err := m.summarizer.Summarize(sess.Messages)
+    request := buildRequest(a.SystemPrompt, formatMemoryResults(results), user)
+    built, err := a.Context.Build(ctx, contextwindow.BuildInput{
+        Provider: a.Provider,
+        Model:    a.Model,
+        Request:  request,
+        Config:   a.ContextConfig,
+        CurrentTurnStart: len(request.Messages) - 1,
+    })
     if err != nil {
-        m.logger.Warn("summary generation failed", "error", err)
-    } else {
-        // 写入 Summary 层记忆
-        key := fmt.Sprintf("session:%s:summary", sess.ID)
-        _ = sess.Agent.Memory.Add(key, summary, map[string]any{
-            "layer":      memory.LayerSummary,
-            "session_id": sess.ID,
-            "agent_id":   sess.AgentID,
-            "created_at": time.Now(),
-        })
+        return err
     }
-
-    // 短期记忆晋升：将关键短期记忆提升为长期记忆
-    if ext, ok := sess.Agent.Memory.(memory.MemoryExtended); ok {
-        items, _ := ext.ListByLayer(memory.LayerShortTerm, 100, 0)
-        for _, item := range items {
-            if shouldPromote(item) {
-                _ = ext.Promote(item.Key)
-            }
-        }
-    }
-
-    return m.store.Delete(sessID)
+    return a.executeAndCommit(ctx, sessionID, built.Request)
 }
 ```
 
----
+示例只表达调用顺序；实际 Agent 必须使用 Session 的 `RunTurn` callback，不能绕过 FIFO gate。除 `ErrMemoryDisabled` 外，Memory 读取失败一律阻断当前 turn，不能伪装为空结果；v1 没有通用“继续对话”配置，只有明确的 `fallback_to_keyword` 负责向量到关键词降级。
 
-## 5. 完整集成流程图
+## 3. Memory 注入格式
 
-```text
-Session 创建                     Agent Loop                      Session 关闭
-     │                              │                               │
-     ▼                              │                               │
-┌──────────┐                       │                        ┌──────────┐
-│ Session  │                       │                        │ 摘要生成 │
-│ Manager  │                       │                        │  Summary │
-└────┬─────┘                       │                        └────┬─────┘
-     │                              │                             │
-     │ 加载关联记忆                  │                             │ 写入 Summary
-     ▼                              │                             ▼
-┌──────────┐    ③检索    ┌──────────┐    ⑧写入    ┌──────────────┐
-│  Memory  │◄───────────│  Context │───────────►│    Memory    │
-│  Store   │            │  Builder │            │    Store     │
-└──────────┘            └────┬─────┘            └──────────────┘
-     ▲                       │                       ▲
-     │                       │ ④构建                  │ ⑦晋升
-     │                       ▼                       │
-     │                  ┌──────────┐                  │
-     │     ⑤调用        │  Agent   │     ⑥回复        │
-     │◄─────────────────│   Loop   │─────────────────►│
-     │                   └──────────┘                  │
-     │                                                  │
-     └────────────── ③ 检索 / ⑧ 写入 ──────────────────┘
+Context 文档规定 Memory 通常作为受保护 system message。格式化器必须：
+
+- 只读取 `SearchResult.Item.Content` 和必要的非敏感 metadata；不把 Score 当作 MemoryItem 字段。
+- 固定转义换行和控制字符，避免内容伪造 role 或 Tool protocol。
+- 按 Search 返回顺序输出，不重新按模型生成结果排序。
+- 应用 Agent 的注入字节上限；超过上限时丢弃最末结果并记录计数，不修改 Session。
+- 不把 Memory item 写回 Session system message；它只存在于本次 candidate request。
+
+v1 固定 Memory 注入上限为 32 KiB（UTF-8 编码后的完整 system message）；该上限不是 `MemoryConfig` 字段。`Limit=0` 由 Manager 使用 effective `vector.top_k`，格式化器仍必须执行 32 KiB 总字节上限。
+
+## 4. 显式写入与晋升
+
+业务代码自行决定何时写入：
+
+```go
+item := memory.MemoryItem{
+    AgentID:   agentID,
+    SessionID: sessionID,
+    Layer:     memory.LayerLongTerm,
+    Key:       "preference.answer_style",
+    Content:   "用户偏好简洁回答",
+    Metadata:  map[string]any{"source": "user"},
+}
+if _, err := mgr.Put(ctx, policy, item); err != nil {
+    return err
+}
+
+// 需要将同一事实提升为 Agent 全局记忆时：
+_, err := mgr.Promote(ctx, policy,
+    memory.Scope{AgentID: agentID, SessionID: sessionID, Layer: memory.LayerLongTerm},
+    item.Key,
+)
 ```
 
+Put 是 upsert；调用方不先调用 Add/Update，也不自行拼接 Version。Promote 保留 Session 来源 item，只覆盖或创建空 SessionID 的全局 item。Memory 不在 assistant 回复完成、Session Pause/Close 或 Runtime shutdown 时自动摘要或 Promote。
+
+## 5. Session 和 Storage 边界
+
+- Session 的完整 snapshot 由 Session Manager 持久化到根 `storage.Storage` 的 `session:<id>` key。
+- Memory item 由 `memory.storage.type` 选择的 ContentStore 保存；不能把 item 拆成临时层、摘要记录或单独 message key。
+- Session Delete/Clear 不触碰 Memory；Memory Clear/Delete 不触碰 Session。
+- `persist=false` 只影响 Session；Memory 是否持久化由其自己的 `memory.storage.type` 决定。
+- Runtime 恢复 Session 时不读取、不生成 Memory 摘要。Memory SQLite 恢复只校验自身 schema 和 rows。
+
+## 6. 热更新和快照
+
+Agent turn 开始时捕获一次 Config snapshot并解析有效 Memory policy。该 turn 内的 Search、Put、Promote 等调用都显式接收同一个 policy；reload 不改变已经计算出的 ExpiresAt，下一 turn 才使用新 policy。Remote handler 每个请求各捕获一次 snapshot；expiration worker 每个 tick 各捕获一次根 cleanup 配置，cleanup 不属于 Agent turn。
+
+根 `default_ttl`、`max_items` 和 `eviction_policy` 可热更新；`storage.*`、embedding 连接、vector 开关和 dimension 需要重启。Agent override 的可热字段由 [config-ref.md](config-ref.md) 明确列出。
+
+## 7. 故障语义
+
+| 阶段 | 结果 |
+|------|------|
+| ContentStore 读取/写入失败 | 返回稳定错误；不返回伪造空结果，不写临时内存副本 |
+| 向量 query embedding/index 失败，fallback 开启 | 同一次 Search 改走关键词，并发布 degraded |
+| 向量 query embedding/index 失败，fallback 关闭 | Search 返回对应错误并阻断当前 turn |
+| Content Put 成功、index Upsert 失败 | Put 仍成功；健康 degraded，Reindex 可修复 |
+| Session 关闭 | 不触发 Memory 操作 |
+
+## 8. 最小集成测试
+
+1. 只写 Session 后调用 Search，确认没有隐式 Memory item。
+2. Put 一个 Session-scoped item 后，当前 Session 能检索，另一个 Session 只能在 Agent 全范围查询时看到它。
+3. Context Build 返回的 Request 含 Memory system message，但 Session snapshot 不增加该 message。
+4. Promote 后源 item 仍存在，全局 scope 能读取目标 item。
+5. ContentStore 停止时 Put 返回错误且没有内存 fallback。
+6. index 故障时 Put 成功、事件为 degraded，Reindex 恢复后向量 Search 可用。
+7. 在同一 turn 的 Search 与 Put 之间 reload policy，确认两次操作仍使用同一代 policy；下一 turn 使用新 policy。
+
+Runtime 关闭时先停止 Remote 接入并 drain Agent/Session turn，再调用一次共享 `Memory.Manager.Close(ctx)`；Agent 不关闭共享 Memory、ContentStore 或 Embedder。
+
 ---
 
-## 6. 错误处理与降级
-
-| 场景 | 处理策略 | 用户感知 |
-|------|----------|----------|
-| 检索失败 | 跳过 Memory 注入，继续对话 | 无感知，回复可能缺少上下文 |
-| 写入失败 | 日志记录，不阻塞回复 | 无感知，该轮记忆丢失 |
-| 向量搜索不可用 | 回退到关键词搜索 | 检索质量略降 |
-| 存储后端宕机 | 短期记忆保留在内存，长期记忆排队重试 | 短期内无影响 |
-
-**核心原则：** Memory 系统的任何故障都不应阻塞 Agent Loop 的主流程，始终优雅降级。
-
----
-
-## 7. 配置控制
-
-```yaml
-agents:
-  - id: "default"
-    memory:
-      enabled: true
-      search:
-        limit: 5                    # 检索返回条数
-        min_score: 0.7               # 最低相关性分数
-        fallback_to_keyword: true    # 向量不可用时回退关键词
-      injection:
-        max_tokens: 500              # Memory 注入的最大 Token 数
-        position: "after_system"     # 注入位置
-      persistence:
-        auto_promote: true           # 短期记忆自动晋升
-        summary_on_close: true       # Session 关闭时生成摘要
-```
-
----
-
-*最后更新: 2025-07-17*
+*最后更新: 2026-07-22*

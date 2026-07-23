@@ -1,379 +1,138 @@
-# Memory 存储后端设计
+# Memory 存储
 
-> Yaa! Yet Another Agent Runtime
-> 文档路径: `docs/memory/storage.md`
-> 依赖: `docs/memory/README.md` §2, `docs/architecture.md` §3.6
-
----
-
-## 1. 概述
-
-本文档描述 Memory 系统的存储后端实现，包括：
-
-| 组件 | 职责 |
-|------|------|
-| **MemoryStore** | 存储接口定义，屏蔽底层差异 |
-| **SQLite KV Store** | 基于嵌入式 SQLite 的键值存储 |
-| **Embedder** | 向量嵌入生成（调用 Embedding 模型） |
-| **VectorIndex** | 向量索引与相似度检索 |
-
-### 1.1 存储分层
-
-```
-┌─────────────────────────────────────────────┐
-│              Memory Interface               │
-│         (Add / Get / Search / Delete)        │
-├─────────────────────────────────────────────┤
-│            MemoryStore (接口)                │
-│    PutItem / GetItem / Delete / Scan        │
-├──────────────┬──────────────────────────────┤
-│  SQLite KV   │     VectorIndex (接口)       │
-│  (内容/元数据) │  (Embedding 向量 + 检索)     │
-├──────────────┼──────────────────────────────┤
-│  sqlite3     │  Embedder (接口)             │
-│  driver      │  ┌────────┬────────┐        │
-│              │  │ OpenAI │ Ollama │  ...   │
-│              │  └────────┴────────┘        │
-└──────────────┴──────────────────────────────┘
-```
+> 上级: [Memory 系统设计](README.md)
+> 接口与组件: [架构](architecture.md)
 
 ---
 
-## 2. 存储接口定义
+## 1. ContentStore 契约
 
-### 2.1 MemoryStore
+Memory 内容使用专用 `ContentStore`，因为根 `storage.Storage` 只有 KV 读写，不能表达 Memory 的复合主键、查询排序和原子版本更新。两者可以使用同一个进程，但不是同一个接口。
 
 ```go
-// MemoryStore 是记忆存储的底层接口。
-// 所有存储后端（SQLite、外部向量数据库等）均实现此接口。
-type MemoryStore interface {
-    // PutItem 写入或更新一条记忆。
-    // key 已存在时覆盖。
-    PutItem(ctx context.Context, item *MemoryItem) error
-
-    // GetItem 按 key 读取单条记忆。
-    // 不存在时返回 ErrMemoryNotFound。
-    GetItem(ctx context.Context, agentID, key string) (*MemoryItem, error)
-
-    // Delete 按 key 删除单条记忆。
-    Delete(ctx context.Context, agentID, key string) error
-
-    // Scan 列出指定 Agent 的记忆，支持分页。
-    Scan(ctx context.Context, agentID string, limit, offset int) ([]*MemoryItem, error)
-
-    // Clear 清除指定 Agent 的所有记忆。
-    Clear(ctx context.Context, agentID string) error
-
-    // Close 关闭存储，释放资源。
+type ContentStore interface {
+    CommitPut(ctx context.Context, item MemoryItem, victims []ItemRef, now time.Time) (CommitPutResult, error)
+    Get(ctx context.Context, scope Scope, key string) (MemoryItem, error)
+    Search(ctx context.Context, req SearchRequest, now time.Time) ([]MemoryItem, error)
+    List(ctx context.Context, scope Scope, now time.Time) ([]MemoryItem, error)
+    Delete(ctx context.Context, scope Scope, key string) (MemoryItem, error)
+    Clear(ctx context.Context, scope Scope) ([]MemoryItem, error)
+    DeleteExpired(ctx context.Context, before time.Time, limit int) ([]MemoryItem, error)
+    Count(ctx context.Context, agentID string, now time.Time) (int, error)
+    Ping(ctx context.Context) error
     Close() error
 }
 ```
 
-### 2.2 Embedder
+`scope.Layer` 必须是 `long_term`。在 `Get`/`Delete` 中空 `SessionID` 是一个真实的全局主键值，不表示“全部 Session”；全范围语义对 `Search`、`Clear` 和 `List` 开放。Manager 的全量 Reindex 调用 `List` 时传入空 `SessionID`，但公开 Reindex API 只接收 `agentID`。
 
-```go
-// Embedder 将文本转换为向量表示。
-// 支持多种后端：OpenAI、Ollama、本地模型等。
-type Embedder interface {
-    // Embed 生成单条文本的向量。
-    Embed(ctx context.Context, text string) ([]float32, error)
+`CommitPut` 是 target upsert 和容量驱逐的唯一存储事务：
 
-    // EmbedBatch 批量生成向量，提高吞吐。
-    EmbedBatch(ctx context.Context, texts []string) ([][]float32, error)
+1. 校验 target 完整主键、JSON metadata、`now` 和每个 victim `ItemRef`；victim 不得等于 target，Version 必须仍匹配。
+2. 删除全部 victims；任一 ref 不存在或 Version 不匹配时返回 `ErrMemoryQuota` 并回滚。
+3. 找到 target 时保留 `CreatedAt` 并将 Version 加一；否则以 Version 1 创建。
+4. 使用 Manager 传入的同一个 UTC `now` 设置新建的 CreatedAt 和 target UpdatedAt；Store 不读取另一只时钟。
+5. 同一事务替换完整 Content 和 Metadata，不做字段级 merge，并返回 stored target、created 和实际 evicted items 的深拷贝。
 
-    // Dim 返回向量维度。
-    Dim() int
-}
-```
+Manager 传入的 `CreatedAt`、`UpdatedAt` 和 `Version` 不具有写权限；恢复数据使用受校验的存储快照导入路径，而不是调用公开 `Put`。
 
-### 2.3 VectorIndex
+## 2. SQLite 实现
 
-```go
-// VectorIndex 管理向量索引并支持相似度检索。
-type VectorIndex interface {
-    // Upsert 插入或更新一条向量。
-    Upsert(ctx context.Context, agentID, key string, vector []float32) error
+默认后端使用 `modernc.org/sqlite` 的纯 Go 驱动，不依赖 CGO。Memory SQLite 文件由 `memory.storage.path` 指定；目录不存在时创建目录，无法创建或迁移失败则启动失败。
 
-    // Search 按向量相似度检索，返回最相似的 topK 条目。
-    Search(ctx context.Context, agentID string, query []float32, topK int) ([]VectorResult, error)
-
-    // Remove 删除一条向量。
-    Remove(ctx context.Context, agentID, key string) error
-
-    // Close 关闭索引。
-    Close() error
-}
-
-// VectorResult 是向量检索结果。
-type VectorResult struct {
-    Key   string  `json:"key"`
-    Score float64 `json:"score"` // 余弦相似度 0-1
-}
-```
-
----
-
-## 3. SQLite KV 存储
-
-### 3.1 表结构
+最小 schema 如下，时间以 RFC3339Nano UTC 文本保存：
 
 ```sql
-CREATE TABLE IF NOT EXISTS memory_items (
-    agent_id    TEXT    NOT NULL,
-    key         TEXT    NOT NULL,
-    content     TEXT    NOT NULL,
-    metadata    TEXT    DEFAULT '{}',   -- JSON
-    layer       INTEGER NOT NULL DEFAULT 1,
-    created_at  TEXT    NOT NULL,
-    updated_at  TEXT    NOT NULL,
-    expires_at  TEXT    DEFAULT '',
-    PRIMARY KEY (agent_id, key)
+CREATE TABLE memory_items (
+    agent_id   TEXT NOT NULL,
+    layer      TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    item_key   TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    metadata   TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT,
+    version    INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, layer, session_id, item_key)
 );
 
-CREATE INDEX IF NOT EXISTS idx_memory_layer
-    ON memory_items (agent_id, layer);
+CREATE INDEX memory_items_agent_updated
+    ON memory_items (agent_id, layer, updated_at DESC, session_id, item_key);
 
-CREATE INDEX IF NOT EXISTS idx_memory_content
-    ON memory_items USING fts5(content);  -- SQLite FTS5 全文索引
+CREATE INDEX memory_items_expiry
+    ON memory_items (expires_at)
+    WHERE expires_at IS NOT NULL;
 ```
 
-### 3.2 实现
+关键词 Search 不依赖全文索引扩展：读取当前 Agent 的候选 rows，在 Go 中按大小写折叠后的 `item_key`/`content` 做 substring 匹配，再应用 metadata 顶层精确过滤和确定性排序。`max_items` 默认 10000，候选集有明确上限；单个 item 也有固定字节上限，避免无界扫描。
+
+SQL 操作要求：
+
+- CommitPut 使用一个事务完成带 Version 条件的 victim 删除和 `INSERT ... ON CONFLICT ... DO UPDATE`，并在同一事务内计算 target Version；错误时全部回滚。
+- Delete/Clear/DeleteExpired 使用事务；返回实际删除的完整 item，供 Manager 清理派生索引。
+- `expires_at <= now` 的 rows 不由 Search/List/Count 返回；DeleteExpired 按 `expires_at ASC, agent_id, session_id, item_key` 扫描。
+- 数据库错误原样包装为 `ErrMemoryStoreUnavailable`，不转换为“空结果”。JSON 解码错误返回 `ErrMemoryCorrupt`，不能跳过坏 row。
+
+## 3. Memory 实现
+
+`memory.storage.type=memory` 使用进程内 `map[PrimaryKey]MemoryItem` 和 `sync.RWMutex`。它遵守与 SQLite 相同的主键、版本、TTL、排序和拷贝规则；进程退出后数据丢失。该后端只适合测试或明确接受丢失的临时运行。
 
 ```go
-// SQLiteStore 基于 SQLite 的 MemoryStore 实现。
-type SQLiteStore struct {
-    db    *sql.DB
-    embed Embedder
-    vi    VectorIndex
-    log   *slog.Logger
-}
-
-// NewSQLiteStore 创建 SQLite 存储实例。
-func NewSQLiteStore(dsn string, embed Embedder, vi VectorIndex) (*SQLiteStore, error) {
-    db, err := sql.Open("sqlite3", dsn+"?_journal_mode=WAL&_busy_timeout=5000")
-    if err != nil {
-        return nil, fmt.Errorf("open sqlite: %w", err)
-    }
-    db.SetMaxOpenConns(1) // SQLite 写串行
-    s := &SQLiteStore{db: db, embed: embed, vi: vi}
-    if err := s.migrate(); err != nil {
-        return nil, fmt.Errorf("migrate: %w", err)
-    }
-    return s, nil
-}
-
-// PutItem 写入记忆，同时更新向量索引。
-func (s *SQLiteStore) PutItem(ctx context.Context, item *MemoryItem) error {
-    meta, _ := json.Marshal(item.Metadata)
-    _, err := s.db.ExecContext(ctx, `
-        INSERT INTO memory_items
-            (agent_id, key, content, metadata, layer, created_at, updated_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(agent_id, key) DO UPDATE SET
-            content   = excluded.content,
-            metadata  = excluded.metadata,
-            updated_at = excluded.updated_at`,
-        item.AgentID, item.Key, item.Content, string(meta),
-        item.Layer, item.CreatedAt, item.UpdatedAt, item.ExpiresAt)
-    if err != nil {
-        return fmt.Errorf("put item: %w", err)
-    }
-
-    // 同步更新向量索引（如已配置 Embedder）
-    if s.embed != nil && s.vi != nil {
-        vec, err := s.embed.Embed(ctx, item.Content)
-        if err != nil {
-            s.log.Warn("embed failed, skipping vector index", "key", item.Key, "err", err)
-            return nil // 降级：内容已存储，向量缺失
-        }
-        return s.vi.Upsert(ctx, item.AgentID, item.Key, vec)
-    }
-    return nil
+type PrimaryKey struct {
+    AgentID   string
+    Layer     Layer
+    SessionID string
+    Key       string
 }
 ```
+
+Memory 后端的 `CommitPut` 在一个写锁临界区校验/删除 victims 并完成 upsert，失败时不得留下部分 map 修改；可先在副本计算再交换，或验证全部条件后执行不会失败的 mutation。`List` 返回副本并按同一排序规则输出。它不使用 timer 为每个 item 建立 goroutine；统一 expiration worker 调用 `DeleteExpired`。
+
+## 4. 过期、容量和索引的一致性
+
+ContentStore 负责 target 与 victims 的原子内容提交。Manager 负责：
+
+- 在 Put 前将 nil `ExpiresAt` 解析为有效 policy 的 `default_ttl`；显式指向 zero time 表示永不过期。
+- 在同一 Agent 写锁内计算最终 count 和 victim refs，再通过一次 CommitPut 提交，保持 `max_items` 上限。
+- Content commit 后调用并发安全的 `VectorIndex.Upsert`；失败不回滚 content，而是记录 `IndexDegraded` 状态。
+- Delete/Clear/DeleteExpired 后调用 `VectorIndex.Delete`；索引失败不复活已删除内容。
+
+索引引用必须包含完整 `ItemRef`（AgentID、SessionID、Layer、Key、Version）。ContentStore 更新 Version 后，旧引用自然失效；Reindex 从当前 ContentStore items 生成一个新的 exact index，全部成功后在 Agent write lock 下交换 pointer 和 status，不先破坏旧索引。
+
+## 5. 可重建向量索引
+
+v1 的索引实现是内存 exact cosine index。它不写入 ContentStore，不改变 ContentStore 的成功/失败语义：
+
+```go
+func cosine(a, b []float32) (float64, error) {
+    if len(a) == 0 || len(a) != len(b) {
+        return 0, ErrMemoryEmbeddingDimension
+    }
+    var dot, na, nb float64
+    for i := range a {
+        x, y := float64(a[i]), float64(b[i])
+        dot += x * y
+        na += x * x
+        nb += y * y
+    }
+    if na == 0 || nb == 0 {
+        return 0, ErrMemoryEmbeddingZero
+    }
+    return dot / (math.Sqrt(na) * math.Sqrt(nb)), nil
+}
+```
+
+Index `Search` 只返回超过 threshold 的 hit，按 score 降序、`SessionID`/`Key` 升序打破并列。Manager 必须重新从 ContentStore 读取并校验 Version 后再暴露结果。
+
+启用 vector 时，Runtime 必须提供 `Embedder`。内置 HTTP embedder 使用 `POST {base_url}/embeddings`，请求字段为 `model`、`input`，响应必须提供与配置 dimension 相同的浮点数组；非 2xx、超时、格式错误或 dimension 不匹配都返回 embedding 错误。响应正文和输入内容不得写入日志。
+
+## 6. 迁移与备份
+
+SQLite schema 使用单调 `schema_version` 表。启动只执行已知的向前迁移；未知版本、主键不完整或无法解码的 row 使 Memory Runtime Not Ready。迁移前由部署流程备份原文件；文档不定义自动降级或跳过记录。
+
+备份和恢复必须保留完整复合主键、Version、时间和 metadata。向量索引不在备份中，恢复后由 `Reindex` 重建。
 
 ---
 
-## 4. Embedding 生成与存储
-
-### 4.1 流程
-
-```
-用户写入记忆 (Add)
-      │
-      ▼
-┌─ SQLiteStore.PutItem ──┐
-│  1. 内容写入 SQLite    │
-│  2. Embedder.Embed     │──→ 向量
-│  3. VectorIndex.Upsert │──→ 向量索引
-└────────────────────────┘
-      │
-      ▼
-   写入完成
-```
-
-### 4.2 OpenAI Embedder 示例
-
-```go
-// OpenAIEmbedder 调用 OpenAI Embedding API。
-type OpenAIEmbedder struct {
-    apiKey string
-    model  string // "text-embedding-3-small"
-    client *http.Client
-}
-
-func (e *OpenAIEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
-    reqBody, _ := json.Marshal(map[string]any{
-        "model": e.model,
-        "input": text,
-    })
-    req, _ := http.NewRequestWithContext(ctx, "POST",
-        "https://api.openai.com/v1/embeddings", bytes.NewReader(reqBody))
-    req.Header.Set("Authorization", "Bearer "+e.apiKey)
-    req.Header.Set("Content-Type", "application/json")
-
-    resp, err := e.client.Do(req)
-    if err != nil {
-        return nil, fmt.Errorf("embed request: %w", err)
-    }
-    defer resp.Body.Close()
-
-    var result struct {
-        Data []struct {
-            Embedding []float32 `json:"embedding"`
-        } `json:"data"`
-    }
-    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-        return nil, fmt.Errorf("decode embedding: %w", err)
-    }
-    if len(result.Data) == 0 {
-        return nil, ErrEmptyEmbedding
-    }
-    return result.Data[0].Embedding, nil
-}
-
-func (e *OpenAIEmbedder) Dim() int { return 1536 } // text-embedding-3-small
-```
-
----
-
-## 5. 向量索引 — 内存 HNSW
-
-### 5.1 设计取舍
-
-| 方案 | 优点 | 缺点 | Yaa! 选择 |
-|------|------|------|-----------|
-| 内存 HNSW | 检索快、零依赖 | 内存占用高 | ✅ 默认 |
-| SQLite + sqlite-vec | 持久化、轻量 | 需扩展模块 | 可选 |
-| 外部向量数据库 | 可扩展、分布式 | 运维复杂 | 可选 |
-
-### 5.2 内存 HNSW 实现
-
-```go
-// HNSWIndex 基于 hnswlib 的内存向量索引。
-type HNSWIndex struct {
-    mu       sync.RWMutex
-    indexes  map[string]*hnsw.Index // agentID → index
-    dim      int
-    maxElem  int
-    efSearch int
-}
-
-func NewHNSWIndex(dim, maxElem, efSearch int) *HNSWIndex {
-    return &HNSWIndex{
-        indexes:  make(map[string]*hnsw.Index),
-        dim:      dim, maxElem: maxElem, efSearch: efSearch,
-    }
-}
-
-func (h *HNSWIndex) Upsert(ctx context.Context, agentID, key string, vec []float32) error {
-    h.mu.Lock()
-    defer h.mu.Unlock()
-    idx, ok := h.indexes[agentID]
-    if !ok {
-        idx = hnsw.New(h.dim, h.maxElem, hnsw.M(16), hnsw.EfConstruction(200))
-        h.indexes[agentID] = idx
-    }
-    return idx.Add(key, vec)
-}
-
-func (h *HNSWIndex) Search(ctx context.Context, agentID string, query []float32, topK int) ([]VectorResult, error) {
-    h.mu.RLock()
-    idx, ok := h.indexes[agentID]
-    h.mu.RUnlock()
-    if !ok {
-        return nil, nil // 无记忆，空结果
-    }
-    return idx.Search(query, topK, h.efSearch)
-}
-```
-
-### 5.3 检索降级策略
-
-```
-Search 请求
-    │
-    ├─ Embedder 可用？ ──→ 是 ──→ 生成 query 向量
-    │                              │
-    │                              ├─ VectorIndex.Search 成功 ──→ 返回语义结果
-    │                              │
-    │                              └─ VectorIndex.Search 失败 ──→ 降级 FTS
-    │
-    └─ Embedder 不可用 ──→ SQLite FTS5 全文检索（关键词匹配）
-```
-
-```go
-// Search 实现：优先向量检索，失败降级全文搜索。
-func (s *SQLiteStore) Search(ctx context.Context, agentID, query string, limit int) ([]*MemoryItem, error) {
-    // 1. 尝试向量语义检索
-    if s.embed != nil && s.vi != nil {
-        qVec, err := s.embed.Embed(ctx, query)
-        if err == nil {
-            results, err := s.vi.Search(ctx, agentID, qVec, limit)
-            if err == nil && len(results) > 0 {
-                return s.loadByKeys(ctx, agentID, results)
-            }
-        }
-        s.log.Warn("vector search failed, falling back to FTS", "err", err)
-    }
-    // 2. 降级：SQLite FTS5 全文检索
-    rows, err := s.db.QueryContext(ctx, `
-        SELECT key, content, metadata, layer, created_at, updated_at
-        FROM memory_items
-        WHERE agent_id = ? AND memory_items MATCH ?
-        ORDER BY rank LIMIT ?`,
-        agentID, query, limit)
-    if err != nil {
-        return nil, fmt.Errorf("fts search: %w", err)
-    }
-    defer rows.Close()
-    return scanItems(rows)
-}
-```
-
----
-
-## 6. 配置参考
-
-```yaml
-memory:
-  store: sqlite                    # sqlite | external
-  sqlite:
-    dsn: "data/yaa_memory.db"
-    journal_mode: WAL
-  embedder:
-    provider: openai               # openai | ollama | none
-    model: text-embedding-3-small
-    api_key: ${OPENAI_API_KEY}
-    batch_size: 64
-  vector_index:
-    type: hnsw                     # hnsw | sqlite-vec | external
-    dim: 1536
-    max_elements: 100000
-    ef_search: 50
-    ef_construction: 200
-```
-
----
-
-*最后更新: 2025-07-17*
+*最后更新: 2026-07-22*

@@ -1,315 +1,167 @@
 # MCP 系统设计
 
-> Yaa! Yet Another Agent Runtime
-> 文档路径: `docs/mcp/` (原计划单文件 `docs/mcp.md`，拆分为多文件)
-> 依赖: `docs/architecture.md` §3.9, `docs/tool/` 全系列
+> 文档路径: `docs/mcp/README.md`
+> 依赖: `docs/architecture.md` §3.9、`docs/tool/` 全系列
 
 ---
 
-## 1. 概述
+## 1. 范围
 
-### 1.1 什么是 MCP
-
-MCP (Model Context Protocol) 是一种开放协议，用于 LLM/Agent 与外部工具、数据源之间的标准化通信。Yaa! 原生支持 MCP，无需第三方桥接。
-
-### 1.2 双角色设计
-
-Yaa! 在 MCP 生态中同时扮演两个角色：
-
-| 角色 | 说明 | 方向 |
-|------|------|------|
-| **MCP Client** | 连接外部 MCP Server，将其暴露的 Tool 注册为 Yaa! Tool 使用 | Yaa! → 外部 |
-| **MCP Server** | 将 Yaa! 自身的 Tool / Skill 通过 MCP 协议暴露给其他 MCP Client | 外部 → Yaa! |
+Yaa! 同时作为 MCP Client 和 MCP Server。MVP 只实现 Tool 能力；首选 MCP `2025-03-26`，并为 legacy SSE 接受 `2024-11-05`。Resource 与 Prompt 留待后续版本。
 
 ```text
-                         ┌─────────────────┐
-                         │   External      │
-                         │   MCP Client    │
-                         │   (Claude /     │
-                         │    Cursor /     │
-                         │    其他 Agent)   │
-                         └────────┬────────┘
-                                  │
-                          MCP 协议  │ stdio / SSE / WS
-                                  ▼
-┌─────────────────────────────────────────────────────────┐
-│                    Yaa! Runtime                          │
-│                                                         │
-│   ┌─────────────────────────────────────────────────┐   │
-│   │              MCP Manager                         │   │
-│   │                                                  │   │
-│   │   ┌──────────────┐         ┌──────────────┐     │   │
-│   │   │  MCP Client  │         │  MCP Server   │     │   │
-│   │   │  (连接外部    │         │  (暴露 Yaa!   │     │   │
-│   │   │   Server)    │         │   能力)       │     │   │
-│   │   └──────┬───────┘         └───────┬──────┘     │   │
-│   │          │                        │             │   │
-│   │          ▼                        ▼             │   │
-│   │   Tool Registry            Tool / Skill         │   │
-│   │   (外部 Tool 注册)          (内置能力)           │   │
-│   └─────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
-         │
-         │ MCP 协议
-         │ stdio / SSE / WS
-         ▼
-   ┌──────────────────┐
-   │  External MCP     │
-   │  Server           │
-   │  (filesystem /    │
-   │   github / db)    │
-   └──────────────────┘
+Agent → Tool Manager → MCP Tool Proxy → MCP Client → External MCP Server
+
+External MCP Client → Yaa! MCP Server → Tool Manager → Yaa! Tool
 ```
 
-### 1.3 核心原则
+MCP 与 Yaa! Remote API 是两套协议：Remote API 可使用 WebSocket；MCP transport 只使用 `stdio`、`streamable_http` 和兼容旧 Server 的 `sse`。
 
-1. **Native MCP** — 无需插件，MCP 支持内置于 Runtime
-2. **双向互通** — 既是 Client 也是 Server，无缝融入 MCP 生态
-3. **Tool 透明** — 外部 MCP Tool 注册后与内置 Tool 无差异
-4. **Config over Code** — 通过 `mcp.servers` 配置连接外部 Server
-5. **传输无关** — 支持 stdio、SSE、WebSocket 三种传输方式
-
----
-
-## 2. 核心接口
-
-### 2.1 MCP Manager
-
-MCP Manager 是 MCP 子系统的入口，统一管理所有 MCP Client 连接和 MCP Server 实例。
+## 2. Manager
 
 ```go
-// MCP Manager 管理所有 MCP 连接（Client + Server）
-type Manager struct {
-    Clients  map[string]*Client   // 已连接的外部 MCP Server（Yaa! 作为 Client）
-    Servers  map[string]*Server   // Yaa! 暴露的 MCP Server 实例
-    Tools    *tool.Manager        // Tool 注册中心引用
-    Config   *MCPConfig
+type ServerStatus struct {
+    Name            string           `json:"name"`
+    Status          ConnectionStatus `json:"status"`
+    Transport       string           `json:"transport"`
+    ProtocolVersion *string          `json:"protocol_version"`
+    ToolCount       int              `json:"tool_count"`
+    ConnectedAt     *time.Time       `json:"connected_at"`
+    LastError       string           `json:"last_error,omitempty"`
 }
 
-// 初始化：加载配置中的 mcp.servers，建立连接并注册 Tool
-func (m *Manager) Init(cfg *MCPConfig) error
-
-// 启动所有 MCP Server 实例
-func (m *Manager) StartServers() error
-
-// 优雅关闭所有连接
-func (m *Manager) Shutdown(ctx context.Context) error
+func (m *Manager) Prepare() error
+func (m *Manager) Activate() error
+func (m *Manager) Stop(ctx context.Context) error
+func (m *Manager) Done() <-chan struct{}
+func (m *Manager) Ready() bool
+func (m *Manager) Get(name string) (ServerStatus, bool)
+func (m *Manager) Tools(name string) ([]tool.ToolInfo, bool)
+func (m *Manager) List() []ServerStatus
 ```
 
-### 2.2 MCP Client
+完整 Manager owner 字段只在 [config-ref.md](config-ref.md#7-加载与启动流程) 定义。Manager 是 catalog、稳定 Proxy、heartbeat 和重连的唯一 owner，不向调用方暴露可变 `Client`。`Prepare` 校验并持有本地 transport，但不接收请求；同时连接 auto-start 上游、发现 Tool 并注册稳定 Proxy。`Config.Activate` 完成 binding 校验后，Runtime 才调用 `Activate` 启动本地 `Serve`。外部 Server 连接失败只把该连接标记为 `error`；若配置实际引用了未注册的 MCP Tool，后续 binding 校验仍会拒绝启动。显式启用的本地 Server 若配置、listener、Agent principal 或 exposed Tool 无效则启动失败。`Ready` 在本地 `Serve` 意外退出后返回 false，使 Runtime 进入 unhealthy/Not Ready。`ServerStatus` 是 Manager、健康快照与 Remote 投影共用的唯一上游状态类型；敏感连接配置不进入该类型。`Stop(ctx)` 可以因 caller deadline 先返回；Runtime 必须等待 `Done()`，再用 `Stop(context.Background())` 读取缓存的最终 teardown error，之后才能关闭 Tool Manager 等依赖。
 
-MCP Client 代表 Yaa! 到一个外部 MCP Server 的连接。
+## 3. Client
 
 ```go
-// Client 连接外部 MCP Server，将其 Tool 注册到 Yaa! Tool Registry
-type Client struct {
-    Name      string             // 连接名称（配置中的 name）
-    Transport Transport          // 传输层（stdio / SSE / WS）
-    Tools     []MCPTool          // 远端暴露的 Tool 列表
-    State     ClientState        // Disconnected / Connecting / Ready / Error
-}
-
-// 建立连接并发现远端 Tool
 func (c *Client) Connect(ctx context.Context) error
-
-// 列出远端可用 Tool
-func (c *Client) ListTools(ctx context.Context) ([]MCPTool, error)
-
-// 调用远端 Tool
-func (c *Client) CallTool(ctx context.Context, name string, params map[string]any) (json.RawMessage, error)
-
-// 断开连接
-func (c *Client) Disconnect() error
+func (c *Client) Initialize(ctx context.Context) error
+func (c *Client) DiscoverTools(ctx context.Context) ([]MCPTool, error)
+func (c *Client) Ping(ctx context.Context) error
+func (c *Client) Done() <-chan struct{}
+func (c *Client) Err() error
+func (c *Client) CallTool(ctx context.Context, name string, arguments map[string]any) (*CallToolResult, error)
+func (c *Client) Close() error
 ```
 
-MCP Client 发现的 Tool 会自动注册到 Yaa! 的 Tool Registry，命名格式为 `mcp.{server_name}.{tool_name}`，与内置 Tool 一样参与 Agent 的 Tool Loop。
+Client 的唯一完整结构见 [client.md](client.md#1-状态与结构)。每个 Client 只代表一代连接；`Done`/`Err` 把终止状态交给 Manager，Client 自己不重连。连接状态只有 `disconnected`、`connecting`、`connected`、`error`。Initialize 请求和响应都必须协商 `protocolVersion`。`streamable_http` 只接受 `2025-03-26`，legacy `sse` 只接受 `2024-11-05`，`stdio` 首选 `2025-03-26` 并接受这两个版本。
 
-### 2.3 MCP Server
+Tool 映射到 Yaa! 后统一命名为：
 
-MCP Server 将 Yaa! 的内置 Tool 和 Skill 通过 MCP 协议暴露给外部 Client。
-
-```go
-// Server 将 Yaa! 能力暴露为 MCP Server
-type Server struct {
-    Name      string             // Server 名称
-    Transport Transport          // 传输层（stdio / SSE / WS）
-    Tools     []tool.Tool        // 暴露的 Tool 列表
-    Skills    []skill.Skill      // 暴露的 Skill 列表
-    State     ServerState        // Stopped / Running / Error
-}
-
-// 启动 MCP Server，监听外部 Client 连接
-func (s *Server) Start(ctx context.Context) error
-
-// 处理来自外部 Client 的 Tool 调用
-func (s *Server) handleToolCall(ctx context.Context, name string, params map[string]any) (json.RawMessage, error)
-
-// 停止 Server
-func (s *Server) Stop() error
+```text
+mcp.<server_name>.<tool_name>
 ```
 
----
+## 4. Server
 
-## 3. 传输方式
+Yaa! MCP Server 通过独立 `ServerTransport` 接收 JSON-RPC，只声明实际实现的 Tool capability。
 
-### 3.1 传输方式对比
+| 方法 | MVP 行为 |
+|------|----------|
+| `initialize` | 按 transport 协商 `2025-03-26` 或 legacy `2024-11-05`，返回 Tool capability |
+| `notifications/initialized` | 标记连接就绪 |
+| `tools/list` | 返回允许暴露的 Tool，支持 cursor |
+| `tools/call` | 校验名称和参数后调用 Tool Manager |
+| `ping` | 返回空 result |
+| `resources/*`, `prompts/*` | 返回 `-32601 Method not found` |
 
-| 传输方式 | 适用场景 | 优势 | 限制 |
-|----------|----------|------|------|
-| **stdio** | 本地进程通信 | 零配置、低延迟、最简单 | 仅限同机，需启动子进程 |
-| **SSE** | 远程单向调用 | HTTP 兼容、穿透防火墙 | 不支持双向实时通信 |
-| **WebSocket** | 远程双向通信 | 全双工、实时性强 | 需 WS 兼容环境 |
+可通过 `mcp.server.exposed_tools` 配置公开 Tool；默认空列表，不暴露任何内部 Tool。
 
-### 3.2 传输接口
+## 5. Transport
 
-```go
-// Transport 抽象所有传输方式
-type Transport interface {
-    // Start 启动传输层，建立连接
-    Start(ctx context.Context) error
+| transport | 角色 | 说明 |
+|-----------|------|------|
+| `stdio` | Client/Server | 本地子进程或标准输入输出 |
+| `streamable_http` | Client/Server | MCP 2025-03-26 标准 HTTP transport |
+| `sse` | Client/Server | MCP 2024-11-05 legacy 兼容 |
 
-    // 发送消息
-    Send(ctx context.Context, msg *Message) error
+Client 和 Server transport 接口、SSE frame 与 Streamable HTTP session header 见 [transport.md](transport.md)。
 
-    // 接收消息
-    Recv(ctx context.Context) (*Message, error)
-
-    // 关闭连接
-    Close() error
-
-    // Info 返回传输层元信息
-    Info() TransportInfo
-}
-
-// 三种实现
-type StdioTransport struct {
-    Cmd    *exec.Cmd       // 子进程
-    Stdin  io.WriteCloser
-    Stdout io.ReadCloser
-}
-
-type SSETransport struct {
-    URL    string           // Server SSE 端点
-    Client *http.Client
-}
-
-type WebSocketTransport struct {
-    URL    string           // WS 端点
-    Conn   *websocket.Conn
-}
-```
-
----
-
-## 4. 配置参考
+## 6. 配置
 
 ```yaml
-# yaa.yaml — MCP 配置示例
 mcp:
-  # 作为 MCP Client：连接外部 MCP Server
   servers:
-    - name: "filesystem"
-      command: "npx"
+    - name: filesystem
+      transport: stdio
+      command: npx
       args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-      transport: "stdio"
-
-    - name: "github"
-      transport: "sse"
-      url: "http://localhost:3001/sse"
-
-    - name: "remote-tools"
-      transport: "websocket"
-      url: "ws://10.0.0.5:8090/mcp"
-
-  # 作为 MCP Server：暴露 Yaa! 能力
-  expose:
+      auto_start: true
+    - name: remote-search
+      transport: streamable_http
+      url: https://mcp.example.com/mcp
+      headers:
+        Authorization: "Bearer ${MCP_TOKEN}"
+      auto_start: true
+  timeout:
+    connect: 10s
+    init: 15s
+    tool: 0
+  reconnect:
     enabled: true
-    transport: "sse"
-    addr: ":9090"
-    tools: ["shell", "http", "file"]   # 暴露哪些 Tool
-    skills: ["web-scraper"]            # 暴露哪些 Skill
+    max_attempts: 3
+    initial_delay: 1s
+    max_delay: 60s
+  server:
+    enabled: false
+    agent_id: "default"
+    transport: stdio
+    addr: "127.0.0.1:9090"
+    path: "/mcp"
+    exposed_tools: []
 ```
 
-配置加载后，MCP Manager 会：
-1. 逐个连接 `mcp.servers` 中的外部 Server
-2. 发现远端 Tool 并注册到 Tool Registry（前缀 `mcp.{name}.`）
-3. 如果 `mcp.expose.enabled` 为 true，启动 MCP Server 实例
+完整字段见 [config-ref.md](config-ref.md)。
 
----
+## 7. 错误语义
 
-## 5. 数据流
+- 未知 JSON-RPC method：JSON-RPC `-32601`。
+- 未知 Tool 或参数无效：JSON-RPC `-32602`。
+- Tool 已被正确调用但执行失败：返回 `result.isError=true` 和安全的文本内容。
+- Transport/协议错误：返回 `ErrMCP*`，连接进入 `error`。
+- 连接断开后不自动重放任何已经发送的 `tools/call` 请求。
+- 已注册的 Proxy 在暂时断线时保留并返回 `ErrMCPUnavailable`；只在 Manager 永久关闭时注销。
 
-### 5.1 MCP Client 调用流程
+## 8. 启动顺序
+
+完整 Runtime 顺序中 Plugin 和 MCP 都在 Skill Load/binding 之前完成 Tool Proxy 注册：
 
 ```text
-Agent Tool Loop
-  │
-  │  LLM 返回 Tool Call: mcp.filesystem.read_file
-  │
-  ▼
-Tool Registry
-  │
-  │  查找 Tool → 发现是 MCP Tool
-  │
-  ▼
-MCP Manager → Client ("filesystem")
-  │
-  │  通过 Transport 发送 MCP 请求
-  │
-  ▼
-External MCP Server (stdio / SSE / WS)
-  │
-  │  执行 Tool，返回结果
-  │
-  ▼
-MCP Client → Tool Registry → Context Manager
-  │
-  │  Tool 结果加入上下文
-  │
-  ▼
-Agent → 再次调用 LLM
+Config Validate
+  → Tool Manager
+  → MCP Manager.Prepare
+  → 为 auto_start Server 建立连接
+  → initialize 版本协商
+  → 分页拉取 tools/list
+  → 注册稳定 MCP Tool Proxy
+  → Skill Load
+  → Config.Activate(binding)
+  → MCP Manager.Activate（本地 Serve）
 ```
-
-### 5.2 MCP Server 响应流程
-
-```text
-External MCP Client
-  │
-  │  MCP 请求 (stdio / SSE / WS)
-  │
-  ▼
-MCP Server (Yaa!)
-  │
-  │  解析请求 → 路由到对应 Tool / Skill
-  │
-  ▼
-Tool / Skill 执行
-  │
-  │  返回结果
-  │
-  ▼
-MCP Server → Transport
-  │
-  │  MCP 响应
-  │
-  ▼
-External MCP Client
-```
-
----
 
 ## 文档索引
 
 | 文件 | 内容 |
 |------|------|
-| [client.md](client.md) | MCP Client — 连接外部 Server、Tool 发现、调用转发、重连策略 |
-| [server.md](server.md) | MCP Server — 暴露 Yaa! 能力、Tool/Skill 映射、会话管理 |
-| [transport.md](transport.md) | 传输层 — stdio / SSE / WebSocket 实现、连接生命周期 |
-| [integration.md](integration.md) | 与 Tool / Agent / Config 的集成 |
-| [config-ref.md](config-ref.md) | 配置参考 — mcp.servers / mcp.expose 完整字段说明 |
-| [errors.md](errors.md) | 错误处理 — 连接失败、超时、重连、降级策略 |
-| [observability.md](observability.md) | 可观测性 — 日志、指标、Remote API 事件 |
-| [decisions.md](decisions.md) | 设计决策（MC-001 ~ MC-008）+ 模块关系 |
+| [client.md](client.md) | MCP Client、初始化、Tool 发现与调用 |
+| [server.md](server.md) | MCP Server 方法与暴露策略 |
+| [transport.md](transport.md) | Client/Server transport 与 wire 约定 |
+| [integration.md](integration.md) | Tool/Agent/Config 集成 |
+| [config-ref.md](config-ref.md) | 完整配置字段 |
+| [errors.md](errors.md) | 错误、重试和降级 |
+| [observability.md](observability.md) | 日志、指标与事件 |
+| [decisions.md](decisions.md) | 设计决策 |
 | [checklist.md](checklist.md) | 实现检查清单 |
 
 ---

@@ -7,6 +7,8 @@
 
 ## 11. 配置参考
 
+字段、类型和默认值由 [Config reference](../config/reference.md#6-tools-节点) 唯一维护；本文件给出组合示例和 Agent override 用法。
+
 ### 11.1 完整配置
 
 ```yaml
@@ -25,15 +27,16 @@ tools:
       options:
         allowed_commands: []
         blocked_commands: ["rm -rf /", "mkfs", "dd if="]
-        working_dir: "/workspace"
+        working_dir: "."
+        env: {}
         max_output_bytes: 65536
     http:
       enabled: true
       timeout: 30s
       options:
         max_redirects: 5
-        allowed_domains: []
-        blocked_domains: []
+        allowed_hosts: []
+        blocked_hosts: []
         max_response_bytes: 1048576
     file:
       enabled: true
@@ -46,43 +49,21 @@ tools:
     # 配置管理类工具
     config_query:
       enabled: true
-      options:
-        redact_patterns: ["api_key", "password", "secret", "token"]
-    config_set:
-      enabled: true
-      options:
-        allowed_paths: []                          # 空=全部允许
-        blocked_paths: ["runtime.security", "tools.builtin.config"]
-        allow_persist: true
+      options: {}
     config_reload:
-      enabled: true
-    config_scheme:
-      enabled: true
-    config_save:
-      enabled: true
-      options:
-        allowed_paths: ["./config.yaml"]
-        backup: true
-    config_diff:
       enabled: true
 
     # 内视类工具（只读，默认启用）
     runtime_status:
       enabled: true
-      options:
-        full_detail_requires_admin: true           # detail=full 需管理权限
     agent_list:
       enabled: true
     agent_inspect:
       enabled: true
-      options:
-        context_requires_admin: true               # include_context 需管理权限
     session_list:
       enabled: true
     session_inspect:
       enabled: true
-      options:
-        tool_results_requires_admin: true           # include_tool_results 需管理权限
     tool_list:
       enabled: true
     skill_list:
@@ -91,34 +72,9 @@ tools:
       enabled: true
     mcp_list:
       enabled: true
-    log_query:
-      enabled: true
-      options:
-        redact_patterns: ["api_key", "password", "secret", "token"]
-        max_results: 500
-    metric_query:
-      enabled: true
 
-    # 管理类工具（默认禁用，需显式启用）
-    skill_install:
-      enabled: false
-    skill_uninstall:
-      enabled: false
-    skill_enable:
-      enabled: false
-    skill_disable:
-      enabled: false
-    provider_health:
-      enabled: true
-
-  custom:
-    - name: "my_tool"
-      type: "plugin"
-      plugin: "my_plugin.so"
-      enabled: true
-      timeout: 60s
-      options:
-        api_key: "${MY_API_KEY}"
+  # 第三方二进制 Tool 通过根级 plugins.entries 配置，
+  # Plugin Manager 握手后自动注册 Tool Proxy。
 ```
 
 ### 11.2 Agent 级别覆盖
@@ -127,7 +83,6 @@ tools:
 agents:
   - id: "dev-agent"
     tools: ["shell", "http", "file_read", "file_write", "file_list"]
-    tool_choice: "auto"
     tools_config:
       shell:
         timeout: 120s          # 覆盖全局 shell timeout
@@ -135,5 +90,6 @@ agents:
           working_dir: "/workspace/project"
 ```
 
----
+`tools_config` 只覆盖该 Agent 的 Tool `timeout` 与 `options`。Manager 将其解码为不含 `Enabled` 的内部 presence-aware override（`Timeout *time.Duration`、nil/非 nil `Options`）；不能复用 root `config.ToolConfig`，也不能让 Agent 重新启用 root disabled Tool。root 和 Agent options 都在启动 binding 阶段按 [Config reference](../config/reference.md#6-tools-节点) 严格解码，未知 key 必须报告完整配置路径。`ToolChoice` 和 `Thinking` 是每次组装 `provider.ChatRequest` 时设置的请求级字段，不是 `AgentConfig` 字段。
 
+---

@@ -1,179 +1,95 @@
-# Planner 集成设计
+# Planner 集成
 
-> 文档路径: `docs/planner/integration.md`
-> 上级: `docs/planner/README.md`
-> 依赖: `docs/architecture.md` §3.5, `docs/tool/`, `docs/skill/`
+> 上级: [Planner 系统设计](README.md)
 
 ---
 
-## 1. 概述
+## 1. Agent 调用顺序
 
-Planner 是 Yaa! Runtime 中连接"任务输入"与"执行编排"的中间层。它接收用户任务，将其分解为有序步骤（Plan），然后由 Agent 按步骤执行。
-
-Planner 与以下核心模块紧密集成：
-
-| 模块 | 集成方向 | 说明 |
-|------|---------|------|
-| Agent | 双向 | Agent 调用 Planner 生成计划；Planner 借助 Agent 的 Provider 能力 |
-| Tool | 单向 | Plan 中的 Step 可引用 Tool 执行原子操作 |
-| Skill | 单向 | Plan 中的 Step 可触发 Skill 完成多步骤工作流 |
-| Session | 单向 | Planner 在 Session 上下文中运行，Plan 挂载到 Session |
-| Context | 单向 | Planner 输出的 Plan 可注入 Context 供 LLM 参考 |
-
----
-
-## 2. 与 Agent 集成
-
-Agent 是 Planner 的主要调用方。当 Agent 收到用户任务后，判断是否需要规划：
+Planner 只能在 Session 已取得 turn FIFO gate 后运行：
 
 ```go
-func (a *Agent) handleTask(ctx context.Context, task string) error {
-    // 1. 判断是否需要规划（简单任务跳过 Planner）
-    if a.shouldPlan(task) {
-        plan, err := a.planner.Plan(ctx, task, a)
-        if err != nil {
-            return fmt.Errorf("planning failed: %w", err)
-        }
-        // 2. 将 Plan 挂载到当前 Session
-        a.session.SetPlan(plan)
-        // 3. 按步骤执行
-        return a.executePlan(ctx, plan)
+func (a *Agent) runPlannedTurn(ctx context.Context, turn *session.Turn, req TurnRequest) (TurnResult, error) {
+    if a.planner == nil { // resolved planner.type == disabled
+        return a.runDirectLoop(ctx, turn, req)
     }
-    // 简单任务直接进入 Agent Loop
-    return a.runLoop(ctx, task)
-}
 
-func (a *Agent) executePlan(ctx context.Context, plan *Plan) error {
-    for _, step := range plan.Steps {
-        if err := a.executeStep(ctx, step); err != nil {
-            return err
-        }
-    }
-    return nil
-}
-```
-
-**Planner 使用 Agent 的 Provider：**
-
-默认的 LLM 驱动规划器通过 Agent 绑定的 Provider 调用 LLM 生成计划：
-
-```go
-func (p *LLMPlanner) Plan(ctx context.Context, task string, a *agent.Agent) (*Plan, error) {
-    prompt := p.buildPlanPrompt(task, a.Tools, a.Skills)
-    resp, err := a.Provider.Chat(ctx, &provider.ChatRequest{
-        Messages: []provider.Message{
-            {Role: "system", Content: p.systemPrompt},
-            {Role: "user", Content: prompt},
-        },
-    })
+    var usage provider.Usage // 每次调用独占，不能放在 Agent 字段上。
+    in := a.planningInput(req.TurnID, req.Content)
+    plan, planningUsage, err := a.planner.Plan(ctx, in)
+    addUsage(&usage, planningUsage)
     if err != nil {
-        return nil, err
+        return TurnResult{Usage: usage}, fmt.Errorf("plan turn: %w", err)
     }
-    return p.parsePlan(resp.Content)
+    if err := planner.ValidatePlan(plan, in); err != nil {
+        return TurnResult{Usage: usage}, fmt.Errorf("validate plan: %w", err)
+    }
+    result, err := a.planExecutor.Execute(ctx, a.id, req.SessionID, plan)
+    addUsage(&usage, result.Usage)
+    if err != nil {
+        return TurnResult{Usage: usage, ToolCallCount: result.ToolCallCount},
+            fmt.Errorf("execute plan: %w", err)
+    }
+    return a.finishPlannedTurn(ctx, turn, plan, result, usage, result.ToolCallCount)
+}
+
+func addUsage(dst *provider.Usage, src provider.Usage) {
+    dst.PromptTokens += src.PromptTokens
+    dst.CompletionTokens += src.CompletionTokens
+    dst.TotalTokens += src.TotalTokens
 }
 ```
+
+该 helper 只由 [Agent 唯一 turn 流程](../agent.md#4-唯一-turn-流程) 在 `turn.AppendUser` 成功后调用；`finishPlannedTurn` 使用传入的同一个 `*session.Turn` 提交 final assistant，并把最终生成 usage 加入传入的局部值后写入 `TurnResult`，不创建第二个 gate、Session handle 或 Agent 共享 accumulator。
+
+规划失败不会静默切换到普通 Agent Loop。需要直接模式时应配置 `planner.type: disabled`；这可避免一次任务在两条执行路径上产生重复副作用。
 
 ---
 
-## 3. 与 Tool 集成
+## 2. 能力投影
 
-Plan 中的 Step 可以指定调用某个 Tool：
-
-```go
-type Step struct {
-    ID       string
-    Action   string         // "tool:shell", "skill:web-scraper", "llm"
-    Input    map[string]any
-    Depends  []string
-    Status   StepStatus
-}
-```
-
-**Step 执行时调用 Tool：**
-
-```go
-func (a *Agent) executeStep(ctx context.Context, step *Step) error {
-    switch {
-    case strings.HasPrefix(step.Action, "tool:"):
-        toolName := strings.TrimPrefix(step.Action, "tool:")
-        result, err := a.toolMgr.Execute(ctx, toolName, step.Input)
-        if err != nil {
-            step.Status = StepFailed
-            return fmt.Errorf("step %s failed: %w", step.ID, err)
-        }
-        step.Output = result
-        step.Status = StepDone
-    case strings.HasPrefix(step.Action, "skill:"):
-        // 见下文 Skill 集成
-    }
-    return nil
-}
-```
-
----
-
-## 4. 与 Skill 集成
-
-Plan 中的 Step 可以触发一个完整 Skill 工作流，而非单个 Tool：
-
-```go
-func (a *Agent) executeStep(ctx context.Context, step *Step) error {
-    if strings.HasPrefix(step.Action, "skill:") {
-        skillName := strings.TrimPrefix(step.Action, "skill:")
-        // 激活 Skill → 注入 Prompt → 进入 Agent Loop 执行
-        if err := a.skillMgr.Activate(skillName, a); err != nil {
-            step.Status = StepFailed
-            return err
-        }
-        step.Status = StepDone
-    }
-    return nil
-}
-```
-
-| Step Action | 执行方式 | 粒度 |
-|-------------|---------|------|
-| `tool:<name>` | 调用单个 Tool | 原子操作 |
-| `skill:<name>` | 激活 Skill 工作流 | 多步骤编排 |
-| `llm` | 纯 LLM 推理 | 无外部调用 |
-
----
-
-## 5. 与 Session 集成
-
-Plan 生成后挂载到 Session，支持跨轮次执行和恢复：
-
-```go
-func (s *Session) SetPlan(plan *Plan) {
-    s.Plan = plan
-    s.Metadata["plan_created_at"] = time.Now()
-}
-
-func (s *Session) GetPlan() *Plan {
-    return s.Plan
-}
-```
-
-**Session 恢复时自动加载未完成的 Plan：**
+`planningInput` 只能投影当前 Agent 已授权且可用的能力：
 
 ```text
-Session 恢复 → 检查 Plan → 有未完成 Step → 从中断处继续执行
+ToolManager.ListForAgent(agentID)   -> Capability{...}
 ```
+
+不得把全局 Tool 注册表、禁用项或其他 Agent 的能力放进 Prompt。Skill 在 Agent 构造 Context 时作为静态 Prompt 解析，不是 Planner capability。即使生成时做过过滤，执行时 Tool Manager 仍需按真实 scope 再次鉴权。
 
 ---
 
-## 6. 与 Context 集成
+## 3. StepRunner 分发
 
-Planner 可将 Plan 摘要注入 Context，让 LLM 在后续推理中感知整体计划：
+Agent 构造唯一 `StepRunner`，按 `Action` 分发：
 
-```go
-func (p *LLMPlanner) injectPlanContext(ctx *context.Context, plan *Plan) {
-    summary := p.summarizePlan(plan)
-    ctx.AppendMessage(provider.Message{
-        Role:    "system",
-        Content: fmt.Sprintf("## Current Plan\n\n%s", summary),
-    })
-}
-```
+| Action | 分发规则 |
+|--------|----------|
+| `tool` | `ToolManager.Execute(ctx, tool.ExecutionScope{AgentID: agentID, SessionID: sessionID}, step.Target, input)`；实际调用后返回 `StepRunResult{Output: content/is_error, ToolCallCount: 1}`，Usage 为零值 |
+| `llm` | 校验 `input.instruction`，用当前 Provider 的 `Chat`；请求不携带 Tool definitions；返回 `StepRunResult{Output: content, Usage: response.Usage}` |
 
-**Context 占用控制：** Plan 摘要限制在 500 tokens 以内，超出时仅保留当前和后续步骤。
+Tool result 和 LLM response 都应转成 JSON 可编码值；无法编码时 Step 失败。`addUsage` 只操作本次 `HandleTurn` 栈上的局部值，逐字段相加 `PromptTokens/CompletionTokens/TotalTokens`；直接模式也用同一 helper 累计每次 Provider response。因此成功 `TurnResult.Usage` 覆盖本 turn 的 planning、LLM Step 与 final generation，不会在并行 Session 间串值。
+
+---
+
+## 4. Session 与 Context
+
+- Session snapshot 不增加 `Plan` 或 `PlanResult` 字段。
+- Agent 的 `RunTurn` callback 先提交 user message，再进入 Planner；Remote handler 不直接写 Session，后续失败不回滚该 user message。
+- 直接 Planner Tool Step 没有 Provider 生成的前置 `assistant.tool_calls`，因此不得伪造或提交 Session Tool unit。Plan/Step 中间消息和输出全部保持 turn-local。
+- 只有真实 Agent Tool Loop 才按 [Session Tool 集成](../session/integration.md#5-tool-集成) 原子提交完整 Tool unit；Planner 成功后再提交 final assistant。
+- `PlanResult` 可用于构造最终回答，但不作为 system message 永久注入历史。
+- Session close、stop、客户端取消和 Runtime shutdown 均通过同一个 turn context 传播。
+
+Planner 不直接依赖根 `storage.Storage` 或 Memory Manager。
+
+---
+
+## 5. Remote API
+
+Planner 没有独立路由或事件类型。Remote 客户端只观察现有 conversation contract：
+
+- REST 请求返回本轮最终响应或统一错误 envelope。
+- WebSocket 返回现有 `queued`、增量和恰好一个终态 frame。
+- Session SSE 只发送该 Session 已定义的通用事件，不广播 Plan/Step 快照。
+
+因此 Router、RBAC 和 Remote DTO 不需要新增 `plan` resource。

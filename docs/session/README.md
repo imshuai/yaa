@@ -1,307 +1,152 @@
 # Session 系统设计
 
-> Yaa! Yet Another Agent Runtime
-> 文档路径: `docs/session/` (原计划单文件 `docs/session.md`，拆分为多文件)
-> 依赖: `docs/architecture.md` §3.3 (Session), §3.11 (Remote API), §5 (并发模型)
+> 文档路径: `docs/session/`
+> 依赖: [Provider](../provider.md)、[Storage](../storage/README.md)、[Context](../context/README.md)
 
 ---
 
-## 1. 概述
+## 1. 职责与边界
 
-### 1.1 什么是 Session
+Session 是一次对话的持久状态单元，负责：
 
-Session 是 Yaa! 中**一次完整交互上下文**的管理单元。
+- 保存完整、有序的 Provider 消息历史；
+- 管理 `created | active | paused | closed` 生命周期；
+- 为同一 Session 的完整对话 turn 提供 FIFO 串行边界；
+- 按创建时解析出的 policy 同步持久化和恢复；
+- 发布提交后的状态、消息和删除事件。
 
-| 层级 | 抽象 | 类比 |
-|------|------|------|
-| Agent | 人格 + 能力集合 + Memory | 用户账号 |
-| **Session** | **一次交互上下文 + 消息历史 + 状态** | **一个对话窗口** |
-| Message | 一条交互记录 | 一条消息 |
+Session 不负责组装 System Prompt、裁剪上下文、调用 Provider、执行 Tool 或生成 Memory。Context Manager 每次从 Session 快照组装完整 `provider.ChatRequest`，且不得修改 Session 历史。
 
-一个 Session 封装了：
-- **消息历史** — 完整的多轮对话记录（user / assistant / tool）
-- **状态机** — Created / Active / Paused / Closed 四态生命周期
-- **隔离边界** — Session 之间状态完全隔离
-- **持久化单元** — 可保存到 Storage，重启后恢复
-- **元数据** — 自定义键值对，支持业务扩展
-
-### 1.2 设计理念
-
-Yaa! 的 Session 系统遵循以下设计原则：
-
-| 设计原则 | 说明 |
-|----------|------|
-| **隔离优先** | 每个 Session 拥有独立的消息历史和状态，互不干扰 |
-| **串行处理** | 同一 Session 内消息串行处理，避免并发导致状态混乱 |
-| **可恢复** | Session 可持久化，Runtime 重启后自动恢复 |
-| **多 Session 并发** | 一个 Agent 可同时管理多个 Session，各 Session 间并行 |
-| **Remote API 驱动** | Session 的创建、查询、恢复、关闭均通过 Remote API |
-| **生命周期明确** | 四态状态机（Created / Active / Paused / Closed），状态转换有清晰的前置条件和副作用 |
-| **元数据可扩展** | 通过 `Metadata` 字段支持业务自定义数据，无需修改核心结构 |
-
-### 1.3 核心特性
-
-```text
-┌─────────────────────────────────────────────────────────┐
-│                      Agent                               │
-│                                                           │
-│   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
-│   │  Session A   │  │  Session B   │  │  Session C   │    │
-│   │  (Active)    │  │  (Paused)    │  │  (Closed)    │    │
-│   │              │  │              │  │              │    │
-│   │  Messages    │  │  Messages    │  │  Messages    │    │
-│   │  [user, asst, │  │  [user, asst]│  │  [archived]  │    │
-│   │   tool, ...]  │  │              │  │              │    │
-│   │              │  │              │  │              │    │
-│   │  Metadata    │  │  Metadata    │  │  Metadata    │    │
-│   └──────┬───────┘  └──────┬───────┘  └──────────────┘    │
-│          │                 │                              │
-│          │     状态隔离     │                              │
-│          │◄─ ─ ─ ─ ─ ─ ─ ──┤                              │
-│                                                           │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-              Session Manager
-              (创建/查询/恢复/关闭/持久化)
-```
-
-**关键能力：**
-
-1. **多 Session 并发** — Agent 同时服务多个客户端，每个客户端拥有独立 Session
-2. **状态隔离** — Session A 的消息、元数据、状态变更不影响 Session B
-3. **持久化与恢复** — Session 数据写入 Storage，Runtime 重启后自动加载
-4. **Remote API 全覆盖** — 创建、列表、详情、关闭均有对应端点
-5. **流式对话** — WebSocket / SSE 支持实时流式输出，绑定到特定 Session
-
----
-
-## 2. 核心接口与类型定义
-
-### 2.1 Session
+## 2. 权威数据模型
 
 ```go
-// Session 管理一次完整的交互上下文。
+package session
+
+type State string
+
+const (
+    StateCreated State = "created"
+    StateActive  State = "active"
+    StatePaused  State = "paused"
+    StateClosed  State = "closed"
+)
+
 type Session struct {
-    ID        string         // 唯一标识符，格式: "sess_" + ULID
-    AgentID   string         // 所属 Agent ID
-    Messages  []Message      // 消息历史（有序）
-    State     SessionState   // 当前状态: Created / Active / Paused / Closed
-    CreatedAt time.Time      // 创建时间
-    UpdatedAt time.Time      // 最后更新时间
-    Metadata  map[string]any // 自定义元数据
+    ID             string
+    AgentID        string
+    State          State
+    CreatedAt      time.Time
+    UpdatedAt      time.Time
+    LastActivityAt time.Time
+    Messages       []SessionMessage
+    Metadata       map[string]any
+    Policy         config.SessionPolicy
+    SchemaVersion  int
+}
+
+type SessionMessage struct {
+    ID        string
+    TurnID    string
+    Payload   provider.Message
+    CreatedAt time.Time
+    Metadata  map[string]any
 }
 ```
 
-**字段说明：**
+约束：
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `ID` | `string` | 全局唯一，ULID 生成，前缀 `sess_` |
-| `AgentID` | `string` | 绑定的 Agent，创建时指定，不可变更 |
-| `Messages` | `[]Message` | 有序消息列表，append-only（详见 §2.3） |
-| `State` | `SessionState` | 生命周期状态枚举 |
-| `CreatedAt` | `time.Time` | 创建时自动设置 |
-| `UpdatedAt` | `time.Time` | 每次消息追加或状态变更时更新 |
-| `Metadata` | `map[string]any` | 业务自定义数据，如 `title`、`tags`、`source` |
+- Session ID 为 `ses_<ULID>`；Message ID 为 `msg_<ULID>`。
+- `TurnID` 由 `RunTurn` 控制并写入该 turn 的每条消息；调用方不能通过 metadata 伪造。
+- `AgentID`、`CreatedAt`、`Policy` 和 `SchemaVersion` 创建后不可变。
+- `Payload` 直接保存完整 `provider.Message`，不得复制到会丢失 `ReasoningContent`、`Refusal` 或 Tool 字段的本地 DTO。
+- `Payload` 中的 assistant `ToolCalls[].Function.Name` 与非空 tool `Name` 始终是 canonical Tool name；Provider-safe alias 只存在于 Agent 发送 Provider 的临时请求副本，绝不持久化。
+- `system` 消息不写入 Session；System Prompt、Skill Prompt 和 Memory 注入由 Context 负责。
+- `Policy` 是根配置、Agent override 和 Create override 的解析结果，定义见 [配置参考](config-ref.md)。
+- `SchemaVersion` 的 v1 值固定为 `1`。
+- Manager 返回深拷贝或只读快照，调用方不得持有并修改内部 slice、map 或消息对象。
 
-### 2.2 SessionState
+REST DTO 可以将 `SessionMessage.Payload` 的字段展开为扁平 JSON，但存储模型始终保留完整、canonical 的 `provider.Message`。Restore 只验证 canonical 名称的格式、消息序列和 Tool unit 完整性，不要求历史 Tool 当前仍注册、enabled 或属于当前 Agent allowlist。
 
-```go
-// SessionState 表示 Session 的生命周期状态。
-type SessionState int
-
-const (
-    // SessionStateCreated 刚创建，尚未接收首条消息。
-    SessionStateCreated SessionState = iota
-
-    // SessionStateActive 活跃状态，可接收消息、执行对话。
-    SessionStateActive
-
-    // SessionStatePaused 暂停状态，拒绝新消息，但可恢复。
-    SessionStatePaused
-
-    // SessionStateClosed 已关闭，不可恢复，消息已归档。
-    SessionStateClosed
-)
-
-func (s SessionState) String() string {
-    switch s {
-    case SessionStateCreated:
-        return "created"
-    case SessionStateActive:
-        return "active"
-    case SessionStatePaused:
-        return "paused"
-    case SessionStateClosed:
-        return "closed"
-    default:
-        return "unknown"
-    }
-}
-```
-
-**状态转换图：**
-
-```text
-            Create()
-               │
-               ▼
-         ┌──────────┐  首条消息
-         │ Created   │─────────────┐
-         └─────┬────┘              │
-               │                   ▼
-          Close()            ┌──────────┐
-               │             │ Active    │◄────────┐
-               ▼             └─────┬────┘          │
-         ┌──────────┐       Pause()  │             │ Resume()
-         │ Closed    │             │             │
-         └──────────┘             ▼             │
-                           ┌──────────┐          │
-                           │ Paused    │─────────┘
-                           └─────┬────┘
-                                 │
-                            Close()
-                                 │
-                                 ▼
-                           ┌──────────┐
-                           │ Closed    │  (终态，不可转换)
-                           └──────────┘
-```
-
-**状态转换规则：**
-
-| 从 | 到 | 触发方式 | 前置条件 |
-|----|----|---------|---------|
-| (创建) | Created | `Create()` | AgentID 有效 |
-| Created | Active | 首条 `AppendMessage()` | State == Created |
-| Created | Closed | `Close()` | — |
-| Active | Paused | `Pause()` | — |
-| Active | Closed | `Close()` | — |
-| Paused | Active | `Resume()` | — |
-| Paused | Closed | `Close()` | — |
-| Closed | * | — | **不允许任何转换** |
-
-### 2.3 Message
+## 3. Manager 契约
 
 ```go
-// Message 表示 Session 中的一条消息。
-type Message struct {
-    ID              string         // 消息唯一标识，格式: "msg_" + ULID
-    Role            MessageRole    // 消息角色: user / assistant / tool / system
-    Content         string         // 消息文本内容
-    ReasoningContent string        // 思维链内容（深度思考模式，见 provider.md §13）
-    ToolCalls       []ToolCall     // 助手消息中的 Tool 调用请求（仅 Role=assistant）
-    ToolCallID      string         // Tool 结果对应的调用 ID（仅 Role=tool）
-    Name            string         // Tool 名称（仅 Role=tool）
-    CreatedAt       time.Time      // 消息创建时间
-    Metadata        map[string]any // 消息级元数据
+type CreateRequest struct {
+    AgentID  string
+    Policy   *config.SessionOverride
+    Metadata map[string]any
 }
 
-// MessageRole 消息角色。
-type MessageRole string
-
-const (
-    RoleUser      MessageRole = "user"
-    RoleAssistant MessageRole = "assistant"
-    RoleTool      MessageRole = "tool"
-    RoleSystem    MessageRole = "system"
-)
-
-// ToolCall 表示 LLM 发起的 Tool 调用请求。
-type ToolCall struct {
-    ID       string         // 调用 ID，用于关联 Tool 结果
-    Name     string         // Tool 名称
-    Arguments map[string]any // 调用参数
+type AppendInput struct {
+    Message  provider.Message
+    Metadata map[string]any
 }
-```
 
-**消息类型与用途：**
-
-| Role | 说明 | 生成方 | 是否持久化 |
-|------|------|--------|-----------|
-| `user` | 用户输入 | Remote API Client | ✅ |
-| `assistant` | LLM 响应 | Provider 返回 | ✅ |
-| `assistant` (含 ToolCalls) | LLM 请求调用 Tool | Provider 返回 | ✅ |
-| `tool` | Tool 执行结果 | Tool Manager | ✅ |
-| `system` | 系统消息（Skill Prompt 注入等） | Skill Manager / Context Manager | ❌（不持久化到 Session） |
-
-**Message 与 Provider 类型的关系：**
-
-`pkg/types/message.go` 中定义的 `Message` 是公共类型，Session 内部使用同一类型。Provider 层负责将 `Message` 转换为各厂商的 API 格式。
-
-```go
-// pkg/types/message.go 中的公共 Message 类型
-// 与 session.Message 保持一致，避免类型转换开销
-type Message = session.Message
-```
-
-### 2.4 SessionManager
-
-```go
-// Manager 管理 Session 的创建、查询、生命周期和持久化。
-type Manager struct {
-    sessions  map[string]*Session      // sessionID → Session（内存索引）
-    agentIdx  map[string][]string       // agentID → []sessionID（Agent 索引）
-    store     SessionStore             // 持久化存储
-    logger    *slog.Logger
-    mu        sync.RWMutex              // 保护 sessions 和 agentIdx
+type ListQuery struct {
+    State    *State
+    Page     int
+    PageSize int
 }
+
+// Turn 只在 RunTurn callback 生命周期内有效，方法不再次进入 FIFO gate。
+type Turn struct { /* unexported fields */ }
+
+func (t *Turn) Snapshot() *Session
+func (t *Turn) AppendUser(content string, metadata map[string]any) (SessionMessage, error)
+func (t *Turn) Append(inputs []AppendInput) ([]SessionMessage, error)
+
+func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Session, error)
+func (m *Manager) Get(ctx context.Context, sessionID string) (*Session, error)
+func (m *Manager) List(ctx context.Context, agentID string, q ListQuery) ([]*Session, int, error)
+func (m *Manager) Pause(ctx context.Context, sessionID string) error
+func (m *Manager) Resume(ctx context.Context, sessionID string) error
+func (m *Manager) Close(ctx context.Context, sessionID string) error
+func (m *Manager) Delete(ctx context.Context, sessionID string) error
+func (m *Manager) DeleteMessage(ctx context.Context, sessionID, messageID string) ([]string, error)
+func (m *Manager) ClearMessages(ctx context.Context, sessionID string) (int, error)
+func (m *Manager) Restore(ctx context.Context, now time.Time) error
+func (m *Manager) RunTurn(
+    ctx context.Context,
+    sessionID, turnID string,
+    onQueued func(position int),
+    fn func(context.Context, *Turn) error,
+) error
+func (m *Manager) CancelTurn(sessionID, turnID string, cause error) error
+func (m *Manager) CancelAgentTurns(ctx context.Context, agentID string, cause error) error
+func (m *Manager) Shutdown(ctx context.Context) error
 ```
 
-**核心方法签名：**
+所有有等待或 I/O 的 Manager 方法接受 `context.Context`。同一 Session 的写操作与完整 Agent turn 进入同一个 FIFO gate；等待期间只由 context 取消，不定义 `ErrSessionBusy` 或锁超时。不同 Session 可以并行。`RunTurn` 为 caller context 派生并登记可取消的 `turnCtx`，callback 和所有下游只能使用它。`Turn` 不能保存到 callback 外，也不能在 callback 内再次调用同一 Session 的 Manager 写方法。`Shutdown` 是 Manager 总生命周期入口，不能与单个 Session 的 `Close` 混用。
 
-```go
-// Create 创建新 Session。
-func (m *Manager) Create(agentID string, opts ...SessionOption) (*Session, error)
+`turnID` 必须为 1..128 UTF-8 bytes 且不含控制字符。Manager 在接受排队时预留 `(sessionID, turnID)`；重复的 queued/running 或已提交 ID 返回 `ErrTurnIDConflict`。`AppendUser` 必须是 callback 的首个写操作，并将 ID 原子加入 snapshot 的永久判重集。queued/callback 在提交 user 前取消会释放预留，ID 可重用；user 一旦提交，即使后续失败、取消、Clear 或 DeleteMessage，该 ID 在 Session 物理 Delete 前都不可重用。`RunTurn` 在 turn context 被取消时返回 `context.Cause(turnCtx)`，从而保留 caller deadline、客户端取消、Agent Stop 和 Runtime shutdown 的不同原因。`CancelAgentTurns` 是管理型收拢操作，不受 Manager admission 状态限制：即使 Manager 已进入 `closing` 或 `closed` 仍可调用；它先取消该 Agent 的全部 handle，再等待它们从 registry 移除。调用时没有活动 handle 则幂等返回 `nil`；仍有 handle 而等待 context 结束时返回 `context.Cause(ctx)`。
 
-// Get 获取 Session 详情。
-func (m *Manager) Get(sessionID string) (*Session, error)
+## 4. 核心不变量
 
-// List 列出指定 Agent 的所有 Session。
-func (m *Manager) List(agentID string) ([]*Session, error)
+1. 创建时解析并校验 policy；热更新不改变已存在 Session。
+2. `persist=true` 时，先同步写入候选快照，再发布内存状态和事件；写入失败则操作失败且状态不变。
+3. `persist=false` 时完全不读写 Storage，进程重启后消失。
+4. 首个合法持久消息将 `created` 与消息追加原子提交为 `active`。
+5. Assistant Tool call 与其全部 Tool result 是不可拆分 unit；追加和删除必须整组处理。
+6. 达到 `max_messages` 或 `max_message_bytes` 时拒绝整个追加批次；Session 不裁剪历史。
+7. `Close` 对已关闭 Session 幂等，不重复持久化或发布事件；其余 Closed 写操作拒绝。
+8. 事件仅在状态提交成功后发布一次。恢复已有快照不重放历史事件。
+9. `persist=true` 的完整 JSON snapshot 不得超过 16 MiB；该限制独立于单条消息 policy。
+10. 每个 turn 的消息使用同一个 `TurnID`；已提交 user 的 ID 持久判重，恢复后语义不变。
 
-// ListByState 列出指定状态的 Session。
-func (m *Manager) ListByState(agentID string, state SessionState) ([]*Session, error)
-
-// Pause 暂停 Session。
-func (m *Manager) Pause(sessionID string) error
-
-// Resume 恢复暂停的 Session。
-func (m *Manager) Resume(sessionID string) error
-
-// Close 关闭 Session。
-func (m *Manager) Close(sessionID string) error
-
-// AppendMessage 向 Session 追加消息。
-func (m *Manager) AppendMessage(sessionID string, msg Message) error
-
-// GetMessages 获取 Session 的消息历史。
-func (m *Manager) GetMessages(sessionID string, opts ...MessageQueryOption) ([]Message, error)
-
-// UpdateMetadata 更新 Session 元数据。
-func (m *Manager) UpdateMetadata(sessionID string, metadata map[string]any) error
-
-// Delete 删除 Session（从存储中彻底移除）。
-func (m *Manager) Delete(sessionID string) error
-
-// RestoreAll 从存储恢复所有 Session（Runtime 启动时调用）。
-func (m *Manager) RestoreAll() error
-```
-
----
-
-## 文档索引
+## 5. 文档索引
 
 | 文件 | 内容 |
 |------|------|
-| [lifecycle.md](lifecycle.md) | Session 生命周期管理 — 创建、激活、暂停、恢复、关闭 |
-| [persistence.md](persistence.md) | Session 持久化与恢复 — 存储格式、序列化、启动恢复 |
-| [messaging.md](messaging.md) | 消息管理 — 消息类型、历史查询、流式输出 |
-| [concurrency.md](concurrency.md) | 并发模型 — 串行处理、消息队列、锁策略 |
-| [integration.md](integration.md) | 与 Agent / Context / Memory 的集成 |
-| [config-ref.md](config-ref.md) | 配置参考 — 全局配置、Agent 级别覆盖 |
-| [errors.md](errors.md) | 错误处理 — 错误分类、传递策略 |
-| [observability.md](observability.md) | 可观测性 — 日志、指标、Remote API 事件 |
-| [decisions.md](decisions.md) | 设计决策（SSD-001 ~ SSD-NNN）+ 模块关系 |
-| [checklist.md](checklist.md) | 实现检查清单 |
+| [config-ref.md](config-ref.md) | 根配置、override、默认值和校验 |
+| [lifecycle.md](lifecycle.md) | 状态机、TTL、最大生命周期和恢复 |
+| [messaging.md](messaging.md) | 消息校验、Tool unit、查询和删除 |
+| [persistence.md](persistence.md) | Snapshot 格式与同步持久化 |
+| [concurrency.md](concurrency.md) | FIFO turn gate、锁顺序和关闭 |
+| [integration.md](integration.md) | Agent、Context、Tool、Memory 集成 |
+| [errors.md](errors.md) | 错误集合和 Remote API 映射 |
+| [observability.md](observability.md) | 日志、指标和事件 |
+| [decisions.md](decisions.md) | 已确定的设计决策 |
+| [checklist.md](checklist.md) | 可执行实现清单 |
+
+---
+
+*最后更新: 2026-07-23*

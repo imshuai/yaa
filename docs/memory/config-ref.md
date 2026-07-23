@@ -1,390 +1,201 @@
 # Memory 配置参考
 
-> 文档路径: `docs/memory/config-ref.md`
-> 上级: `docs/memory/README.md` §9
-> 依赖: `docs/architecture.md` §3.12 (Config), `docs/memory/storage.md`
+> 上级: [Memory 系统设计](README.md)
+> 根配置: [完整配置参考](../config/reference.md)
 
 ---
 
-## 1. 配置层级概览
+## 1. 合并层级
 
-Yaa! Memory 系统采用**三级配置合并**机制：
+只有根 `memory` 和 Agent `memory` 两层。合并顺序为根配置 → `agents[].memory` pointer override；没有 Session 级 Memory 配置。Storage 和 embedding 连接是 Runtime 共享基础设施，Agent 只能覆盖策略字段。
 
-| 层级 | 作用域 | 覆盖关系 |
-|------|--------|----------|
-| **全局配置** | 所有 Agent 共享 | 基线默认值 |
-| **Agent 级别** | 单个 Agent | 覆盖全局配置 |
-| **Session 级别** | 单次会话 | 覆盖 Agent 级别（运行时注入，不持久化） |
+## 2. 根类型与默认值
 
-合并优先级：全局 → Agent → Session（后者覆盖前者同名键）。
+```go
+type MemoryConfig struct {
+    Enabled        bool                  `yaml:"enabled" json:"enabled"`
+    MaxItems       int                   `yaml:"max_items" json:"max_items"`
+    DefaultTTL     time.Duration         `yaml:"default_ttl" json:"default_ttl"`
+    ExpireInterval time.Duration         `yaml:"expire_interval" json:"expire_interval"`
+    ExpireBatchSize int                  `yaml:"expire_batch_size" json:"expire_batch_size"`
+    EvictionPolicy string                `yaml:"eviction_policy" json:"eviction_policy"` // fifo | ttl
+    Storage        MemoryStorageConfig   `yaml:"storage" json:"storage"`
+    Vector         MemoryVectorConfig    `yaml:"vector" json:"vector"`
+    Embedding      MemoryEmbeddingConfig `yaml:"embedding" json:"embedding"`
+}
 
----
+type MemoryStorageConfig struct {
+    Type string `yaml:"type" json:"type"` // sqlite | memory
+    Path string `yaml:"path" json:"path"`
+}
 
-## 2. 全局 Memory 配置
+type MemoryVectorConfig struct {
+    Enabled             bool    `yaml:"enabled" json:"enabled"`
+    SimilarityThreshold float64 `yaml:"similarity_threshold" json:"similarity_threshold"`
+    TopK                int     `yaml:"top_k" json:"top_k"`
+    FallbackToKeyword   bool    `yaml:"fallback_to_keyword" json:"fallback_to_keyword"`
+}
 
-全局配置定义在 `yaa.yaml` 的顶层 `memory` 节点下。
+type MemoryEmbeddingConfig struct {
+    Provider  string        `yaml:"provider" json:"provider"`
+    Model     string        `yaml:"model" json:"model"`
+    APIKey    string        `yaml:"api_key" json:"api_key"`
+    BaseURL   string        `yaml:"base_url" json:"base_url"`
+    Dimension int           `yaml:"dimension" json:"dimension"`
+    Timeout   time.Duration `yaml:"timeout" json:"timeout"`
+}
+```
 
-### 2.1 配置项一览
+| 字段 | 默认值 | 规则 |
+|------|--------|------|
+| `enabled` | `true` | false 时该 Runtime 不创建 Memory 操作；Agent 不能在根 false 上重新启用 |
+| `max_items` | `10000` | 每 Agent 未过期 item 上限，`>0` |
+| `default_ttl` | `0` | 0 表示永不过期，否则 `>=1m` |
+| `expire_interval` | `5m` | 全局 cleanup worker 周期，`>=1s` |
+| `expire_batch_size` | `500` | 每批 1..10000 |
+| `eviction_policy` | `fifo` | 只能 `fifo` 或 `ttl` |
+| `storage.type` | `sqlite` | 只能 `sqlite` 或 `memory` |
+| `storage.path` | `./data/yaa-memory.db` | sqlite 必填；memory 忽略 |
+| `vector.enabled` | `false` | 启用纯 Go exact cosine index |
+| `vector.similarity_threshold` | `0.7` | `(0,1]`，只用于向量结果 |
+| `vector.top_k` | `10` | `1..100`；Search Limit=0 使用此值 |
+| `vector.fallback_to_keyword` | `true` | 向量失败时是否走关键词路径 |
+| `embedding.provider` | `openai-compatible` | vector 启用时必填 |
+| `embedding.model` | — | vector 启用时必填 |
+| `embedding.api_key` | — | 按 provider 要求，可使用环境变量引用 |
+| `embedding.base_url` | — | vector 启用时必填，例如 `https://api.openai.com/v1` |
+| `embedding.dimension` | — | vector 启用时正数，且响应长度必须相同 |
+| `embedding.timeout` | `30s` | `>0` |
 
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `enabled` | bool | `true` | 是否启用 Memory 系统 |
-| `backend` | string | `"sqlite"` | 存储后端类型：`sqlite` / `vector` / `external` |
-| `eviction_policy` | string | `"lru"` | 淘汰策略：`lru` / `fifo` / `ttl` |
-| `max_items` | int | `10000` | 每个 Agent 最大记忆条数 |
-| `default_ttl` | duration | `0`（永不过期） | 默认记忆过期时间 |
-| `expire_interval` | duration | `5m` | 过期清理任务执行间隔 |
-| `expire_batch_size` | int | `500` | 每次过期清理批量删除上限 |
+未知字段必须硬失败。v1 不接受另一种 Memory 内容后端、全文索引扩展或外部向量服务配置；未来新增能力必须增加版本化字段和对应接口。
 
-### 2.2 YAML 示例
+## 3. YAML 示例
 
 ```yaml
-# yaa.yaml — 全局 Memory 配置
 memory:
   enabled: true
-  backend: sqlite
-  eviction_policy: lru
   max_items: 10000
   default_ttl: 0
   expire_interval: 5m
   expire_batch_size: 500
-
-  # 存储后端配置（见 §4）
+  eviction_policy: fifo
   storage:
     type: sqlite
-    path: ./data/yaa_memory.db
-
-  # 向量搜索配置（见 §5）
+    path: ./data/yaa-memory.db
   vector:
     enabled: false
-
-  # Embedding Provider 配置
-  embedding:
-    provider: openai
-    model: text-embedding-3-small
-    api_key: ${OPENAI_API_KEY}
-    base_url: https://api.openai.com/v1
-    dimension: 1536
-    cache_enabled: true
-```
-
-### 2.3 Go 结构体定义
-
-```go
-// MemoryConfig 是 Memory 系统的全局配置。
-type MemoryConfig struct {
-    Enabled         bool            `yaml:"enabled"`
-    Backend         string          `yaml:"backend"`
-    EvictionPolicy  string          `yaml:"eviction_policy"`
-    MaxItems        int             `yaml:"max_items"`
-    DefaultTTL      time.Duration   `yaml:"default_ttl"`
-    ExpireInterval  time.Duration   `yaml:"expire_interval"`
-    ExpireBatchSize int             `yaml:"expire_batch_size"`
-    Storage         StorageConfig   `yaml:"storage"`
-    Vector          VectorConfig    `yaml:"vector"`
-    Embedding       EmbeddingConfig `yaml:"embedding"`
-}
-```
-
----
-
-## 3. Agent 级别覆盖
-
-每个 Agent 可在其配置中定义 `memory` 节点，覆盖全局配置。
-
-### 3.1 可覆盖字段
-
-| 字段 | 说明 | 覆盖行为 |
-|------|------|----------|
-| `enabled` | 是否为该 Agent 启用 Memory | 全局 `true` → Agent 可设 `false` 禁用 |
-| `max_items` | 该 Agent 的最大记忆条数 | 覆盖全局值 |
-| `default_ttl` | 该 Agent 的默认过期时间 | 覆盖全局值 |
-| `eviction_policy` | 该 Agent 的淘汰策略 | 覆盖全局值 |
-| `vector.enabled` | 是否为该 Agent 启用向量搜索 | 覆盖全局值 |
-| `embedding` | 该 Agent 专属 Embedding Provider | 覆盖全局值 |
-
-> **注意**：`backend` 和 `storage` 字段仅在全局级别配置，Agent 级别不支持覆盖。所有 Agent 共享同一存储后端实例，通过 `agent_id` 字段隔离数据。
-
-### 3.2 YAML 示例
-
-```yaml
-agents:
-  - id: "researcher"
-    name: "Research Agent"
-    provider: "openai"
-    model: "gpt-4o"
-    memory:
-      enabled: true
-      max_items: 50000          # 覆盖全局 10000
-      default_ttl: 72h          # 覆盖全局 0（永不过期）
-      eviction_policy: ttl      # 覆盖全局 lru
-      vector:
-        enabled: true           # 覆盖全局 false
-        similarity_threshold: 0.75
-
-  - id: "casual"
-    name: "Casual Chat Agent"
-    provider: "ollama"
-    model: "llama3"
-    memory:
-      enabled: false             # 该 Agent 不需要记忆
-```
-
-### 3.3 Go 结构体定义
-
-```go
-// AgentMemoryConfig 是 Agent 级别的 Memory 配置覆盖。
-// 所有字段为指针类型，nil 表示不覆盖（继承全局值）。
-type AgentMemoryConfig struct {
-    Enabled        *bool          `yaml:"enabled,omitempty"`
-    MaxItems       *int           `yaml:"max_items,omitempty"`
-    DefaultTTL     *time.Duration `yaml:"default_ttl,omitempty"`
-    EvictionPolicy *string        `yaml:"eviction_policy,omitempty"`
-    Vector         *VectorConfig  `yaml:"vector,omitempty"`
-    Embedding      *EmbeddingConfig `yaml:"embedding,omitempty"`
-}
-
-// MergeWithGlobal 将 Agent 级别配置与全局配置合并。
-func (a *AgentMemoryConfig) MergeWithGlobal(global MemoryConfig) MemoryConfig {
-    merged := global
-    if a.Enabled != nil {
-        merged.Enabled = *a.Enabled
-    }
-    if a.MaxItems != nil {
-        merged.MaxItems = *a.MaxItems
-    }
-    if a.DefaultTTL != nil {
-        merged.DefaultTTL = *a.DefaultTTL
-    }
-    if a.EvictionPolicy != nil {
-        merged.EvictionPolicy = *a.EvictionPolicy
-    }
-    if a.Vector != nil {
-        merged.Vector = mergeVectorConfig(global.Vector, *a.Vector)
-    }
-    if a.Embedding != nil {
-        merged.Embedding = *a.Embedding
-    }
-    return merged
-}
-```
-
----
-
-## 4. 存储后端配置
-
-### 4.1 SQLite 后端（默认）
-
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `type` | string | `"sqlite"` | 固定值 |
-| `path` | string | `"./data/yaa_memory.db"` | 数据库文件路径 |
-| `journal_mode` | string | `"WAL"` | SQLite journal 模式 |
-| `busy_timeout` | duration | `5s` | SQLite busy 超时 |
-| `migrate` | bool | `true` | 启动时自动执行 schema 迁移 |
-
-```yaml
-memory:
-  storage:
-    type: sqlite
-    path: ./data/yaa_memory.db
-    journal_mode: WAL
-    busy_timeout: 5s
-    migrate: true
-```
-
-### 4.2 向量数据库后端
-
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `type` | string | — | `"vector"` |
-| `engine` | string | `"sqlite-vec"` | 向量引擎：`sqlite-vec` / `chroma` / `qdrant` |
-| `path` | string | `"./data/yaa_vectors.db"` | 本地引擎路径（sqlite-vec） |
-| `endpoint` | string | — | 远程引擎地址（chroma / qdrant） |
-| `api_key` | string | — | 远程引擎认证密钥 |
-| `collection` | string | `"yaa_memories"` | 向量集合名称 |
-
-```yaml
-memory:
-  backend: vector
-  storage:
-    type: vector
-    engine: qdrant
-    endpoint: http://localhost:6333
-    api_key: ${QDRANT_API_KEY}
-    collection: yaa_memories
-```
-
-### 4.3 外部服务后端
-
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `type` | string | — | `"external"` |
-| `endpoint` | string | — | 外部 Memory 服务 URL |
-| `api_key` | string | — | 认证密钥 |
-| `timeout` | duration | `10s` | 请求超时 |
-
-```yaml
-memory:
-  backend: external
-  storage:
-    type: external
-    endpoint: https://memory.example.com/api/v1
-    api_key: ${MEMORY_SERVICE_KEY}
-    timeout: 10s
-```
-
----
-
-## 5. 向量搜索配置
-
-### 5.1 配置项
-
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `enabled` | bool | `false` | 是否启用向量语义搜索 |
-| `similarity_threshold` | float64 | `0.7` | 相似度阈值，低于此值的结果被过滤 |
-| `top_k` | int | `10` | 向量检索默认返回数量 |
-| `fallback_to_keyword` | bool | `true` | 向量搜索失败时回退到关键词搜索 |
-| `reindex_on_update` | bool | `false` | 记忆更新时自动重新计算向量 |
-
-### 5.2 YAML 示例
-
-```yaml
-memory:
-  vector:
-    enabled: true
-    similarity_threshold: 0.75
+    similarity_threshold: 0.7
     top_k: 10
     fallback_to_keyword: true
-    reindex_on_update: false
-```
-
-### 5.3 Embedding Provider 配置
-
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `provider` | string | `"openai"` | Embedding 提供者：`openai` / `ollama` / `custom` |
-| `model` | string | `"text-embedding-3-small"` | 模型名称 |
-| `api_key` | string | — | API 密钥（支持 `${VAR}` 环境变量引用） |
-| `base_url` | string | — | API 基础 URL |
-| `dimension` | int | `1536` | 向量维度 |
-| `cache_enabled` | bool | `true` | 是否启用 Embedding 缓存 |
-| `batch_size` | int | `100` | 批量嵌入请求大小 |
-
-```yaml
-memory:
   embedding:
-    provider: ollama
-    model: nomic-embed-text
-    base_url: http://localhost:11434
-    dimension: 768
-    cache_enabled: true
-    batch_size: 50
-```
-
-### 5.4 Go 结构体定义
-
-```go
-// VectorConfig 是向量搜索配置。
-type VectorConfig struct {
-    Enabled             bool    `yaml:"enabled"`
-    SimilarityThreshold float64 `yaml:"similarity_threshold"`
-    TopK                int     `yaml:"top_k"`
-    FallbackToKeyword   bool    `yaml:"fallback_to_keyword"`
-    ReindexOnUpdate     bool    `yaml:"reindex_on_update"`
-}
-
-// EmbeddingConfig 是 Embedding Provider 配置。
-type EmbeddingConfig struct {
-    Provider     string `yaml:"provider"`
-    Model        string `yaml:"model"`
-    APIKey       string `yaml:"api_key"`
-    BaseURL      string `yaml:"base_url"`
-    Dimension    int    `yaml:"dimension"`
-    CacheEnabled bool   `yaml:"cache_enabled"`
-    BatchSize    int    `yaml:"batch_size"`
-}
-
-// StorageConfig 是存储后端配置。
-type StorageConfig struct {
-    Type        string        `yaml:"type"`
-    Path        string        `yaml:"path,omitempty"`
-    JournalMode string        `yaml:"journal_mode,omitempty"`
-    BusyTimeout time.Duration `yaml:"busy_timeout,omitempty"`
-    Migrate     bool          `yaml:"migrate,omitempty"`
-    Engine      string        `yaml:"engine,omitempty"`
-    Endpoint    string        `yaml:"endpoint,omitempty"`
-    APIKey      string        `yaml:"api_key,omitempty"`
-    Collection  string        `yaml:"collection,omitempty"`
-    Timeout     time.Duration `yaml:"timeout,omitempty"`
-}
-```
-
----
-
-## 6. 配置校验规则
-
-| 规则 | 说明 |
-|------|------|
-| `backend` 必须是 `sqlite` / `vector` / `external` 之一 | 否则启动报错 |
-| `vector.enabled = true` 时 `embedding.provider` 必须配置 | 否则启动报错 |
-| `max_items` 必须 > 0 | 否则使用默认值 `10000` |
-| `similarity_threshold` 范围 `[0, 1]` | 超出范围使用默认值 `0.7` |
-| `dimension` 必须与 Embedding 模型匹配 | 运行时检测不匹配则报错 |
-| `default_ttl = 0` 表示永不过期 | 非零值必须 > 0 |
-| Agent 级别 `backend` / `storage` 不可覆盖 | 静默忽略，日志 warn |
-
----
-
-## 7. 完整配置示例
-
-```yaml
-# yaa.yaml — Memory 系统完整配置示例
-memory:
-  enabled: true
-  backend: vector
-  eviction_policy: lru
-  max_items: 20000
-  default_ttl: 168h          # 7 天
-  expire_interval: 10m
-  expire_batch_size: 1000
-
-  storage:
-    type: vector
-    engine: sqlite-vec
-    path: ./data/yaa_vectors.db
-    collection: yaa_memories
-
-  vector:
-    enabled: true
-    similarity_threshold: 0.78
-    top_k: 15
-    fallback_to_keyword: true
-    reindex_on_update: true
-
-  embedding:
-    provider: openai
+    provider: openai-compatible
     model: text-embedding-3-small
     api_key: ${OPENAI_API_KEY}
     base_url: https://api.openai.com/v1
     dimension: 1536
-    cache_enabled: true
-    batch_size: 100
-
-agents:
-  - id: "default"
-    name: "Default Agent"
-    provider: "openai"
-    model: "gpt-4o"
-    memory:
-      enabled: true
-      max_items: 50000
-      vector:
-        enabled: true
-        similarity_threshold: 0.80
+    timeout: 30s
 ```
+
+## 4. Agent `MemoryOverride`
+
+```go
+type MemoryOverride struct {
+    Enabled        *bool                     `yaml:"enabled" json:"enabled"`
+    MaxItems       *int                      `yaml:"max_items" json:"max_items"`
+    DefaultTTL     *time.Duration            `yaml:"default_ttl" json:"default_ttl"`
+    EvictionPolicy *string                   `yaml:"eviction_policy" json:"eviction_policy"`
+    Vector         *MemoryVectorOverride     `yaml:"vector" json:"vector"`
+}
+
+type MemoryVectorOverride struct {
+    Enabled             *bool    `yaml:"enabled" json:"enabled"`
+    SimilarityThreshold *float64 `yaml:"similarity_threshold" json:"similarity_threshold"`
+    TopK                *int     `yaml:"top_k" json:"top_k"`
+    FallbackToKeyword   *bool    `yaml:"fallback_to_keyword" json:"fallback_to_keyword"`
+}
+```
+
+`ResolveMemoryPolicy` 从调用方捕获的 Config snapshot 解析 Agent policy；Memory Manager 不保存另一份可热更新 map。cleanup、storage 和 embedding 不进入该结构：
+
+```go
+type MemoryPolicy struct {
+    Enabled        bool
+    MaxItems       int
+    DefaultTTL     time.Duration
+    EvictionPolicy string
+    Vector         MemoryVectorConfig
+}
+
+func ResolveMemoryPolicy(root MemoryConfig, override *MemoryOverride) MemoryPolicy {
+    out := MemoryPolicy{
+        Enabled:        root.Enabled,
+        MaxItems:       root.MaxItems,
+        DefaultTTL:     root.DefaultTTL,
+        EvictionPolicy: root.EvictionPolicy,
+        Vector:         root.Vector,
+    }
+    if override == nil {
+        return out
+    }
+    if override.Enabled != nil { out.Enabled = *override.Enabled }
+    if override.MaxItems != nil { out.MaxItems = *override.MaxItems }
+    if override.DefaultTTL != nil { out.DefaultTTL = *override.DefaultTTL }
+    if override.EvictionPolicy != nil { out.EvictionPolicy = *override.EvictionPolicy }
+    if v := override.Vector; v != nil {
+        if v.Enabled != nil { out.Vector.Enabled = *v.Enabled }
+        if v.SimilarityThreshold != nil { out.Vector.SimilarityThreshold = *v.SimilarityThreshold }
+        if v.TopK != nil { out.Vector.TopK = *v.TopK }
+        if v.FallbackToKeyword != nil { out.Vector.FallbackToKeyword = *v.FallbackToKeyword }
+    }
+    return out
+}
+```
+
+所有 override scalar 都是 pointer；显式 `false`、`0` 能覆盖根值。Agent 不得覆盖 `storage` 或 `embedding`，也不能覆盖 `expire_interval`/`expire_batch_size`。`vector.*` 允许声明但改变向量基础设施，需重启；其余 policy 字段在下一次 Agent turn 或 Remote request 捕获 snapshot 时生效。
+
+```yaml
+agents:
+  - id: researcher
+    name: Researcher
+    provider: openai
+    model: gpt-4o
+    memory:
+      max_items: 20000
+      default_ttl: 168h
+      eviction_policy: ttl
+  - id: ephemeral
+    name: Ephemeral
+    provider: ollama
+    model: llama3
+    memory:
+      enabled: false
+```
+
+`ResolveMemoryPolicy(root, override)` 只复制非 nil 字段并返回 Effective Policy；如果 root `enabled=false` 而 override `enabled=true`，校验失败。
+
+## 5. 校验
+
+加载和 reload 时按以下顺序校验：
+
+1. 先注入默认值，再校验所有根字段；未知字段在 strict decoder 阶段拒绝。
+2. `max_items`、batch、interval、TTL 和 eviction enum 满足上表范围。
+3. storage type 为 `sqlite|memory`；sqlite path 非空。
+4. threshold/top_k 满足范围；vector 启用时 embedding provider/model/base_url/dimension/timeout 完整且 dimension>0。
+5. 对每个 Agent 合并 override 后重新校验 policy；Agent 不能越过 root disabled 或修改共享连接。
+
+`enabled=false` 仍校验结构和值，避免下一次启用时才发现坏配置。配置 reload 不重新解释已有 item 的绝对 ExpiresAt。
+
+## 6. 热更新
+
+| 路径 | 生效时机 |
+|------|----------|
+| `memory.max_items`, `default_ttl`, `eviction_policy` | 下一次 Agent turn/Remote request；已有 ExpiresAt 不变 |
+| `memory.expire_interval`, `expire_batch_size` | 下一次 cleanup worker tick |
+| `agents[].memory.max_items`, `default_ttl`, `eviction_policy` | 下一次该 Agent turn/Remote request |
+| `enabled`, `storage.*`, `vector.*`, `embedding.*`（根或 Agent） | 需要重启 |
+
+热字段与重启字段混在同一 reload 批次时整批拒绝。Agent turn 内所有 Memory 调用显式传同一个旧 policy；Remote 每请求、cleanup 每 tick各自捕获一次，不能在操作中途切换。
 
 ---
 
-*最后更新: 2025-07-17*
+*最后更新: 2026-07-22*

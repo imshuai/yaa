@@ -1,177 +1,79 @@
 # Plugin 设计决策
 
 > 文档路径: `docs/plugin/decisions.md`
-> 上级: `docs/plugin/README.md` §9
+> 上级: [README.md](README.md)
 
 ---
 
-## 9. 设计决策
+## PG-001: 只采用进程外 Plugin
 
-### PG-001: 优先采用进程外插件，不使用 Go plugin 原生机制
+**决策：** 第三方 Plugin 是独立可执行进程；Runtime 不使用 Go `plugin` 包、不加载 `.so`/DLL、不接收第三方 Go object。
 
-**决策：** Yaa! 插件系统以进程外（Out-of-Process）插件为主，不依赖 Go `plugin` 标准库做动态加载。
+**理由：** 覆盖 Windows 7、隔离崩溃、避免 Go ABI/依赖版本耦合，并允许跨语言 SDK。官方高频能力仍可静态编译成内置 Tool/Provider，但不属于 Plugin 系统。
 
-**理由：**
-- Go `plugin` 仅支持 Linux/macOS，不支持 Windows（与 Windows First 原则冲突）
-- Go `plugin` 要求编译器版本、依赖版本、CGO 设置完全一致，实际部署极难满足
-- 进程外插件通过 gRPC/HTTP 通信，语言无关，生态更广
-- 进程崩溃可隔离，不影响 Runtime 主进程
+## PG-002: 启动期加载，不热插拔
 
-**影响：** 需定义稳定的 Plugin RPC 协议；需要进程生命周期管理（启动、健康检查、重启）。
+**决策：** Runtime 启动时完成发现、依赖排序、进程启动和 Proxy 注册。运行期间没有 install/uninstall/enable/disable/reload；配置或二进制变更在下次 Runtime 启动生效。
 
----
+**理由：** 避免在途请求、依赖图和版本切换的状态复杂度。运行中 unexpected process exit 只做同版本有限次重启，不改变 Manifest/配置。
 
-### PG-002: 保留 Go 编译式 Tool 作为内置扩展
+## PG-003: 本机进程级隔离
 
-**决策：** Go 编译式 Tool（静态编译进 Runtime）仍作为内置扩展手段，但不通过 `plugin` 包动态加载，而是通过编译标签或 init 注册。
+**决策：** 每个 Plugin 是独立 OS 进程。Unix 使用 Unix Socket；Windows 7 使用带启动 nonce 的 loopback TCP。MVP 不接受远程 Plugin endpoint。
 
-**理由：**
-- 核心插件（如内置 Provider 适配器）需要高性能和直接内存访问
-- 编译式扩展零启动开销
-- 适合官方维护的高频组件
+**理由：** 本机进程边界清晰，且配置/Loader 能完整描述。远程模式需要额外 TLS、身份认证和威胁模型，进入需求后另行设计。
 
-**影响：** 编译式扩展需要重新编译 Runtime，不适合第三方动态安装。
+## PG-004: 单向 gRPC 拨号
 
----
+**决策：** Runtime gRPC Client 拨号 Plugin gRPC Server。当前文档阶段的唯一权威 IDL 是 [`interface.md`](interface.md) 的完整 proto 代码块；实现首先将其落到目标路径 `api/plugin/v1/plugin.proto`，此后该文件成为唯一 wire contract。Plugin 不反向连接 Runtime，也不访问 internal package。
 
-### PG-003: 插件加载时机为 Runtime 启动阶段
+**影响：** 所有能力通过序列化 RPC 和 Runtime 侧 Proxy 暴露；取消、deadline 和 request ID 由 gRPC 传播。
 
-**决策：** 进程外插件在 Runtime 启动时统一加载并建立连接，运行期间保持常驻，不支持运行中热插拔。
+## PG-005: RPC major + 业务 SemVer
 
-**理由：**
-- 热插拔增加状态管理复杂度（连接断开、请求在途、版本切换）
-- 插件通常提供长期服务（Provider 适配、Tool 后端等），无需频繁切换
-- 启动时加载可提前发现配置错误和兼容性问题
+**决策：** `protocol_version` 是 RPC major 字符串，v1 只接受精确 `"1"`。同一 major 只新增可忽略的 Protobuf 字段；新增 capability type 或其他破坏性 wire 变更升级 major。Plugin `version`、`requires_runtime` 和 dependency range 使用 SemVer。
 
-**影响：** 插件更新需要重启 Runtime；需要启动阶段超时和错误汇总机制。
+**理由：** 不引入未定义的 minor/range 协商，Handshake 行为可直接实现。
 
----
+## PG-006: 主配置是唯一 Runtime 配置源
 
-### PG-004: 插件隔离策略采用进程级隔离
+**决策：** Plugin Runtime 配置只来自 `yaa.yaml plugins.entries[].config`，由 Config Loader 展开环境变量，Runtime 按 Manifest `config_schema` 校验后传给 Init。Plugin 自行应用未配置字段的默认值。
 
-**决策：** 每个进程外插件运行在独立 OS 进程中，通过 gRPC/Unix Socket 通信，不共享内存空间。
+**影响：** JSON Schema `default` 只是 annotation；Runtime 不猜测或注入 Plugin 默认值。所有 `plugins.*` 变更需要重启。
 
-**理由：**
-- 进程级隔离是最强隔离等级（相比线程级、协程级）
-- 插件 Panic 不会影响 Runtime
-- 可对插件进程设置资源限制（cgroup、CPU/内存上限）
-- 安全边界清晰，适合不可信第三方插件
+## PG-007: Manifest typed capabilities
 
-**影响：** 跨进程通信有序列化开销；需要进程监控和自动重启机制。
+**决策：** `plugin.yaml` 声明身份、业务/RPC 版本、entry、依赖、config schema 和 typed `provides[]`。v1 capability 只有 `tool`；Skill 由 SKILL.md 加载，Hook/Middleware、Provider 和 Memory 不属于 v1 Plugin RPC。
 
----
+**影响：** Manifest `provides[]` 必须与 Ready 响应的 type/name/description/schema 集合精确一致，之后 Runtime 才注册 Proxy。
 
-### PG-005: 插件版本兼容采用 SemVer + 协议协商
+## PG-008: 失败隔离与重启
 
-**决策：** 插件使用语义化版本号，Runtime 与插件在握手阶段进行协议版本协商，不兼容则拒绝加载。
+**决策：** 单个 Plugin 初始启动失败只尝试一次并进入 non-fatal StartupReport。只有已 Ready 进程运行中退出时 Proxy 才立即返回 unavailable，并按配置有限重启；重连成功后原子替换 stable Proxy client handle。Health 超时只标记 degraded，不触发 Kill。
 
-**理由：**
-- SemVer 是行业标准，支持自动版本范围检查
-- 协议协商避免运行时因接口不匹配导致 Panic
-- 明确拒绝比静默降级更安全
+**影响：** 重启窗口中的请求会失败且不自动 replay；依赖 Plugin 不级联重启。
 
-**影响：** 插件 SDK 需内置协议版本信息；Runtime 需维护兼容版本范围表。
-
----
-
-### PG-006: 插件配置统一通过 Runtime config.json 管理
-
-**决策：** 插件配置由 Runtime 的 `config.json` 统一管理，插件不维护独立配置文件。
-
-**理由：**
-- 统一配置入口降低运维复杂度
-- Runtime 可在加载前校验配置完整性
-- 支持配置热更新（Runtime 侧修改后通知插件重载）
-
-**影响：** 配置 schema 需在插件清单中声明；Runtime 需实现配置下发和变更通知。
-
----
-
-### PG-007: 插件能力声明采用 Manifest 清单文件
-
-**决策：** 每个插件提供 `plugin.yaml` Manifest 文件，声明名称、版本、协议版本、提供的能力（Provider/Tool/Hook 等）、配置 schema。
-
-**理由：**
-- Runtime 在不启动插件进程的情况下即可了解插件能力
-- 支持依赖解析和冲突检测
-- 与 Skill 的 SKILL.md frontmatter 风格一致
-
-**影响：** Runtime 需实现 Manifest 解析和校验逻辑。
-
----
-
-### PG-008: 插件通信协议默认 gRPC over Unix Socket
-
-**决策：** 进程外插件默认使用 gRPC over Unix Socket 通信，支持可选 TCP 传输用于远程插件。
-
-**理由：**
-- Unix Socket 零网络开销，适合本机进程间通信
-- gRPC 提供强类型 Protobuf 接口，跨语言友好
-- TCP 选项支持远程插件部署（如 GPU 机器上的专用 Provider 插件）
-
-**影响：** 需维护 Protobuf IDL 定义和生成多语言 Stub。
-
----
-
-## 10. 模块关系
+## 模块关系
 
 ```text
-┌──────────────────────────────────────────────────────────────┐
-│                         Yaa! Runtime                          │
-│                                                                │
-│  ┌──────────────┐    ┌──────────────────┐    ┌────────────┐ │
-│  │ Plugin        │───►│ Plugin Manager    │───►│ Config     │ │
-│  │ Manager       │    │                   │    │ Manager    │ │
-│  └──────┬───────┘    └────────┬──────────┘    └────────────┘ │
-│         │                     │                               │
-│         │            ┌────────▼─────────┐                     │
-│         │            │ Manifest 解析器    │                     │
-│         │            │ (plugin.yaml)     │                     │
-│         │            └────────┬─────────┘                     │
-│         │                     │                               │
-│  ┌──────▼──────────────────────▼──────────┐                    │
-│  │         Plugin RPC Layer                │                    │
-│  │  ┌─────────────┐  ┌─────────────────┐  │                    │
-│  │  │ gRPC Server  │  │ gRPC Client      │  │                    │
-│  │  │ (Runtime侧)  │  │ (Runtime侧)      │  │                    │
-│  │  └─────────────┘  └────────┬────────┘  │                    │
-│  └─────────────────────────────┼───────────┘                    │
-│                                │                                │
-│  ┌─────────────────────────────▼───────────┐                    │
-│  │         插件进程 (独立 OS 进程)           │                    │
-│  │                                           │                   │
-│  │  ┌───────────┐  ┌──────────┐  ┌────────┐│                   │
-│  │  │ gRPC Client│  │ gRPC Server│  │Plugin  ││                   │
-│  │  │ (连Runtime)│  │ (暴露能力) │  │ Logic  ││                   │
-│  │  └───────────┘  └──────────┘  └────────┘│                   │
-│  │                                           │                   │
-│  │  能力实现:                                │                   │
-│  │  ┌──────────┐ ┌────────┐ ┌───────────┐ │                   │
-│  │  │Provider   │ │Tool    │ │Hook       │ │                   │
-│  │  │Adapter    │ │Backend │ │Handler    │ │                   │
-│  │  └──────────┘ └────────┘ └───────────┘ │                   │
-│  └───────────────────────────────────────────┘                │
-│                                                                │
-│  ┌──────────────────────────────────────────────────────┐     │
-│  │  进程管理                                               │     │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  │     │
-│  │  │ 启动/停止  │  │ 健康检查  │  │ 自动重启 (Backoff)│  │     │
-│  │  └──────────┘  └──────────┘  └──────────────────┘  │     │
-│  └──────────────────────────────────────────────────────┘     │
-└──────────────────────────────────────────────────────────────┘
-
-依赖方向:
-  Plugin Manager → Config Manager (读取插件配置)
-  Plugin Manager → Manifest 解析器 (加载前校验能力声明)
-  Plugin Manager → Plugin RPC Layer (建立通信通道)
-  Plugin RPC Layer → 插件进程 (gRPC over Unix Socket / TCP)
-  插件进程 → Plugin SDK (gRPC Stub + 协议握手)
-  进程管理 → 插件进程 (生命周期控制)
+Config Manager ── config.PluginsConfig ──▶ Plugin Manager
+                                             │
+                    Manifest parser/Loader ◀─┤
+                                             │
+                         Runtime gRPC Client ─┼── local IPC ─▶ Plugin gRPC Server
+                                             │
+                                 Tool Proxy
+                                             │
+                                  Tool Manager
 ```
 
-**依赖关系：**
-- Plugin Manager 依赖 Config Manager（插件配置下发）
-- Plugin Manager 不直接依赖 Provider/Tool/Skill 模块，而是通过 Hook 和能力注册间接交互
-- 插件进程依赖 Plugin SDK（由 Yaa! 提供，含 Protobuf Stub）
-- 进程管理是 Plugin Manager 的内部子模块，不单独暴露
-- 插件进程崩溃由进程管理自动重启，对上层透明
+依赖方向固定为：
+
+- Plugin Manager 读取 Config DTO，但 Config 包不导入 Plugin 模块。
+- Loader/Manager 使用 `pkg/pluginrpc` 生成类型；Plugin SDK 不导入 `internal/*`。
+- Runtime 各 Manager 只持有 Proxy，不持有 Plugin 实现对象。
+- Skill Manager 可依赖已经注册的 Tool Proxy，不参与 Plugin 生命周期。
+
+---
+
+*最后更新: 2025-07-17*

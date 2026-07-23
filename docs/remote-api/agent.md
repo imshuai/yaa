@@ -1,215 +1,76 @@
 # Agent API
 
-> [← 返回索引](./INDEX.md)
+> [返回索引](INDEX.md) · canonical 配置见 [AgentConfig](../config/reference.md#3-agents-节点)
 
----
+Agent 由 `agents[]` 配置创建，`id` 是唯一寻址键。v1 Remote API 不新增、修改或删除 Agent 配置，也不生成 `agt_*` ID。
 
-## POST /api/v1/agents
+## 安全 DTO
 
-创建 Agent。
-
-**请求 Body:**
+列表使用固定 `AgentSummaryView`，详情使用固定 `AgentDetailView`。Remote 只投影 `agent.Manager.Get/Inspect`，不得直接序列化 `AgentConfig`：
 
 ```json
 {
-  "name": "my-agent",
-  "display_name": "My Assistant",
-  "model": "gpt-4o",
+  "id": "default",
+  "name": "Default Agent",
   "provider": "openai",
-  "system_prompt": "You are a helpful assistant.",
-  "temperature": 0.7,
-  "max_tokens": 4096,
-  "tools": ["web_search", "file_read"],
-  "skills": ["weather", "summarize"],
-  "mcp_servers": ["filesystem"],
+  "model": "gpt-4o",
+  "tools": ["shell", "http"],
+  "skills": ["weather"],
   "memory_enabled": true,
-  "metadata": { "project": "demo" }
+  "planner_enabled": false,
+  "status": "running"
 }
 ```
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `name` | string | ✅ | Agent 唯一标识（slug 格式） |
-| `display_name` | string | ❌ | 显示名称 |
-| `model` | string | ✅ | 使用的模型 ID |
-| `provider` | string | ❌ | Provider 名称，默认使用系统默认 |
-| `system_prompt` | string | ❌ | 系统提示词 |
-| `temperature` | float | ❌ | 采样温度，默认 0.7 |
-| `max_tokens` | int | ❌ | 最大输出 token 数 |
-| `tools` | []string | ❌ | 启用的内置 Tool 列表 |
-| `skills` | []string | ❌ | 启用的 Skill 列表 |
-| `mcp_servers` | []string | ❌ | 关联的 MCP Server 列表 |
-| `memory_enabled` | bool | ❌ | 是否启用记忆，默认 false |
-| `metadata` | object | ❌ | 自定义元数据 |
-
-**响应 data:**
-
-```json
-{
-  "id": "agt_01J...",
-  "name": "my-agent",
-  "display_name": "My Assistant",
-  "model": "gpt-4o",
-  "provider": "openai",
-  "status": "stopped",
-  "system_prompt": "You are a helpful assistant.",
-  "temperature": 0.7,
-  "max_tokens": 4096,
-  "tools": ["web_search", "file_read"],
-  "skills": ["weather", "summarize"],
-  "mcp_servers": ["filesystem"],
-  "memory_enabled": true,
-  "metadata": { "project": "demo" },
-  "created_at": "2025-07-15T10:00:00Z",
-  "updated_at": "2025-07-15T10:00:00Z"
-}
-```
-
----
+`AgentSummaryView` 只有 `id`、`name`、`provider`、`model`、`status`；`AgentDetailView` 在其基础上只增加排序后的 canonical `tools`、`skills`、`memory_enabled` 和 `planner_enabled`。`tools` 不返回 Provider alias 或 alias map。`status` 只有 `running`、`paused`、`stopped`。两者都不包含 `system_prompt`、`tools_config`、`skills_config`、Context/Session/Memory options、路径、Secret 或其他开放 map。
 
 ## GET /api/v1/agents
 
-列出所有 Agent（分页）。
+Query：
 
-**Query 参数:**
-
-| 参数 | 类型 | 说明 |
+| 参数 | 默认 | 规则 |
 |------|------|------|
-| `page` | int | 页码，默认 1 |
-| `page_size` | int | 每页条数，默认 20 |
-| `status` | string | 按状态过滤：`running` / `paused` / `stopped` |
+| `page` | 1 | `>=1` |
+| `page_size` | 20 | `1..100` |
+| `status` | 未过滤 | `running|paused|stopped` |
 
-**响应 data:**
+结果按配置中的 Agent ID 升序稳定分页：
 
 ```json
 {
-  "items": [
-    {
-      "id": "agt_01J...",
-      "name": "my-agent",
-      "display_name": "My Assistant",
-      "model": "gpt-4o",
-      "provider": "openai",
-      "status": "running",
-      "created_at": "2025-07-15T10:00:00Z",
-      "updated_at": "2025-07-15T10:00:00Z"
-    }
-  ],
+  "items": [{"id": "default", "name": "Default Agent", "provider": "openai", "model": "gpt-4o", "status": "running"}],
   "total": 1,
   "page": 1,
   "page_size": 20
 }
 ```
 
----
+列表 item 使用 `AgentSummaryView`；详情使用上述 `AgentDetailView`。
 
 ## GET /api/v1/agents/:id
 
-获取 Agent 详情。
-
-**路径参数:**
-
-| 参数 | 说明 |
-|------|------|
-| `id` | Agent ID 或 name |
-
-**响应 data:** 同 POST /api/v1/agents 响应结构。
-
----
-
-## PUT /api/v1/agents/:id
-
-更新 Agent 配置。全量更新，未提供的字段会被重置为默认值。
-
-**请求 Body:** 同创建请求，所有字段均为可选。
-
-**响应 data:** 更新后的完整 Agent 对象。
-
----
-
-## DELETE /api/v1/agents/:id
-
-删除 Agent。删除前会自动停止 Agent。
-
-**响应 data:**
-
-```json
-{ "deleted": true }
-```
-
----
+`:id` 只接受 `AgentConfig.id`，不接受 name alias。不存在返回 404 / `40401`。响应只能来自 `agent.Manager.Inspect` 的深拷贝，不能从 Config snapshot 补字段。
 
 ## POST /api/v1/agents/:id/start
 
-启动 Agent（从 stopped/paused 状态恢复运行）。
-
-**响应 data:**
+将 `stopped` 或 `paused` 变为 `running`；已经 `running` 时幂等成功。成功 data：
 
 ```json
-{
-  "id": "agt_01J...",
-  "status": "running",
-  "started_at": "2025-07-15T10:00:00Z"
-}
+{"id": "default", "status": "running"}
 ```
-
----
 
 ## POST /api/v1/agents/:id/pause
 
-暂停 Agent。暂停后 Agent 保留在内存中，可快速恢复。
-
-**响应 data:**
-
-```json
-{
-  "id": "agt_01J...",
-  "status": "paused"
-}
-```
-
----
+将 `running` 变为 `paused`；已经 `paused` 时幂等成功。`stopped` 返回 409 / `40901`。已开始的 Session turn 继续到合法提交边界，之后不再接受新 turn。
 
 ## POST /api/v1/agents/:id/stop
 
-停止 Agent。释放运行时资源，Session 数据保留。
+将 `running` 或 `paused` 变为 `stopped`；已经 `stopped` 时幂等成功。停止先拒绝新 turn，再取消/等待运行中的 turn 到 shutdown deadline；已提交 Session snapshot 不回滚。
 
-**响应 data:**
+Agent 运行态只存在于当前进程，重启后按 Runtime 启动配置重新建立；这些端点不会回写配置文件。
 
-```json
-{
-  "id": "agt_01J...",
-  "status": "stopped"
-}
-```
+控制端点统一映射：未知 Agent 为 404 / `40401`；`ErrAgentInvalidState`、`ErrAgentPaused`、`ErrAgentStopped` 为 409 / `40901`；调用 ctx deadline 为 504 / `50401`，client cancel 后通常不再写响应。Stop 已把状态提交为 stopped 后即使等待 turn 超时也不回滚状态。
 
 ---
 
-## PATCH /api/v1/agents/:id/model
-
-切换 Agent 模型，运行时生效，无需重启 Agent。
-
-**请求 Body:**
-
-```json
-{
-  "model": "claude-sonnet-4-20250514",
-  "provider": "claude"
-}
-```
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `model` | string | ✅ | 新的模型 ID |
-| `provider` | string | ❌ | Provider 名称，留空则沿用当前 |
-
-**响应 data:**
-
-```json
-{
-  "id": "agt_01J...",
-  "model": "claude-sonnet-4-20250514",
-  "provider": "claude",
-  "updated_at": "2025-07-15T10:00:00Z"
-}
-```
+*最后更新: 2026-07-22*

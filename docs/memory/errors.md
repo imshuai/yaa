@@ -1,225 +1,119 @@
-# Memory 错误处理
+# Memory 错误与降级
 
-> 文档路径: `docs/memory/errors.md`
-> 上级: `docs/memory/README.md` §错误处理
-> 依赖: `docs/memory/architecture.md`, `docs/memory/storage.md`
-
----
-
-## 1. 错误分类
-
-### 1.1 错误类型总表
-
-| 错误类型 | 说明 | 处理方式 |
-|---------|------|---------|
-| `ErrMemoryNotFound` | 按 key 未找到记忆 | 返回空结果或告知 LLM 无相关记忆 |
-| `ErrMemoryAlreadyExists` | Add 时 key 已存在 | 返回给调用方，提示使用 Update |
-| `ErrMemoryStoreUnavailable` | 存储后端不可用（DB 连接断开） | 触发降级策略，回退到内存缓存 |
-| `ErrMemoryEmbedderFailed` | 向量嵌入失败（Embedder 超时/报错） | 回退到关键词搜索 |
-| `ErrMemoryEmbedderUnavailable` | 未配置 Embedder 或服务不可达 | 直接使用关键词搜索 |
-| `ErrMemorySearchTimeout` | 检索超时 | 返回已获取的部分结果 + 警告 |
-| `ErrMemoryWriteFailed` | 写入失败（磁盘满 / DB 错误） | 记录错误日志，返回错误给调用方 |
-| `ErrMemoryDeleteFailed` | 删除失败 | 记录日志，标记为待清理 |
-| `ErrMemoryCorrupted` | 记忆数据损坏（反序列化失败） | 跳过该条，记录错误，继续处理其余 |
-| `ErrMemoryPermissionDenied` | Agent 无权访问目标 Memory 作用域 | 返回权限错误给调用方 |
-| `ErrMemoryQuotaExceeded` | 超出 Agent 记忆配额 | 触发淘汰策略，淘汰低优先级记忆后重试 |
-| `ErrMemoryLayerInvalid` | 指定了无效的 MemoryLayer | 返回参数错误给调用方 |
-
-### 1.2 错误严重度分级
-
-| 级别 | 说明 | 示例 | 影响 |
-|------|------|------|------|
-| **Fatal** | 存储完全不可用 | SQLite 文件丢失且无法重建 | Memory 系统停摆，Agent 降级运行 |
-| **Error** | 单条操作失败 | 写入失败、删除失败 | 该条记忆不可用，其余正常 |
-| **Warn** | 功能降级 | 向量搜索回退为关键词搜索 | 检索质量下降，功能可用 |
-| **Info** | 预期内行为 | 记忆过期清理、晋升触发 | 无负面影响 |
+> 上级: [Memory 系统设计](README.md)
+> 可观测性: [observability.md](observability.md)
 
 ---
 
-## 2. 错误传递策略
+## 1. 稳定错误
 
-### 2.1 传递路径
-
-```text
-Memory 操作错误 → Memory Manager → Agent → LLM
-                                      │
-                                      ├─ 可恢复 → 降级处理，返回降级结果
-                                      └─ 不可恢复 → 告知 LLM，LLM 决策
-```
-
-### 2.2 Agent 层错误处理
+Memory 包导出以下可用 `errors.Is` 判断的 sentinel。底层错误必须用 `%w` 包装，不能把它们转换成空 slice 或 nil。
 
 ```go
-func (a *Agent) recallMemory(query string, limit int) ([]*MemoryItem, error) {
-    mem, err := a.memMgr.GetMemory(a.id)
-    if err != nil {
-        // Memory 实例获取失败 → 降级：不注入记忆
-        a.logger.Warn("memory unavailable, skipping recall", "error", err)
-        return nil, nil // 返回空，不阻断主流程
-    }
-
-    results, err := mem.Search(query, limit)
-    if err != nil {
-        switch {
-        case errors.Is(err, ErrMemoryEmbedderFailed),
-             errors.Is(err, ErrMemoryEmbedderUnavailable):
-            // 向量搜索不可用 → 降级为关键词搜索
-            a.logger.Warn("vector search unavailable, falling back to keyword", "error", err)
-            results, err = a.keywordSearchFallback(mem, query, limit)
-            if err != nil {
-                a.logger.Error("keyword search also failed", "error", err)
-                return nil, nil
-            }
-
-        case errors.Is(err, ErrMemorySearchTimeout):
-            // 超时 → 返回部分结果
-            a.logger.Warn("memory search timed out, returning partial results", "error", err)
-            // results 可能已包含部分数据
-
-        default:
-            a.logger.Error("memory search failed", "error", err)
-            return nil, nil
-        }
-    }
-
-    return results, nil
+var (
+    ErrMemoryDisabled          = errors.New("memory: disabled")
+    ErrMemoryClosed            = errors.New("memory: closed")
+    ErrMemoryNotFound          = errors.New("memory: item not found")
+    ErrMemoryInvalidScope      = errors.New("memory: invalid scope")
+    ErrMemoryInvalidItem       = errors.New("memory: invalid item")
+    ErrMemoryManagedField      = errors.New("memory: managed field is not writable")
+    ErrMemoryUnsupportedLayer  = errors.New("memory: unsupported layer")
+    ErrMemoryExpiredInput      = errors.New("memory: expiration is in the past")
+    ErrMemoryQuota             = errors.New("memory: capacity could not be satisfied")
+    ErrMemoryStoreUnavailable  = errors.New("memory: content store unavailable")
+    ErrMemoryCorrupt           = errors.New("memory: corrupt content")
+    ErrMemoryEmbeddingFailed   = errors.New("memory: embedding failed")
+    ErrMemoryEmbeddingDimension = errors.New("memory: embedding dimension mismatch")
+    ErrMemoryEmbeddingZero     = errors.New("memory: zero vector")
+    ErrMemoryIndexUnavailable  = errors.New("memory: vector index unavailable")
+    ErrMemoryIndexDegraded     = errors.New("memory: vector index degraded")
+    ErrMemoryReindexFailed     = errors.New("memory: reindex failed")
 }
 ```
 
-### 2.3 错误包装规范
+参数错误（scope、layer、长度、metadata、limit）在 ContentStore 写入前返回。`ErrMemoryNotFound` 同时表示不存在和已过期；调用方不应通过错误内容区分两者。
 
-Memory 系统遵循 Go 错误包装惯例，使用 `fmt.Errorf` + `%w` 保留原始错误链：
+## 2. 操作语义
+
+| 操作 | ContentStore 失败 | embedding/index 失败 |
+|------|-------------------|----------------------|
+| Put/容量驱逐 | CommitPut 整体回滚 target 与 victims | 内容已提交，Put 成功，状态 degraded |
+| Get | 返回错误 | 不访问 index |
+| 关键词 Search | 返回错误 | 不适用 |
+| 向量 Search，fallback=true | 不适用 | 同一次请求改走关键词，返回成功并发布 degraded |
+| 向量 Search，fallback=false | 不适用 | 返回 `ErrMemoryEmbeddingFailed`、`ErrMemoryIndexUnavailable` 或 `ErrMemoryIndexDegraded` |
+| Delete/Clear/Expire/Evict | 返回错误，删除事务回滚 | 内容删除成功，索引状态 degraded |
+| Reindex | 保留旧索引，返回错误 | 保留旧索引，返回错误 |
+
+“Put 成功但 index degraded”是有意的 partial success：Manager 返回 `PutResult{IndexStatus: IndexDegraded}` 和 nil error。ContentStore 是唯一真实来源，调用方不应因为 degraded 自动重复 Put。事件和健康报告提供修复信号，`Reindex` 是唯一修复入口。vector Search 在 `fallback_to_keyword=false` 且状态已 degraded 时返回 `ErrMemoryIndexDegraded`。
+
+## 3. Agent 层传播
+
+Agent 不得捕获所有错误后返回 nil。推荐规则：
 
 ```go
-// 存储层错误包装
-if err := s.db.Get(key, &item); err != nil {
-    if errors.Is(err, sql.ErrNoRows) {
-        return nil, ErrMemoryNotFound
-    }
-    return nil, fmt.Errorf("memory store get '%s': %w", key, err)
-}
-
-// 调用方可通过 errors.Is 判断具体错误类型
-if errors.Is(err, ErrMemoryNotFound) {
-    // 记忆不存在，非异常行为
-    return nil
+results, err := mgr.Search(ctx, policy, req)
+switch {
+case err == nil:
+    // 注入 results
+case errors.Is(err, ErrMemoryDisabled):
+    // 明确关闭时不注入
+default:
+    // v1 除 Disabled 外没有继续策略；所有错误向上传递
+    return fmt.Errorf("recall memory: %w", err)
 }
 ```
 
----
+Agent 对除 `ErrMemoryDisabled` 外的 Memory 错误一律阻断当前 turn，因为静默跳过会让用户误以为记忆已保存或已检索。v1 配置没有通用“继续对话”字段；唯一降级是已定义的 `vector.fallback_to_keyword`。
 
-## 3. 降级策略
+## 4. 不允许的降级
 
-### 3.1 降级层次
+- ContentStore 故障时不得写入只存在于进程内的临时副本。
+- 不得把坏 row 跳过后报告 Search 成功；返回 `ErrMemoryCorrupt` 并将 Runtime 标为 Not Ready/Unhealthy。
+- 不得无限重试 Put、embedding 或 Reindex。Manager 不内置重试循环；调用方如需重试必须受 ctx deadline 和业务次数限制。
+- 不得因为 quota 失败自动删除任意“低优先级” item；victim 只能按 `fifo|ttl` 的确定性排序选择。
+- 不得把 vector threshold 应用于关键词结果，也不得在 fallback 时扩大结果数量。
 
-| 层次 | 触发条件 | 降级行为 | 影响范围 |
-|------|---------|---------|---------|
-| L0 | 向量嵌入失败 | 向量搜索 → 关键词搜索 | 检索精度下降 |
-| L1 | 存储后端不可用 | 持久化存储 → 内存缓存（临时） | 重启后丢失新记忆 |
-| L2 | Memory 系统完全不可用 | 跳过记忆注入，Agent 无记忆运行 | 仅当前 Session 受影响 |
-| L3 | 配额超限 | 淘汰低优先级记忆后重试写入 | 旧记忆被清理 |
-
-### 3.2 向量搜索降级实现
+## 5. 错误包装和取消
 
 ```go
-func (m *MemoryManager) searchWithFallback(mem Memory, query string, limit int) ([]*MemoryItem, error) {
-    results, err := mem.Search(query, limit)
-    if err == nil {
-        return results, nil
+item, err := store.Get(ctx, scope, key)
+if err != nil {
+    if errors.Is(err, ErrMemoryNotFound) {
+        return MemoryItem{}, ErrMemoryNotFound
     }
-
-    // 降级 L0：向量搜索失败 → 关键词搜索
-    if errors.Is(err, ErrMemoryEmbedderFailed) ||
-       errors.Is(err, ErrMemoryEmbedderUnavailable) {
-        m.logger.Warn("vector search degraded to keyword search",
-            "agent_id", mem.AgentID(),
-            "error", err,
-        )
-        m.metrics.IncCounter("memory_search_degraded_total")
-
-        if kwMem, ok := mem.(KeywordSearchable); ok {
-            return kwMem.KeywordSearch(query, limit)
-        }
-    }
-
-    // 降级 L2：搜索完全失败 → 返回空结果
-    m.logger.Error("memory search completely failed, returning empty", "error", err)
-    return nil, nil
+    return MemoryItem{}, fmt.Errorf("memory get: %w: %w", ErrMemoryStoreUnavailable, err)
 }
 ```
 
-### 3.3 存储降级实现
+真实底层错误应作为 wrapped cause 保留给日志和 tracing，但对外稳定分类使用上面的 sentinel。Reindex 失败必须包装 `ErrMemoryReindexFailed`，并继续包装 embedding/index/store 原因；`context.Canceled` 和 `context.DeadlineExceeded` 保留原错误链，不能改成“not found”。
 
-```go
-func (m *MemoryManager) writeWithFallback(agentID, key, content string, meta map[string]any) error {
-    mem, err := m.GetMemory(agentID)
-    if err != nil {
-        return fmt.Errorf("get memory instance: %w", err)
-    }
+## 6. 启动和健康
 
-    if err := mem.Add(key, content, meta); err != nil {
-        if errors.Is(err, ErrMemoryStoreUnavailable) {
-            // 降级 L1：持久化存储不可用 → 内存缓存
-            m.logger.Warn("store unavailable, caching in memory temporarily",
-                "agent_id", agentID, "key", key)
-            m.fallbackCache.Set(agentID+":"+key, &MemoryItem{
-                Key: key, Content: content, Metadata: meta,
-                CreatedAt: time.Now(),
-            })
-            m.metrics.IncCounter("memory_write_fallback_total")
-            return nil
-        }
+- ContentStore 打开、迁移或 row 校验失败：Memory Runtime Not Ready。
+- vector enabled 且 `fallback_to_keyword=false` 时，初始 Reindex 失败：Runtime Not Ready。
+- vector enabled 且 `fallback_to_keyword=true` 时，初始 Reindex 失败：Runtime 可 Ready，但为 degraded，向量 Search 会按配置 fallback。
+- index 单次 Upsert/Delete 失败：不影响已提交内容，健康为 degraded，发布 `memory.degraded`。
 
-        if errors.Is(err, ErrMemoryQuotaExceeded) {
-            // 降级 L3：配额超限 → 淘汰后重试
-            m.logger.Warn("quota exceeded, evicting low-priority memories", "agent_id", agentID)
-            if evictErr := m.evict(agentID, 5); evictErr != nil {
-                return fmt.Errorf("evict for quota: %w", evictErr)
-            }
-            return mem.Add(key, content, meta) // 重试一次
-        }
+## 7. 对 Remote API 的映射
 
-        return err
-    }
-    return nil
-}
-```
+API 层统一使用 envelope；建议状态码：
+
+| 错误 | HTTP |
+|------|------|
+| invalid scope/item/limit | 400 / `40001` |
+| not found | 404 / `40401` |
+| disabled | 409 / `40901` |
+| quota | 429 / `42901` |
+| closed | 503 / `50301` |
+| store unavailable/corrupt | 503 / `50301` |
+| vector unavailable/degraded 且未启用 fallback | 503 / `50301` |
+| Reindex failure（非请求取消/超时） | 503 / `50301` |
+| request deadline exceeded | 504 / `50401` |
+| 已提交但 index degraded | 2xx，并在 data/index_status 中标记 `degraded` |
+
+Handler 必须先检查自己的 request context：`context.Canceled` 表示客户端已断开，通常不再写响应；只有 request context 的 `DeadlineExceeded` 映射 `50401`。内部 embedding/store/index 子操作的 timeout 在 request context 尚未到期时映射 `50301`。API 不暴露数据库路径、embedding 响应、完整 ContentStore 错误文本或凭据。
 
 ---
 
-## 4. 重试策略
-
-| 操作 | 重试条件 | 重试次数 | 退避策略 |
-|------|---------|---------|---------|
-| 向量嵌入 | Embedder 超时 | 2 次 | 固定 500ms |
-| 存储写入 | DB 临时错误 | 3 次 | 指数退避 200ms / 400ms / 800ms |
-| 存储读取 | DB 临时错误 | 2 次 | 指数退避 100ms / 200ms |
-| 配额淘汰后写入 | 淘汰成功 | 1 次 | 无 |
-| 连接重建 | 存储连接断开 | 5 次 | 指数退避 1s / 2s / 4s / 8s / 16s |
-
----
-
-## 5. 可观测性集成
-
-### 5.1 错误指标
-
-| 指标 | 类型 | 标签 | 说明 |
-|------|------|------|------|
-| `memory_errors_total` | Counter | type, agent_id | 错误总数按类型 |
-| `memory_search_degraded_total` | Counter | agent_id, reason | 搜索降级次数 |
-| `memory_write_fallback_total` | Counter | agent_id | 写入降级到内存缓存次数 |
-| `memory_eviction_total` | Counter | agent_id, layer | 记忆淘汰次数 |
-| `memory_retry_total` | Counter | operation, agent_id | 重试次数 |
-
-### 5.2 Remote API 事件
-
-| 事件 | 触发时机 | Payload |
-|------|---------|---------|
-| `memory.error` | Memory 操作发生错误 | agent_id, key, error_type, message |
-| `memory.degraded` | 搜索/写入触发降级 | agent_id, operation, fallback_level |
-| `memory.evicted` | 记忆被淘汰 | agent_id, key, layer, reason |
-| `memory.store_recovered` | 存储从不可用恢复 | agent_id, duration |
-
----
-
-*最后更新: 2025-07-17*
+*最后更新: 2026-07-22*

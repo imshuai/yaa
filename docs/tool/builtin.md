@@ -12,8 +12,8 @@ Yaa! 的内置 Tool 分为三大类：
 | 类别 | Tool 列表 | 说明 | 文件 |
 |------|-----------|------|------|
 | **通用执行** | `shell`, `http`, `file_read`, `file_write`, `file_list`, `file_delete` | 基础操作能力 | 本文件 |
-| **配置管理** | `config_query`, `config_set`, `config_reload`, `config_scheme`, `config_save`, `config_diff` | 运行时配置管理 | [config-tools.md](config-tools.md) |
-| **内视与管理** | `runtime_status`, `agent_list`, `agent_inspect`, `session_list`, `session_inspect`, `tool_list`, `skill_list`, `provider_list`, `mcp_list`, `log_query`, `metric_query`, `skill_install`, `skill_uninstall`, `skill_enable`, `skill_disable`, `provider_health` | 自我认知与管理 | [introspection.md](introspection.md) |
+| **配置管理** | `config_query`, `config_reload` | 读取脱敏配置、按文件 watcher 同一流程 reload | [config-tools.md](config-tools.md) |
+| **内视** | `runtime_status`, `agent_list`, `agent_inspect`, `session_list`, `session_inspect`, `tool_list`, `skill_list`, `provider_list`, `mcp_list` | 固定的只读运行态视图 | [introspection.md](introspection.md) |
 
 ### 6.1 Shell
 
@@ -21,16 +21,16 @@ Yaa! 的内置 Tool 分为三大类：
 
 ```go
 type ShellTool struct {
-    config ShellConfig
+    options EffectiveShellOptions
 }
 
-type ShellConfig struct {
-    Timeout          time.Duration `yaml:"timeout"`
-    AllowedCommands  []string      `yaml:"allowed_commands"`   // 命令白名单，空=全部允许
-    BlockedCommands  []string      `yaml:"blocked_commands"`    // 命令黑名单
-    WorkingDir       string        `yaml:"working_dir"`         // 工作目录
-    Env              map[string]string `yaml:"env"`             // 环境变量
-    MaxOutputBytes   int           `yaml:"max_output_bytes"`    // 输出截断
+// EffectiveShellOptions 由 config.ToolConfig.Options 严格解码；不参与 YAML 解码。
+type EffectiveShellOptions struct {
+    AllowedCommands []string
+    BlockedCommands []string
+    WorkingDir      string
+    Env             map[string]string
+    MaxOutputBytes  int
 }
 ```
 
@@ -43,15 +43,6 @@ type ShellConfig struct {
     "command": {
       "type": "string",
       "description": "The shell command to execute"
-    },
-    "timeout": {
-      "type": "integer",
-      "description": "Timeout in seconds (overrides default)",
-      "default": 30
-    },
-    "working_dir": {
-      "type": "string",
-      "description": "Working directory for the command"
     }
   },
   "required": ["command"]
@@ -78,17 +69,19 @@ type ShellConfig struct {
 
 ```go
 type HTTPTool struct {
-    config HTTPConfig
+    options EffectiveHTTPOptions
 }
 
-type HTTPConfig struct {
-    Timeout        time.Duration `yaml:"timeout"`
-    MaxRedirects   int           `yaml:"max_redirects"`
-    AllowedDomains []string      `yaml:"allowed_domains"`   // 域名白名单
-    BlockedDomains []string      `yaml:"blocked_domains"`   // 域名黑名单
-    MaxResponseBytes int         `yaml:"max_response_bytes"`
+// EffectiveHTTPOptions 由 config.ToolConfig.Options 严格解码；不参与 YAML 解码。
+type EffectiveHTTPOptions struct {
+    MaxRedirects     int
+    AllowedHosts     []string
+    BlockedHosts     []string
+    MaxResponseBytes int
 }
 ```
+
+每次初始请求和重定向都对 `url.Hostname()` 的小写结果做精确匹配；`blocked_hosts` 优先，非空 `allowed_hosts` 是 allowlist。达到 `max_redirects` 或目标不允许时停止，不向目标发送下一跳请求。
 
 **Parameters Schema：**
 
@@ -112,10 +105,6 @@ type HTTPConfig struct {
     "body": {
       "type": "string",
       "description": "Request body (for POST/PUT/PATCH)"
-    },
-    "timeout": {
-      "type": "integer",
-      "description": "Timeout in seconds"
     }
   },
   "required": ["url"]
@@ -152,41 +141,73 @@ tools:
     file:
       enabled: true
       options:
-        allowed_paths: ["/tmp", "/workspace"]  # 允许访问的路径前缀
-        blocked_paths: ["/etc", "/root/.ssh"]   # 禁止访问的路径前缀
+        allowed_paths: ["/tmp", "/workspace"]  # 允许访问的路径根目录
+        blocked_paths: ["/etc", "/root/.ssh"]   # 禁止访问的路径根目录
         max_file_size: "10MB"                    # 单次读写上限
 ```
 
 **路径校验：**
 
 ```go
-func validatePath(path string, allowed, blocked []string) error {
-    abs, _ := filepath.Abs(path)
+func canonicalPath(path string) (string, error) {
+    current, err := filepath.Abs(path)
+    if err != nil {
+        return "", err
+    }
+    current = filepath.Clean(current)
 
-    // 检查黑名单
-    for _, b := range blocked {
-        if strings.HasPrefix(abs, b) {
-            return fmt.Errorf("path %s is blocked", abs)
+    // 写入目标可能尚不存在；先解析最近的已有祖先，再接回缺失部分。
+    var tail []string
+    for {
+        if _, err = os.Lstat(current); err == nil {
+            break
+        }
+        if !errors.Is(err, os.ErrNotExist) {
+            return "", err
+        }
+        parent := filepath.Dir(current)
+        if parent == current {
+            return "", err
+        }
+        tail = append(tail, filepath.Base(current))
+        current = parent
+    }
+    current, err = filepath.EvalSymlinks(current)
+    if err != nil {
+        return "", err
+    }
+    for i := len(tail) - 1; i >= 0; i-- {
+        current = filepath.Join(current, tail[i])
+    }
+    return filepath.Clean(current), nil
+}
+
+func within(path, root string) bool {
+    rel, err := filepath.Rel(root, path)
+    return err == nil && rel != ".." && !filepath.IsAbs(rel) &&
+        !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func validatePath(path string, allowed, blocked []string) (string, error) {
+    target, err := canonicalPath(path)
+    if err != nil {
+        return "", err
+    }
+    for _, root := range blocked { // root 在启动时同样 canonicalize。
+        if within(target, root) {
+            return "", fmt.Errorf("path is blocked")
         }
     }
-
-    // 检查白名单
     if len(allowed) > 0 {
-        allowed_ := false
-        for _, a := range allowed {
-            if strings.HasPrefix(abs, a) {
-                allowed_ = true
-                break
+        for _, root := range allowed {
+            if within(target, root) {
+                return target, nil
             }
         }
-        if !allowed_ {
-            return fmt.Errorf("path %s is not in allowed paths", abs)
-        }
+        return "", fmt.Errorf("path is not in allowed paths")
     }
-
-    // 防止路径穿越
-    // 已通过 filepath.Abs + HasPrefix 隐式处理
-
-    return nil
+    return target, nil
 }
 ```
+
+所有 configured roots 必须是绝对路径，并在启动时通过同一 `canonicalPath` 解析；失败即配置错误。每次操作只使用返回的 canonical target，不能在校验后重新使用原始 path。`filepath.Rel` 提供目录边界，因此 `/tmpfoo` 不属于 `/tmp`；解析最近已有祖先则同时覆盖 symlink escape 和新建文件场景。

@@ -47,30 +47,35 @@
 - **决策**：有 Tool Call 的轮次，`reasoning_content` 必须保留在 Context 中
 - **理由**：DeepSeek 等厂商要求多轮 Tool 调用时必须回传 reasoning_content，否则返回 400 错误。Context Manager 需理解此约束
 
-### TD-009: Config Tool 运行时生效而非重启
+### TD-009: Config Tool 遵循统一热更新边界
 
-- **决策**：`config_set` 修改立即在内存层生效，通过 `OnChange` 回调传播到相关组件
-- **理由**：Agent Runtime 的核心价值是长期运行、无需重启。配置变更应实时生效，`config_reload` 和 `config_save` 提供磁盘层面的同步
+- **决策**：v1 不提供 `config_set`/`config_save`；配置文件由运维方修改，watcher 与 `config_reload` 共用 `ReloadManager`，restart-required 变化只返回结构化结果而不发布候选快照
+- **理由**：复用 Config Manager 的单一 Load/diff/Store 契约，避免内存显示新值但底层资源仍使用旧值
 
 ### TD-010: 敏感字段自动脱敏
 
-- **决策**：`config_query` 和 `log_query` 默认对 `api_key`、`password`、`secret`、`token` 等字段脱敏
-- **理由**：Tool 结果会注入 LLM Context，存在信息泄露风险。脱敏是默认安全行为，可通过 `redact_secrets=false` 显式关闭（需管理权限）
+- **决策**：`config_query` 强制调用唯一 `config.RedactedView`，且没有关闭开关；v1 不提供需要内部日志存储的 `log_query`
+- **理由**：Tool 结果会注入 LLM Context，`ExecutionScope` 没有独立管理员 principal，任何可关闭脱敏都会绕过边界
 
-### TD-011: 管理类 Tool 默认禁用
+### TD-011: v1 不提供 Skill 管理 Tool
 
-- **决策**：`skill_install`、`skill_uninstall`、`skill_enable`、`skill_disable` 默认 `enabled=false`
-- **理由**：这些 Tool 会改变运行时结构（安装/卸载/绑定 Skill），风险较高。只读内视工具默认启用，写入/管理工具默认禁用，由用户显式开启
+- **决策**：不注册 `skill_install`、`skill_uninstall`、`skill_enable` 或 `skill_disable`
+- **理由**：Skill Manager 只在启动时构造不可变 snapshot；部署系统修改文件和配置后重启 Runtime
 
-### TD-012: 内视工具分级权限
+### TD-012: 内视工具使用固定安全视图
 
-- **决策**：内视工具的"详细模式"（如 `runtime_status.detail=full`、`agent_inspect.include_context=true`、`session_inspect.include_tool_results=true`）需要更高权限
-- **理由**：摘要信息对调试有帮助且无风险，但完整上下文、Goroutine dump、Tool 结果可能包含敏感数据。分级权限平衡了可用性和安全性
+- **决策**：v1 不提供 goroutine dump、跨 Agent Context 或任意 Session Tool result 等详细模式；每个 Tool 返回固定、脱敏且有界的 DTO
+- **理由**：Tool Manager 只有 Agent/Session execution scope，没有 Auth role。删除敏感模式比引入一条不可执行的“管理员”分支更明确
 
-### TD-013: config_diff 作为运维辅助
+### TD-013: Config 查询只读
 
-- **决策**：`config_diff` 作为独立 Tool 而非 `config_save` 的参数
-- **理由**：diff 是只读操作，可安全地给 Agent 使用；save 是写操作，需更高权限。分离后 Agent 可以随时 diff 但不能随意 save
+- **决策**：`config_query` 只读取强制脱敏的 Effective Config；不提供 `config_schema`、`config_diff` 或来源层恢复能力
+- **理由**：Loader 不保留原始来源层或 Secret 引用；只读 Effective Config 是唯一可稳定实现的视图
+
+### TD-014: Provider alias 是 turn-local wire 投影
+
+- **决策**：Runtime/Session/Remote/MCP 始终使用 canonical Tool name；只有发送 Provider 的请求副本使用 [确定性 Provider-safe alias](provider.md)，并通过 turn-local executable map 精确反查响应
+- **理由**：MCP 点分名、Unicode 等合法 canonical name 不能满足所有厂商的 function-name 正则。持久化 alias 会把 Session 绑定到 Provider 和算法版本；让 adapter 各自改名又会产生无法统一反查的多套规则
 
 ---
 
@@ -96,12 +101,12 @@
 │               │  File        │                            │
 │               │             │                            │
 │               │ 配置管理类   │◄──► Config Manager        │
-│               │  Config×6    │                            │
+│               │ Query/Reload │                            │
 │               │             │                            │
 │               │ 内视管理类   │◄──► Runtime / Agent Mgr   │
 │               │  Introspect  │◄──► Session Mgr            │
-│               │  + Admin     │◄──► Skill Manager          │
-│               │             │◄──► Provider Registry      │
+│               │             │◄──► Skill Manager          │
+│               │             │◄──► Provider Manager       │
 │               │             │◄──► MCP Client              │
 │               │             │◄──► Log / Metric Store     │
 │               └─────────────┘                            │
@@ -110,18 +115,17 @@
 依赖方向:
   Agent → Tool Manager (调用)
   Tool Manager → Tool 实例 (执行)
-  Tool Manager → Provider (ToolDef 转换)
+  Tool Manager → Provider (turn-local ToolDef alias 投影)
   Context Manager ← Tool Manager (结果注入)
   MCP Client → Tool Manager (注册 MCP Tool)
-  Config Tools → Config Manager (读写配置)
+  Config Tools → Config Manager (脱敏查询/统一 reload)
   Introspection Tools → Runtime/Agent/Session/Skill/Provider/MCP (查询状态)
-  Admin Tools → Skill Manager / Provider Registry (管理操作)
 ```
 
 **依赖关系：**
 - Tool Manager 依赖 Provider 的类型定义（`ToolDef`, `ToolCall`），但不依赖 Provider 实现
 - Tool 实例只依赖 Tool interface，不感知 Provider / Context / Agent
 - Context Manager 依赖 Provider 的 `Message` 类型，与 Tool Manager 协作处理 Tool 消息
+- Provider alias 只存在于投影后的 request 与反查前的 response；Session/Remote/执行路径均为 canonical
 
 ---
-

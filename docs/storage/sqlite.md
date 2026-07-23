@@ -1,141 +1,54 @@
-# SQLite 存储实现
+# SQLite Storage 实现
 
-> Yaa! 默认存储后端，基于 `modernc.org/sqlite`（纯 Go，零 CGO）。
-> 实现 `storage.Storage` 接口，提供 Key-Value 语义与 TTL 支持。
-
----
-
-## 1. 设计目标
-
-| 目标 | 说明 |
-|------|------|
-| 零依赖 | 纯 Go SQLite，无需 CGO，Windows 7 兼容 |
-| 单文件 | 整个数据库存储在一个 `.db` 文件中，便于备份与迁移 |
-| Key-Value 语义 | 对 `Storage` 接口的简单映射，上层无需关心 SQL |
-| TTL 支持 | 可选过期时间，后台惰性清理 |
-| 前缀查询 | 支持 `Keys(prefix)` 按前缀枚举键 |
-| 并发安全 | 依赖 SQLite WAL 模式 + `sync.Mutex` 保护写操作 |
+> 上级: [Storage 系统设计](README.md)
+> 驱动: `modernc.org/sqlite`（纯 Go）
 
 ---
 
-## 2. 表结构
-
-### 2.1 主表 `kv_store`
+## 1. 表结构
 
 ```sql
-CREATE TABLE IF NOT EXISTS kv_store (
-    key       TEXT    PRIMARY KEY,
-    value     BLOB    NOT NULL,
-    created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-    expires_at  INTEGER          -- Unix 时间戳，NULL 表示永不过期
+CREATE TABLE IF NOT EXISTS root_kv (
+    key        TEXT PRIMARY KEY,
+    value      BLOB NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER
 );
-```
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `key` | TEXT PK | 键名，主键索引 |
-| `value` | BLOB | 值，以字节流存储 |
-| `created_at` | INTEGER | 创建时间（Unix 秒） |
-| `expires_at` | INTEGER | 过期时间（Unix 秒），NULL = 永不过期 |
-
-### 2.2 辅助索引
-
-```sql
--- 加速过期清理查询
-CREATE INDEX IF NOT EXISTS idx_kv_expires ON kv_store (expires_at)
+CREATE INDEX IF NOT EXISTS root_kv_expiry
+    ON root_kv (expires_at)
     WHERE expires_at IS NOT NULL;
-```
 
-### 2.3 Schema 版本管理
-
-```sql
-CREATE TABLE IF NOT EXISTS schema_version (
+CREATE TABLE IF NOT EXISTS root_storage_schema_version (
     version INTEGER PRIMARY KEY,
-    applied_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    applied_at INTEGER NOT NULL
 );
 ```
 
-启动时检查 `schema_version`，按需执行迁移脚本。
+时间使用 Unix nanoseconds；`expires_at=NULL` 表示永不过期。表名和 schema version namespace 与 Memory ContentStore 分离，因此两个模块显式使用同一 SQLite 文件时不会冲突。
 
----
-
-## 3. Key-Value 映射
-
-`Storage` 接口到 SQL 操作的映射关系：
-
-| Storage 方法 | SQL 操作 | 说明 |
-|---|---|---|
-| `Get(key)` | `SELECT value FROM kv_store WHERE key=? AND (expires_at IS NULL OR expires_at > ?)` | 读取时惰性检查过期 |
-| `Set(key, val, ttl?)` | `INSERT OR REPLACE INTO kv_store (key, value, expires_at) VALUES (?, ?, ?)` | UPSERT 语义 |
-| `Delete(key)` | `DELETE FROM kv_store WHERE key=?` | 直接删除 |
-| `Has(key)` | `SELECT 1 FROM kv_store WHERE key=? AND (expires_at IS NULL OR expires_at > ?)` | 存在性检查 |
-| `Keys(prefix)` | `SELECT key FROM kv_store WHERE key LIKE ? AND (expires_at IS NULL OR expires_at > ?)` | 前缀匹配 |
-
-**前缀查询说明：** `prefix` 会被转义后拼接为 `prefix%`，使用 `LIKE` 匹配。
-
----
-
-## 4. TTL 支持
-
-### 4.1 写入时设置 TTL
+## 2. 初始化
 
 ```go
-// 永不过期
-storage.Set("agent:1:config", data)
-
-// 10 分钟后过期
-storage.Set("session:abc:cache", data, 10*time.Minute)
-```
-
-### 4.2 惰性过期
-
-`Get` / `Has` / `Keys` 在读取时检查 `expires_at`：
-- 若已过期，`Get` 返回 `ErrNotFound`，`Has` 返回 `false`
-- 过期行不被立即删除，由后台清理协程回收
-
-### 4.3 后台清理
-
-```text
-启动时创建 goroutine，每 60 秒执行：
-    DELETE FROM kv_store WHERE expires_at IS NOT NULL AND expires_at <= strftime('%s','now')
-```
-
----
-
-## 5. Go 代码示例
-
-### 5.1 初始化
-
-```go
-package storage
-
-import (
-    "database/sql"
-    "fmt"
-    "sync"
-    "time"
-
-    _ "modernc.org/sqlite"
-)
-
-type SQLiteStorage struct {
-    db   *sql.DB
-    mu   sync.Mutex
-    stop chan struct{}
-}
-
-func NewSQLiteStorage(path string) (*SQLiteStorage, error) {
-    db, err := sql.Open("sqlite", path)
+func NewSQLite(cfg StorageConfig) (*SQLiteStorage, error) {
+    if cfg.Path == "" {
+        return nil, ErrInvalidPath
+    }
+    db, err := sql.Open("sqlite", cfg.Path)
     if err != nil {
-        return nil, fmt.Errorf("open sqlite: %w", err)
+        return nil, fmt.Errorf("open root storage: %w", err)
     }
-    // 启用 WAL 模式，提升并发读性能
-    if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+    db.SetMaxOpenConns(1)
+    if _, err = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`); err != nil {
         db.Close()
-        return nil, err
+        return nil, fmt.Errorf("configure root storage: %w", err)
     }
-    s := &SQLiteStorage{db: db, stop: make(chan struct{})}
-    if err := s.initSchema(); err != nil {
+    s := &SQLiteStorage{
+        db:   db,
+        stop: make(chan struct{}),
+        done: make(chan struct{}),
+    }
+    if err = s.migrate(); err != nil {
         db.Close()
         return nil, err
     }
@@ -144,158 +57,99 @@ func NewSQLiteStorage(path string) (*SQLiteStorage, error) {
 }
 ```
 
-### 5.2 Schema 初始化
+目录创建、权限检查和 migration 在 Runtime Ready 前完成。只接受当前或可向前迁移的 schema version；未知更高版本使启动失败。
+
+## 3. 方法到 SQL 的映射
+
+| 方法 | 行为 |
+|------|------|
+| Get | 查询 key 且 `expires_at IS NULL OR expires_at > now`；无 row 返回 ErrNotFound |
+| Set | `INSERT ... ON CONFLICT DO UPDATE`，完整替换 value/expiry，保留 created_at |
+| Delete | `DELETE WHERE key=?`，0 row 也成功 |
+| Has | 与 Get 相同过滤，只查询存在性 |
+| Keys | 按前缀和 expiry 过滤，`ORDER BY key ASC` |
+
+Set 的核心 SQL：
+
+```sql
+INSERT INTO root_kv (key, value, created_at, expires_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(key) DO UPDATE SET
+    value = excluded.value,
+    expires_at = excluded.expires_at;
+```
+
+前缀查询不用拼接未转义的 `LIKE`：
+
+```sql
+SELECT key
+FROM root_kv
+WHERE substr(key, 1, length(?)) = ?
+  AND (expires_at IS NULL OR expires_at > ?)
+ORDER BY key ASC;
+```
+
+## 4. TTL
+
+共同参数校验先将可选 TTL 转成绝对 Unix nanoseconds：
 
 ```go
-func (s *SQLiteStorage) initSchema() error {
-    _, err := s.db.Exec(`
-        CREATE TABLE IF NOT EXISTS kv_store (
-            key         TEXT    PRIMARY KEY,
-            value       BLOB    NOT NULL,
-            created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-            expires_at  INTEGER
-        );
-        CREATE INDEX IF NOT EXISTS idx_kv_expires
-            ON kv_store (expires_at) WHERE expires_at IS NOT NULL;
-        CREATE TABLE IF NOT EXISTS schema_version (
-            version     INTEGER PRIMARY KEY,
-            applied_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-        );
-        INSERT OR IGNORE INTO schema_version (version) VALUES (1);
-    `)
-    return err
+func expiresAt(now time.Time, ttl []time.Duration) (*int64, error) {
+    if len(ttl) > 1 || (len(ttl) == 1 && ttl[0] < 0) {
+        return nil, ErrInvalidTTL
+    }
+    if len(ttl) == 0 || ttl[0] == 0 {
+        return nil, nil
+    }
+    v := now.Add(ttl[0]).UTC().UnixNano()
+    return &v, nil
 }
 ```
 
-### 5.3 Set / Get
+后台 worker 每 60 秒执行有限 batch 删除；若一批满额则立即继续，期间检查 stop channel：
 
-```go
-var ErrNotFound = fmt.Errorf("storage: key not found")
-
-func (s *SQLiteStorage) Set(key string, value []byte, ttl ...time.Duration) error {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-
-    var expiresAt interface{} // nil = 永不过期
-    if len(ttl) > 0 && ttl[0] > 0 {
-        expiresAt = time.Now().Add(ttl[0]).Unix()
-    }
-    _, err := s.db.Exec(
-        `INSERT OR REPLACE INTO kv_store (key, value, expires_at) VALUES (?, ?, ?)`,
-        key, value, expiresAt,
-    )
-    return err
-}
-
-func (s *SQLiteStorage) Get(key string) ([]byte, error) {
-    var value []byte
-    now := time.Now().Unix()
-    err := s.db.QueryRow(
-        `SELECT value FROM kv_store WHERE key=? AND (expires_at IS NULL OR expires_at > ?)`,
-        key, now,
-    ).Scan(&value)
-    if err == sql.ErrNoRows {
-        return nil, ErrNotFound
-    }
-    return value, err
-}
+```sql
+DELETE FROM root_kv
+WHERE key IN (
+    SELECT key FROM root_kv
+    WHERE expires_at IS NOT NULL AND expires_at <= ?
+    ORDER BY expires_at, key
+    LIMIT 1000
+);
 ```
 
-### 5.4 Delete / Has / Keys
+cleanup 失败记录稳定错误并等下一 tick，不关闭 Storage。Get/Has/Keys 的 expiry filter 保证失败期间也不会暴露过期值。
 
-```go
-func (s *SQLiteStorage) Delete(key string) error {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    _, err := s.db.Exec(`DELETE FROM kv_store WHERE key=?`, key)
-    return err
-}
+## 5. 拷贝、并发和关闭
 
-func (s *SQLiteStorage) Has(key string) (bool, error) {
-    var one int
-    now := time.Now().Unix()
-    err := s.db.QueryRow(
-        `SELECT 1 FROM kv_store WHERE key=? AND (expires_at IS NULL OR expires_at > ?)`,
-        key, now,
-    ).Scan(&one)
-    if err == sql.ErrNoRows {
-        return false, nil
-    }
-    return err == nil, err
-}
+- Set 在调用 SQL 前复制 value；Get 在 Scan 后返回新的 byte slice。
+- `database/sql` 与单连接负责序列化；v1 不增加应用层事务接口。
+- cleanup goroutine 退出前关闭 `done`；Close 使用 `sync.Once` 标记 closed、关闭 `stop`、等待 `<-done`，再关闭 DB。重复 Close 返回首次 close error。
+- Close 开始后所有公开方法返回 ErrClosed。
+- key/value 上限在共同 wrapper 中校验，SQLite 和 memory 后端一致。
 
-func (s *SQLiteStorage) Keys(prefix string) ([]string, error) {
-    now := time.Now().Unix()
-    pattern := prefix + "%"
-    rows, err := s.db.Query(
-        `SELECT key FROM kv_store WHERE key LIKE ? AND (expires_at IS NULL OR expires_at > ?)`,
-        pattern, now,
-    )
-    if err != nil {
-        return nil, err
-    }
-    defer rows.Close()
+## 6. Key 约定
 
-    var keys []string
-    for rows.Next() {
-        var k string
-        if err := rows.Scan(&k); err != nil {
-            return nil, err
-        }
-        keys = append(keys, k)
-    }
-    return keys, rows.Err()
-}
+v1 只有：
+
+```text
+session:<session-id> -> 完整 Session snapshot
 ```
 
-### 5.5 后台清理 & 关闭
+Session message 不拆 key，Memory item 不写入 `root_kv`。完整所有权见 [集成](integration.md)。
 
-```go
-func (s *SQLiteStorage) cleanupLoop() {
-    ticker := time.NewTicker(60 * time.Second)
-    defer ticker.Stop()
-    for {
-        select {
-        case <-s.stop:
-            return
-        case <-ticker.C:
-            now := time.Now().Unix()
-            s.db.Exec(`DELETE FROM kv_store WHERE expires_at IS NOT NULL AND expires_at <= ?`, now)
-        }
-    }
-}
+## 7. 备份与恢复
 
-func (s *SQLiteStorage) Close() error {
-    close(s.stop)
-    return s.db.Close()
-}
-```
+运行中备份使用 SQLite online backup API，或先停止写入、checkpoint WAL 后复制。恢复文件必须先通过 `PRAGMA integrity_check` 和 schema version 校验，再允许 Session Restore；失败时保留原文件，不自动丢弃 rows。
+
+## 8. 测试
+
+1. 两次 Set 保留 created_at、替换 value/TTL。
+2. Get/Has/Keys 同时隐藏刚过期但尚未物理删除的 key。
+3. 前缀含 `%`、`_`、Unicode 时仍按字面匹配并稳定排序。
+4. Delete 缺失 key 幂等；Close 两次幂等；Close 后方法返回 ErrClosed。
+5. migration、数据库忙、损坏 row 和 cleanup 失败均保留明确错误链。
 
 ---
 
-## 6. Key 命名约定
-
-建议上层模块使用冒号分层命名，便于 `Keys(prefix)` 查询：
-
-| Key 模式 | 用途 | 示例 |
-|---|---|---|
-| `agent:{id}:config` | Agent 配置 | `agent:default:config` |
-| `session:{id}:msg:{n}` | Session 消息 | `session:abc123:msg:0` |
-| `memory:{agentID}:{key}` | 长期记忆 | `memory:default:pref01` |
-| `skill:{name}:cache` | Skill 缓存 | `skill:weather:cache` |
-
----
-
-## 7. 配置
-
-```yaml
-runtime:
-  storage:
-    type: sqlite
-    path: ./data/yaa.db
-```
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `type` | string | `sqlite` | 存储类型标识 |
-| `path` | string | `./data/yaa.db` | 数据库文件路径 |
+*最后更新: 2026-07-22*

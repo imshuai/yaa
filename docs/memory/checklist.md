@@ -1,120 +1,66 @@
 # Memory 实现检查清单
 
-> 文档路径: `docs/memory/checklist.md`
-> 上级: `docs/memory/README.md` §9
+> 依据 [Memory 系统设计](README.md) 和 [配置参考](config-ref.md)。
 
 ---
 
-## Memory 接口
+## 模型与 API
 
-- [ ] `Memory` interface 定义（Add, Get, Search, Delete, Clear）
-- [ ] `MemoryItem` 结构体定义（Key, Content, Metadata, Layer, Score, CreatedAt, UpdatedAt, ExpiresAt）
-- [ ] `MemoryLayer` 枚举定义（LayerShortTerm, LayerLongTerm, LayerSummary）
-- [ ] `MemoryExtended` 扩展接口定义（AddBatch, SearchWithFilter, Update, ListByLayer, Count, Promote, Expire）
-- [ ] `MemoryFilter` 结构体定义（Layer, Metadata, After, Before, Tags）
-- [ ] 能力检测模式实现（类型断言 `mem.(MemoryExtended)`）
-- [ ] Key 命名规范校验（语义化路径，如 `user_preference:theme`）
-- [ ] Score 字段仅在 Search 返回时有意义，Add/Get 时为 0
+- [ ] `MemoryItem` 包含 AgentID、可选 SessionID、Layer、Key、Content、Metadata、时间、ExpiresAt、Version。
+- [ ] v1 只接受 `LayerLongTerm`，主键为 `(agent, layer, session, key)`。
+- [ ] 调用方 managed fields 必须为零；Manager 单次采样 now，Store 在事务内设置时间/Version。
+- [ ] `Put` 是唯一 upsert；Get/Delete 使用完整 Scope；返回值均深拷贝。
+- [ ] Search/Clear 的空 SessionID 仅表示 Agent 全范围；Limit 和排序确定。
+- [ ] Promote 复制到全局 scope、保留源、重新应用 default TTL；目标只发 promoted，committed victims 仍发 evicted。
+- [ ] `Manager.Close(ctx)` 拒绝新操作、停止 worker、等待 in-flight、只关闭 Store 一次，超时后后台关闭可继续。
+- [ ] `beginOp` 在 `lifecycleMu` 下完成 closing 检查与 `inFlight.Add(1)`；race test 覆盖并发操作和 Close。
 
-## 三层架构
+## 内容存储与索引
 
-- [ ] Short-term Memory — 当前 Session 消息历史，内存或 Storage 存储
-- [ ] Long-term Memory — 跨 Session 持久化，SQLite 或向量数据库
-- [ ] Summary Memory — Session 压缩摘要，由 Context Manager 生成
-- [ ] 三层记忆相互独立，各自有独立的存储和检索策略
-- [ ] Short-term → Long-term 自动晋升机制（Progressive Persistence）
-- [ ] Summary 生成触发条件（Token 阈值 / Session 关闭 / 手动触发）
-- [ ] 各层记忆的 Agent 隔离（Agent Scoped）
+- [ ] ContentStore 完整实现 CommitPut/Get/Search/List/Delete/Clear/DeleteExpired/Count/Ping/Close。
+- [ ] CommitPut 在一个 SQLite 事务/Memory 写锁中提交 target + victims，失败不修改任何 item/event/index。
+- [ ] SQLite 使用 pure Go driver，DDL、upsert、事务、时间与 metadata 编码有集成测试。
+- [ ] Memory 后端遵守相同主键、排序、过期和深拷贝语义。
+- [ ] VectorIndex 使用完整 ItemRef + Version 和 typed Session/global selector；scope 在 threshold/排序前过滤，命中必须回查 ContentStore。
+- [ ] VectorIndex 全部方法并发安全；factory 每次返回新的非 nil 空索引并由 Manager 持有。
+- [ ] Content 先提交，index 失败不回滚；Delete/Clear/Expire 后 index 失败不复活内容。
+- [ ] Reindex 只接收 AgentID，构建全 Agent 临时索引并原子替换，不丢失并发 Put/Delete。
+- [ ] vector disabled/初始化/失败/完整 Reindex 成功的状态依次遵循 ready/degraded/degraded/ready，API 全程使用 `IndexStatus`。
 
-## 存储后端
+## TTL 与容量
 
-- [ ] `MemoryStore` 接口定义（屏蔽存储差异）
-- [ ] SQLite 存储后端实现（默认）
-- [ ] 向量数据库存储后端实现（可选）
-- [ ] 外部服务存储后端实现（可选）
-- [ ] 存储后端通过配置切换，无需修改代码（Configurable Backend）
-- [ ] SQLite 表结构设计（memory_items 表，含 layer / metadata / timestamps）
-- [ ] 存储 TTL 与过期清理支持
-- [ ] 批量写入支持（AddBatch）
+- [ ] nil ExpiresAt 使用 default TTL；zero time pointer 永久；过去时间拒绝。
+- [ ] Get/Search/List/Count 隐藏已过期 item；cleanup 有稳定顺序、batch 和取消。
+- [ ] `max_items` 按 Agent 统计；fifo/ttl victim 和 tie-break 与文档一致。
+- [ ] 最终 count 计算覆盖新建、过期 row 恢复和未过期更新；target 排除在 victims 外，热缩后下一次 Put 原子收敛。
 
-## 向量搜索
+## 集成与失败
 
-- [ ] `Embedder` 接口定义（文本 → 向量）
-- [ ] 向量嵌入器实现（支持可配置的 Embedding Provider）
-- [ ] 向量索引存储（SQLite 向量扩展或外部向量库）
-- [ ] 语义相似度检索（cosine similarity）
-- [ ] Search 方法支持向量语义搜索
-- [ ] 向量搜索不可用时回退到关键词搜索（Graceful Degradation）
-- [ ] SearchWithFilter 支持元数据 + 向量联合检索
-- [ ] Embedding 缓存（避免重复计算）
-- [ ] 向量维度配置化
+- [ ] Agent 在 Context Build 前检索；Context 不主动访问 Memory。
+- [ ] Memory system message 只存在于请求副本，不写入 Session snapshot。
+- [ ] Session Close/Restore/Delete 不隐式摘要、Promote 或删除 Memory。
+- [ ] ContentStore 错误不吞掉、不写临时 fallback；向量 fallback 只由配置控制。
+- [ ] v1 除 Disabled 和 vector keyword fallback 外没有通用继续策略；其他 Memory 错误阻断 turn。
+- [ ] index degraded、Runtime Ready/Not Ready 和 Remote API 状态码符合 errors.md。
+- [ ] 锁顺序固定为 mutationGate → Agent keyed lock → index state；Promote 不重入 Agent lock。
 
-## 生命周期管理
+## 配置与可观测性
 
-- [ ] 记忆创建（Add 写入，记录 CreatedAt）
-- [ ] 记忆更新（Update 修改 Content / Metadata，更新 UpdatedAt）
-- [ ] 记忆晋升（Promote: Short-term → Long-term）
-- [ ] 记忆过期（ExpiresAt 零值表示永不过期）
-- [ ] 过期清理任务（Expire 方法，批量清理已过期记忆）
-- [ ] 记忆淘汰策略（LRU / 容量上限 / 手动 Delete）
-- [ ] 记忆清除（Clear 清除当前作用域所有记忆）
-- [ ] Session 关闭时的记忆处理（晋升或清除）
+- [ ] 根内容后端唯一 owner 为 `memory.storage.type`，只接受 `sqlite|memory`。
+- [ ] Agent 类型为 `*MemoryOverride`，所有 override scalar/vector 字段为 pointer。
+- [ ] Agent 不能覆盖 storage/embedding/cleanup，也不能在 root disabled 上启用。
+- [ ] hot/restart 字段与 config-ref/hot-reload 完全一致；strict decoder 拒绝未知字段。
+- [ ] Agent turn 显式复用同一 policy；Remote 每请求、cleanup 每 tick各捕获一个 Config snapshot。
+- [ ] Remote 仅 request deadline 映射 504；client cancel 不写响应，quota/closed 分别映射 429/503。
+- [ ] 事件只使用 canonical 8 种名称；指标统一 `yaa_memory_*` 且无高基数/敏感 label。
+- [ ] 健康只反映 content/embedder/index，不根据 Session 状态判断。
 
-## 集成
+## 文档门禁
 
-- [ ] `MemoryManager` 结构体定义（instances map, store, embedder, config, logger, mu）
-- [ ] `GetMemory(agentID)` — 获取 Agent 的 Memory 实例（懒加载）
-- [ ] `CloseAll()` — 关闭所有 Memory 实例，释放资源
-- [ ] 与 Session 集成 — Session 生命周期内记忆的读写
-- [ ] 与 Context Manager 集成 — 检索记忆注入 Context
-- [ ] 与 Agent 集成 — 每个 Agent 独立 Memory 空间
-- [ ] Summary 记忆由 Context Manager 压缩时生成并写入 Memory
-- [ ] 记忆注入 Context 的策略（检索后按需注入，非全量加载）
-
-## 配置
-
-- [ ] `MemoryConfig` 结构体定义（全局配置）
-- [ ] 存储后端配置（backend: sqlite / vector / external）
-- [ ] 向量搜索配置（embedder provider, 维度, 相似度阈值）
-- [ ] 过期清理配置（interval, batch_size）
-- [ ] Agent 级别 Memory 配置覆盖
-- [ ] 三级配置合并逻辑（全局 → Agent 级别 → Session 级别）
-- [ ] 淘汰策略配置（max_items, ttl, eviction_policy）
-- [ ] Embedding Provider 配置（model, api_key, endpoint）
-
-## 错误处理
-
-- [ ] `ErrMemoryNotFound` — 记忆不存在
-- [ ] `ErrMemoryAlreadyExists` — Key 已存在（当策略为报错时）
-- [ ] `ErrMemoryStoreUnavailable` — 存储后端不可用
-- [ ] `ErrMemoryEmbedFailed` — 向量嵌入失败
-- [ ] `ErrMemorySearchFailed` — 检索失败
-- [ ] 向量搜索失败回退关键词搜索（降级策略）
-- [ ] 存储后端不可用时的降级处理（内存临时存储）
-- [ ] 批量操作部分失败的错误聚合
-
-## 可观测性
-
-- [ ] 记忆操作日志（Add / Get / Search / Delete / Clear）
-- [ ] 记忆晋升日志（Promote）
-- [ ] 过期清理日志（Expire）
-- [ ] 指标: `memory_total` (Gauge, 按 Layer 分维度)
-- [ ] 指标: `memory_add_total` (Counter)
-- [ ] 指标: `memory_search_total` (Counter)
-- [ ] 指标: `memory_search_duration` (Histogram)
-- [ ] 指标: `memory_expire_total` (Counter)
-- [ ] 指标: `memory_promote_total` (Counter)
-- [ ] 指标: `memory_embed_duration` (Histogram)
-- [ ] `HealthCheck()` 方法 — Memory 系统健康检查
-- [ ] `MemoryHealthReport` 结构体（store 状态, embedder 状态, 记忆数量）
-- [ ] SSE 事件: `memory.added`
-- [ ] SSE 事件: `memory.searched`
-- [ ] SSE 事件: `memory.deleted`
-- [ ] SSE 事件: `memory.promoted`
-- [ ] SSE 事件: `memory.expired`
-- [ ] SSE 事件: `memory.error`
-- [ ] 调用链追踪（span: memory.add, memory.search, memory.promote）
+- [ ] Memory 全部文档不存在旧层级、旧写 API、未定义配置或重复 DTO。
+- [ ] fenced JSON/YAML 可解析，相对链接存在，Markdown fence 配对。
+- [ ] `git diff --check` 通过。
 
 ---
 
-*最后更新: 2025-07-17*
+*最后更新: 2026-07-22*

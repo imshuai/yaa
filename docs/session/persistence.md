@@ -1,244 +1,158 @@
 # Session 持久化与恢复
 
-> 文档路径: `docs/session/persistence.md`
-> 上级: `docs/session/README.md` §2
+> 上级: [Session 系统设计](README.md)
+> 底层接口: [Storage 系统设计](../storage/README.md)
 
 ---
 
-## 1. 概述
+## 1. 单一存储抽象
 
-Session 持久化确保 Runtime 重启后能够恢复所有 Session 数据，包括消息历史、状态和元数据。Yaa! 使用 Storage 抽象层，默认实现为 SQLite。
+Session 直接复用根 `storage.Storage`，不再定义 `SessionStore`、Session 专用 SQLite 表、异步写队列或第二套后端配置。
 
----
+| 项目 | 契约 |
+|------|------|
+| Key | `session:<session-id>`，例如 `session:ses_01J...` |
+| 枚举 | `store.Keys("session:")` |
+| 写入 | `store.Set(key, snapshot)`，不传 Storage TTL |
+| 删除 | `store.Delete(key)` |
+| 内容 | 带 `schema_version` 的完整 JSON snapshot |
 
-## 2. 存储接口
+Session 的 TTL 是生命周期 policy，只改变 Session 状态；不能使用 Storage TTL 自动删除 snapshot。
+
+## 2. Snapshot 格式
+
+编码只使用以下私有 DTO，不能直接 `json.Marshal(Session)`；这样字段名和 duration 格式不会受内存模型改变影响。`message` 内的 Tool name 必须已经是 canonical；Provider-safe alias 及 turn-local map 严禁写入 snapshot：
 
 ```go
-// SessionStore 定义 Session 的持久化接口。
-type SessionStore interface {
-    Save(sess *Session) error
-    Load(sessionID string) (*Session, error)
-    LoadByAgent(agentID string) ([]*Session, error)
-    LoadAll() ([]*Session, error)
-    Delete(sessionID string) error
-    Close() error
+const maxSessionSnapshotBytes = storage.MaxValueBytes
+
+type snapshotV1 struct {
+    SchemaVersion  int                 `json:"schema_version"`
+    ID             string              `json:"id"`
+    AgentID        string              `json:"agent_id"`
+    State          State               `json:"state"`
+    CreatedAt      time.Time           `json:"created_at"`
+    UpdatedAt      time.Time           `json:"updated_at"`
+    LastActivityAt time.Time           `json:"last_activity_at"`
+    Policy         policySnapshotV1    `json:"policy"`
+    Messages       []messageSnapshotV1 `json:"messages"`
+    UsedTurnIDs    []string            `json:"used_turn_ids"`
+    Metadata       map[string]any      `json:"metadata"`
 }
-```
 
----
+type policySnapshotV1 struct {
+    MaxMessages     int    `json:"max_messages"`
+    MaxMessageBytes int    `json:"max_message_bytes"`
+    TTL             string `json:"ttl"`
+    MaxLifetime     string `json:"max_lifetime"`
+    Persist         bool   `json:"persist"`
+}
 
-## 3. 存储格式
-
-### 3.1 SQLite 表结构
-
-```sql
-CREATE TABLE IF NOT EXISTS sessions (
-    id          TEXT PRIMARY KEY,
-    agent_id    TEXT NOT NULL,
-    state       INTEGER NOT NULL DEFAULT 0,
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL,
-    metadata    TEXT,             -- JSON
-    messages    TEXT              -- JSON array
-);
-
-CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_state ON sessions(state);
-```
-
-### 3.2 键值存储格式
-
-使用通用 Storage 接口时，Key 格式为：
-
-```
-session/{agentID}/{sessionID}     → Session JSON
-session/index/{agentID}           → []sessionID JSON
-```
-
----
-
-## 4. 序列化
-
-Session 序列化为 JSON 格式，兼容人类可读和机器解析：
-
-```go
-type sessionJSON struct {
+type messageSnapshotV1 struct {
     ID        string            `json:"id"`
-    AgentID   string            `json:"agent_id"`
-    State     int               `json:"state"`
-    Messages  []Message         `json:"messages"`
+    TurnID    string            `json:"turn_id"`
+    Message   provider.Message  `json:"message"`
     CreatedAt time.Time         `json:"created_at"`
-    UpdatedAt time.Time         `json:"updated_at"`
-    Metadata  map[string]any    `json:"metadata,omitempty"`
-}
-
-func (s *Session) MarshalJSON() ([]byte, error) {
-    return json.Marshal(sessionJSON{
-        ID:        s.ID,
-        AgentID:   s.AgentID,
-        State:     int(s.State),
-        Messages:  s.Messages,
-        CreatedAt: s.CreatedAt,
-        UpdatedAt: s.UpdatedAt,
-        Metadata:  s.Metadata,
-    })
-}
-
-func (s *Session) UnmarshalJSON(data []byte) error {
-    var sj sessionJSON
-    if err := json.Unmarshal(data, &sj); err != nil {
-        return err
-    }
-    s.ID = sj.ID
-    s.AgentID = sj.AgentID
-    s.State = SessionState(sj.State)
-    s.Messages = sj.Messages
-    s.CreatedAt = sj.CreatedAt
-    s.UpdatedAt = sj.UpdatedAt
-    s.Metadata = sj.Metadata
-    return nil
+    Metadata  map[string]any    `json:"metadata"`
 }
 ```
 
----
-
-## 5. 持久化策略
-
-| 策略 | 触发时机 | 说明 |
-|------|---------|------|
-| **同步写入** | `Create()` / `Close()` / `Delete()` | 低频操作，同步确保一致性 |
-| **异步写入** | `AppendMessage()` / `UpdateMetadata()` | 高频操作，通过写入队列异步处理 |
-| **批量写入** | 定时器触发 | 积攒变更后批量 flush |
-
-```go
-type writeQueue struct {
-    ch     chan *Session
-    store  SessionStore
-    logger *slog.Logger
-    wg     sync.WaitGroup
-}
-
-func (q *writeQueue) run(ctx context.Context) {
-    q.wg.Add(1)
-    defer q.wg.Done()
-
-    batch := make(map[string]*Session)
-    ticker := time.NewTicker(2 * time.Second)
-    defer ticker.Stop()
-
-    flush := func() {
-        if len(batch) == 0 {
-            return
-        }
-        for _, sess := range batch {
-            if err := q.store.Save(sess); err != nil {
-                q.logger.Error("persist session failed",
-                    "session_id", sess.ID, "err", err)
-            }
-        }
-        batch = make(map[string]*Session)
+```json
+{
+  "schema_version": 1,
+  "id": "ses_01J...",
+  "agent_id": "default",
+  "state": "active",
+  "created_at": "2026-07-22T01:00:00Z",
+  "updated_at": "2026-07-22T01:01:00Z",
+  "last_activity_at": "2026-07-22T01:01:00Z",
+  "policy": {
+    "max_messages": 1000,
+    "max_message_bytes": 10485760,
+    "ttl": "24h0m0s",
+    "max_lifetime": "720h0m0s",
+    "persist": true
+  },
+  "messages": [
+    {
+      "id": "msg_01J...",
+      "turn_id": "turn_01J...",
+      "message": {
+        "role": "user",
+        "content": "hello"
+      },
+      "created_at": "2026-07-22T01:01:00Z",
+      "metadata": {}
     }
-
-    for {
-        select {
-        case <-ctx.Done():
-            flush()
-            return
-        case sess := <-q.ch:
-            batch[sess.ID] = sess
-        case <-ticker.C:
-            flush()
-        }
-    }
+  ],
+  "used_turn_ids": ["turn_01J..."],
+  "metadata": {}
 }
 ```
 
----
+Snapshot 必须包含解析后的 policy，不能只保存 override 或在恢复时重新读取当前配置。编码时用 `Duration.String()` 生成 duration；解码时用 `time.ParseDuration` 严格解析。时间先规范化为 UTC，再由 `time.Time` 编码为 RFC 3339 Nano。`SessionMessage.TurnID/Payload` 显式映射到 DTO 的 `turn_id/message` 字段。`used_turn_ids` 是已提交 user 的精确 tombstone 集，编码前按字节升序排序；消息删除和 Clear 不移除它，只有物理删除 Session 才释放。
 
-## 6. 启动恢复流程
+解码要求：
+
+- 拒绝未知 `schema_version`、非法枚举、空 ID、Agent 不匹配和未知 JSON 字段；
+- 校验 key 后缀与 snapshot `id` 相同；
+- 校验所有 Message ID 唯一、每条 Turn ID 合法、消息序列和 Tool unit 完整；
+- `used_turn_ids` 必须有序、无重复且包含每条 persisted user 的 Turn ID；每个非 user 消息的 Turn ID 必须对应此前或同批 user；
+- 校验 resolved policy，但不将当前配置默认值重新覆盖进去；Tool name 只校验 canonical 格式、消息序列和 unit 关联，不要求当前 Tool Manager 仍注册该名称；
+- `metadata: null` 和 `messages: null` 规范化为空 map/slice 后再发布。
+- JSON 编码结果不得超过 `maxSessionSnapshotBytes`；解码 persisted byte slice 前也先检查 `len(raw)`，拒绝历史或外部写入的超限 value。
+
+## 3. 同步提交协议
+
+所有变更使用 copy-on-write 候选快照：
 
 ```text
-Runtime 启动
-  │
-  ├─ 1. 打开 Storage 连接
-  │
-  ├─ 2. SessionManager.RestoreAll()
-  │     │
-  │     ├─ store.LoadAll() → []*Session
-  │     │
-  │     ├─ 遍历每个 Session：
-  │     │   ├─ 重建内存索引 (sessions map, agentIdx map)
-  │     │   ├─ 状态修正：
-  │     │   │   ├─ Created → 保持 Created（无消息的空会话）
-  │     │   │   ├─ Active → 保持 Active
-  │     │   │   └─ Paused → 保持 Paused
-  │     │   └─ Closed → 加载但不注册到活跃索引
-  │     │
-  │     └─ 记录恢复统计日志
-  │
-  ├─ 3. 恢复 WebSocket/SSE 连接（客户端重连后重新绑定 Session）
-  │
-  └─ 4. Runtime Ready
+读取当前只读快照
+  → 深拷贝并校验候选状态
+  → persist=true: JSON encode + 16 MiB check + Storage.Set
+  → 原子替换内存快照/索引
+  → 发布一次事件
 ```
 
-```go
-func (m *Manager) RestoreAll() error {
-    sessions, err := m.store.LoadAll()
-    if err != nil {
-        return fmt.Errorf("load sessions: %w", err)
-    }
+编码失败返回 `ErrPersistenceFailed`。编码结果超过 16 MiB 时返回同时包装 `ErrPersistenceFailed` 与 `ErrSessionSnapshotTooLarge` 的错误，且不调用 Storage。Storage 的共同 wrapper 也必须以 `storage.ErrValueTooLarge` 防御绕过。
 
-    m.mu.Lock()
-    defer m.mu.Unlock()
+`storage.Storage` 不接受 context，提交点语义固定为：进入 FIFO task 和调用 `Storage.Set`/`Storage.Delete` 前各检查一次 `ctx.Err()`；一旦开始 Storage mutation 就不可中断。`Set` 成功后必须发布相同候选内存 snapshot；`Delete` 成功后必须完成索引和 runner 删除，即使 context 此时刚被取消。两者都返回成功，使持久状态与内存状态不会分叉。Storage mutation 返回失败时内存、时间字段、计数和事件均保持不变。
 
-    restored := 0
-    for _, sess := range sessions {
-        m.sessions[sess.ID] = sess
-        m.agentIdx[sess.AgentID] = append(
-            m.agentIdx[sess.AgentID], sess.ID)
+禁止“先改内存、后台重试”或静默降级为纯内存，这会造成重启后的历史回退。
 
-        if sess.State != SessionStateClosed {
-            restored++
-        }
-    }
+`persist=false` 时跳过 Storage 步骤，但仍使用同一候选快照和原子内存替换流程。
 
-    m.logger.Info("sessions restored",
-        "total", len(sessions), "active", restored)
-    return nil
-}
-```
+## 4. Create、Update 和 Delete
+
+| 操作 | Storage 顺序 | 内存顺序 |
+|------|--------------|----------|
+| Create | `Set` 成功 | 加入 `sessions` 和 Agent 索引 |
+| Append / 状态 / metadata | `Set` 候选 snapshot 成功 | 替换当前 snapshot |
+| Close | `Set` Closed snapshot 成功 | 替换状态并释放 active capacity |
+| Delete | `Delete` 成功 | 移除 snapshot、索引和 runner |
+
+对 `persist=false` 的 Delete 不调用 Storage。`Storage.Delete` 对不存在 key 应幂等，但 Manager 仍需先确认内存 Session 存在，否则返回 `ErrSessionNotFound`。
+
+## 5. Restore
+
+`Restore(ctx, now)` 使用 `Keys("session:")` 读取所有 snapshot。为避免部分可见状态：
+
+1. 在临时 map 中完整加载和验证所有记录。
+2. 按 [生命周期](lifecycle.md#5-启动恢复) 重新评估 TTL 和 max lifetime。
+3. 同步写回需要状态修正的记录。
+4. 从每条记录的 `used_turn_ids` 重建判重索引；全部成功后一次替换 Manager 的空索引。
+
+任一损坏记录、Turn ID 冲突、未知 schema 或必要写回失败都返回 `ErrRestoreFailed`，Runtime 保持 Not Ready；不得跳过损坏记录后宣称恢复成功。日志可以记录失败 key，但不能记录消息内容或 Turn ID。
+
+v1 只读取 `schema_version=1`。未来迁移必须先生成可恢复备份，再以独立、可重试步骤升级；不能在普通读取路径中隐式迁移。
+
+## 6. 崩溃语义
+
+- `Storage.Set` 返回成功而进程在内存发布前崩溃：重启后恢复新 snapshot，允许。
+- `Storage.Set` 返回失败：旧 snapshot 仍是权威状态。
+- 事件发布失败不回滚已提交 snapshot；记录 `session.error` 指标并继续，因为事件总线不是数据源。
+- Storage 关闭由 Runtime 统一负责，Session Manager 不调用 `Close()`。
 
 ---
 
-## 7. 数据一致性
-
-| 场景 | 处理方式 |
-|------|---------|
-| Runtime 崩溃 | 异步写入可能丢失最近 2s 变更，重启后从 Storage 恢复 |
-| 写入失败 | 重试 3 次，仍失败则记录错误日志，内存数据保留 |
-| 并发写入 | 同一 Session 串行处理（见 concurrency.md） |
-| 存储损坏 | SQLite WAL 模式提供崩溃恢复；定期 VACUUM 优化 |
-
----
-
-## 8. 存储迁移
-
-```go
-// Migrate 检查并执行存储迁移。
-func (s *SQLiteStore) Migrate() error {
-    // 检查表是否存在，不存在则创建
-    // 检查列是否存在，不存在则 ALTER TABLE ADD COLUMN
-    // 版本号记录在 schema_version 表中
-    return s.db.Ping()
-}
-```
-
-| 版本 | 变更 |
-|------|------|
-| v1 | 初始 schema |
-| v2 | 新增 `metadata` 列 |
-| v3 | 新增 `messages` JSON 列（替代独立 messages 表） |
-
----
-
-*最后更新: 2025-07-17*
+*最后更新: 2026-07-23*

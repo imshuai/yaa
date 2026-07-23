@@ -1,106 +1,35 @@
 # Tool API
 
-> [← 返回索引](./INDEX.md)
-
----
+> [返回索引](INDEX.md) · canonical 类型见 [Tool Manager](../tool/manager.md#21-toolinfo)
 
 ## GET /api/v1/tools
 
-列出所有已注册的内置 Tool。
-
-**响应 data:**
+列出 Tool Manager 中所有来源的 Tool，包括 `builtin`、`plugin` 和 `mcp`。数量受配置与已连接扩展限制，不分页。
 
 ```json
 {
   "items": [
     {
-      "name": "web_search",
-      "description": "Search the web for information",
-      "category": "web",
-      "enabled": true
-    },
-    {
-      "name": "file_read",
-      "description": "Read file contents",
-      "category": "filesystem",
-      "enabled": true
+      "name": "http",
+      "description": "Send an HTTP request",
+      "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+      "enabled": true,
+      "source": "builtin"
     }
-  ],
-  "total": 2
+  ]
 }
 ```
 
-> Tool 列表不分页，数量有限，一次性返回。
-
----
+字段逐一映射 `tool.ToolInfo`；`name` 始终是 canonical Tool name，可能包含 MCP 点分命名空间，不能替换为 turn-local Provider alias。Schema 字段名是 `parameters`，没有另造的 `category`。
 
 ## GET /api/v1/tools/:name
 
-获取 Tool 详情，包含完整的参数 Schema。
+`:name` 按 canonical Tool name 精确、大小写敏感寻址。返回一个完整 `ToolInfo`；不存在返回 404 / `40401`。`parameters` 必须是有效 JSON Schema，服务端直接返回 Manager 注册时保存的深拷贝。Provider alias 不是资源 ID。
 
-**响应 data:**
+## 执行边界
 
-```json
-{
-  "name": "web_search",
-  "description": "Search the web for information",
-  "category": "web",
-  "enabled": true,
-  "schema": {
-    "type": "object",
-    "properties": {
-      "query": {
-        "type": "string",
-        "description": "Search query"
-      },
-      "count": {
-        "type": "integer",
-        "description": "Number of results",
-        "default": 5
-      }
-    },
-    "required": ["query"]
-  }
-}
-```
+v1 没有 `POST /api/v1/tools/:name/execute`。`tool.Manager.Execute` 需要 `agentID` 才能应用 Agent Tool 白名单、超时和审计；绕过 Agent principal 的调试端点会产生第二套权限模型。客户端通过 Session 对话让 Agent 调用 Tool。
 
 ---
 
-## POST /api/v1/tools/:name/execute
-
-直接调用 Tool，用于调试和测试。不经过 Agent / LLM，直接执行并返回结果。
-
-**请求 Body:**
-
-```json
-{
-  "arguments": {
-    "query": "Go 1.25 release notes",
-    "count": 3
-  }
-}
-```
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `arguments` | object | ✅ | 工具参数，需匹配 Tool 的 Schema |
-
-**响应 data:**
-
-```json
-{
-  "tool": "web_search",
-  "arguments": { "query": "Go 1.25 release notes", "count": 3 },
-  "result": {
-    "results": [
-      { "title": "Go 1.25 Release Notes", "url": "https://go.dev/doc/go1.25", "snippet": "..." }
-    ]
-  },
-  "duration_ms": 340
-}
-```
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `result` | any | 工具执行结果，结构因工具而异 |
-| `duration_ms` | int | 执行耗时（毫秒） |
+*最后更新: 2026-07-22*

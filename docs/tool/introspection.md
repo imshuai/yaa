@@ -1,73 +1,49 @@
-# 内置 Tool — 内视与管理类
+# 内置 Tool - 只读内视
 
 > 文档路径: docs/tool/introspection.md
-> 上级: docs/tool/builtin.md 6.5-6.7
+> 上级: [内置 Tool](builtin.md)
 
 ---
 
-### 6.5 内视（Introspection）系列工具
+## 1. v1 边界
 
-内视工具让 Agent 能够**自我认知**——了解自身运行状态、资源占用、组件健康状况。这是 Agent Runtime 区别于简单 Chat 应用的核心能力。
+内视 Tool 只把现有 Runtime/Manager snapshot 投影为有界 JSON 文本，不建立第二套 Registry、状态缓存或权限系统。所有调用仍经过 `tool.Manager.Execute` 的 Agent allowlist、timeout、并发和结果上限。
 
-#### 6.5.1 runtime_status
+v1 不提供：
 
-查询 Yaa! 运行时的整体状态。
+- Skill install/uninstall/enable/disable/reload；
+- Provider health probe、health cache、rate-limit cache 或 failover；
+- goroutine dump、System Prompt、消息正文、Tool result、配置 options 或 Secret；
+- `log_query` 或 `metric_query`。当前架构没有日志存储或时序数据库；日志与指标由配置的外部 sink 消费。
 
-```go
-type RuntimeStatusTool struct {
-    runtime *Runtime
-}
-```
+所有参数 Schema 都设置 `additionalProperties:false`。列表按稳定主键升序；空 slice 编码为 `[]`。不存在的资源返回 `ToolResult{IsError:true}`，Manager/context 错误仍作为硬错误返回。以下 Agent、Session、Tool 和 Skill 视图都以 `Execute` 收到的 `ExecutionScope.AgentID` 为唯一 caller；参数不能选择其他 Agent。
 
-**Parameters Schema：**
+## 2. runtime_status
+
+参数是空 object：
 
 ```json
 {
   "type": "object",
-  "properties": {
-    "detail": {
-      "type": "string",
-      "enum": ["summary", "full"],
-      "description": "summary: key metrics only. full: includes goroutine dump, memory breakdown, etc.",
-      "default": "summary"
-    }
-  }
+  "properties": {},
+  "additionalProperties": false
 }
 ```
 
-**返回示例：**
+返回固定摘要：
 
 ```json
 {
   "version": "0.1.0",
+  "go_version": "go1.20.14",
   "uptime_seconds": 86400,
-  "start_time": "2026-07-14T17:12:00Z",
-  "go_version": "go1.25.11",
-  "arch": "arm",
-  "os": "linux",
-  "memory": {
-    "alloc_bytes": 134217728,
-    "sys_bytes": 268435456,
-    "gc_count": 42,
-    "gc_pause_ms": 1.2
-  },
-  "goroutines": 128,
-  "active_sessions": 5,
-  "active_agents": 3,
-  "total_requests": 15234,
-  "total_tool_calls": 8921,
-  "total_tokens": {
-    "input": 4523000,
-    "output": 893000
-  }
+  "ready": true
 }
 ```
 
-#### 6.5.2 agent_list
+`version`/`go_version` 来自构建信息，uptime 使用 Runtime 启动时刻计算，`ready` 与 `GET /api/v1/health` 读取同一状态。没有 `detail` 或 `full` 模式。
 
-列出所有注册的 Agent 及其状态。
-
-**Parameters Schema：**
+## 3. agent_list
 
 ```json
 {
@@ -75,168 +51,93 @@ type RuntimeStatusTool struct {
   "properties": {
     "status": {
       "type": "string",
-      "enum": ["active", "idle", "error", "all"],
-      "default": "all"
+      "enum": ["running", "paused", "stopped"]
     }
-  }
+  },
+  "additionalProperties": false
 }
 ```
 
-**返回示例：**
+调用 `agent.Manager.Get(scope.AgentID)`，因此最多返回 caller Agent 自身。省略 `status` 表示不过滤；若 caller 状态不匹配则返回空 `items`。格式固定：
 
 ```json
 {
-  "agents": [
+  "items": [
     {
       "id": "default",
-      "name": "Default Assistant",
-      "status": "active",
-      "active_sessions": 2,
-      "total_sessions": 156,
-      "provider": "deepseek",
-      "model": "deepseek-chat",
-      "tools_count": 12,
-      "skills_count": 3
+      "name": "Default Agent",
+      "provider": "openai",
+      "model": "gpt-4o",
+      "status": "running"
     }
   ]
 }
 ```
 
-#### 6.5.3 agent_inspect
+状态枚举与 Remote `AgentSummaryView` 相同。
 
-查看指定 Agent 的详细信息。
+## 4. agent_inspect
 
-**Parameters Schema：**
+```json
+{
+  "type": "object",
+  "properties": {},
+  "additionalProperties": false
+}
+```
+
+调用 `agent.Manager.Inspect(scope.AgentID)`，返回 caller 摘要及已授权的 Tool/Skill 名称：
+
+```json
+{
+  "id": "default",
+  "name": "Default Agent",
+  "provider": "openai",
+  "model": "gpt-4o",
+  "status": "running",
+  "tools": ["http", "shell"],
+  "skills": ["weather"],
+  "memory_enabled": true,
+  "planner_enabled": false
+}
+```
+
+Tool 名称来自 `tool.Manager.ListForAgent(scope.AgentID)`，Skill 名称来自 `skill.Manager.ResolveForAgent(scope.AgentID)`。结果不包含 System Prompt、Session、Context、options 或配置 Secret。
+
+## 5. session_list
 
 ```json
 {
   "type": "object",
   "properties": {
-    "agent_id": {
+    "state": {
       "type": "string",
-      "description": "Agent ID to inspect"
+      "enum": ["created", "active", "paused", "closed"]
     },
-    "include_sessions": {
-      "type": "boolean",
-      "default": true
-    },
-    "include_context": {
-      "type": "boolean",
-      "default": false,
-      "description": "If true, include recent context messages (may be large)"
-    }
+    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}
   },
-  "required": ["agent_id"]
+  "additionalProperties": false
 }
 ```
 
-**返回内容：**
+调用 `session.Manager.List(ctx, scope.AgentID, query)`，按 `created_at` 降序、ID 降序，最多返回 `limit` 项。每项只包含 `id`、`agent_id`、`state`、`message_count`、`created_at` 和 `updated_at`；不返回 metadata 或消息。
 
-- Agent 基础信息（ID、名称、状态、创建时间）
-- 绑定的 Provider 和 Model
-- 可用 Tool 列表及权限状态
-- 已加载 Skill 列表
-- 活跃 Session 列表及摘要
-- Token 使用统计
-- 最近错误记录
-
-#### 6.5.4 session_list
-
-列出活跃 Session 及摘要信息。
-
-**Parameters Schema：**
+## 6. session_inspect
 
 ```json
 {
   "type": "object",
   "properties": {
-    "agent_id": {
-      "type": "string",
-      "description": "Filter by agent ID. Empty = all agents."
-    },
-    "status": {
-      "type": "string",
-      "enum": ["active", "closed", "all"],
-      "default": "active"
-    },
-    "limit": {
-      "type": "integer",
-      "default": 20
-    }
-  }
-}
-```
-
-**返回示例：**
-
-```json
-{
-  "sessions": [
-    {
-      "id": "sess_abc123",
-      "agent_id": "default",
-      "status": "active",
-      "created_at": "2026-07-15T10:00:00Z",
-      "last_active": "2026-07-15T17:10:00Z",
-      "message_count": 24,
-      "token_usage": {
-        "input": 12000,
-        "output": 3400,
-        "total": 15400
-      },
-      "context_tokens": 15400,
-      "max_context_tokens": 64000
-    }
-  ]
-}
-```
-
-#### 6.5.5 session_inspect
-
-查看指定 Session 的详细信息，包括上下文和消息历史。
-
-**Parameters Schema：**
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "session_id": {
-      "type": "string",
-      "description": "Session ID to inspect"
-    },
-    "include_messages": {
-      "type": "boolean",
-      "default": true
-    },
-    "message_limit": {
-      "type": "integer",
-      "default": 50,
-      "description": "Max messages to return"
-    },
-    "include_tool_results": {
-      "type": "boolean",
-      "default": false,
-      "description": "If true, include tool call results in messages"
-    }
+    "session_id": {"type": "string", "minLength": 1}
   },
-  "required": ["session_id"]
+  "required": ["session_id"],
+  "additionalProperties": false
 }
 ```
 
-**返回内容：**
+调用 `session.Manager.Get` 后必须验证 `Session.AgentID == scope.AgentID`；不匹配与不存在使用相同的 `ToolResult{IsError:true}`，避免跨 Agent 枚举。成功时返回与 `session_list` 相同的固定元数据字段。v1 不接受 `include_messages`、`include_context` 或 `include_tool_results`。
 
-- Session 基础信息（ID、Agent、状态、创建/最后活跃时间）
-- 上下文统计（消息数、Token 用量、上下文窗口使用率）
-- 消息历史（按 `message_limit` 截断，支持排除 Tool 结果以减少体积）
-- Provider/Model 信息
-- Token 消耗明细
-
-#### 6.5.6 tool_list
-
-列出所有已注册 Tool 及其状态。
-
-**Parameters Schema：**
+## 7. tool_list
 
 ```json
 {
@@ -244,458 +145,97 @@ type RuntimeStatusTool struct {
   "properties": {
     "source": {
       "type": "string",
-      "enum": ["builtin", "plugin", "mcp", "all"],
-      "default": "all"
-    },
-    "enabled_only": {
-      "type": "boolean",
-      "default": false
+      "enum": ["builtin", "plugin", "mcp"]
     }
-  }
+  },
+  "additionalProperties": false
 }
 ```
 
-**返回示例：**
+过滤并返回 `tool.Manager.ListForAgent(scope.AgentID) []ToolInfo`；因此结果天然只含 enabled 且授权的 Tool：
 
 ```json
 {
-  "tools": [
-    {
-      "name": "shell",
-      "description": "Execute shell commands",
-      "source": "builtin",
-      "enabled": true,
-      "timeout": "60s",
-      "registered_agents": ["default", "dev-agent"]
-    },
+  "items": [
     {
       "name": "http",
-      "description": "Send HTTP requests",
-      "source": "builtin",
+      "description": "Send an HTTP request",
+      "parameters": {"type": "object", "properties": {"url": {"type": "string"}}},
       "enabled": true,
-      "timeout": "30s"
+      "source": "builtin"
     }
   ]
 }
 ```
 
-#### 6.5.7 skill_list
-
-列出已安装 Skill 及加载状态。
-
-**Parameters Schema：**
+## 8. skill_list
 
 ```json
 {
   "type": "object",
-  "properties": {
-    "status": {
-      "type": "string",
-      "enum": ["loaded", "unloaded", "error", "all"],
-      "default": "all"
-    }
-  }
+  "properties": {},
+  "additionalProperties": false
 }
 ```
 
-**返回示例：**
+结果由 `skill.Manager.ResolveForAgent(scope.AgentID)` 投影为与 Remote `SkillSummary` 相同的安全字段；只包含 caller 已绑定且 loaded 的 Skill：
 
 ```json
 {
-  "skills": [
+  "items": [
     {
       "name": "weather",
       "description": "Get current weather and forecasts",
-      "status": "loaded",
-      "version": "1.2.0",
-      "tools_provided": ["weather_query", "weather_forecast"],
-      "agents_bound": ["default"]
+      "version": "1.0.0",
+      "status": "loaded"
     }
   ]
 }
 ```
 
-#### 6.5.8 provider_list
+不返回 Prompt、Path、options、Agent binding 或虚构的 `tools_provided`。
 
-列出已注册 Provider 及其模型和健康状态。
+## 9. provider_list
 
-**Parameters Schema：**
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "include_models": {
-      "type": "boolean",
-      "default": true,
-      "description": "If true, include available models for each provider"
-    }
-  }
-}
-```
-
-**返回示例：**
+参数是空 object。返回 `provider.Manager.List() []ProviderInfo`，不执行网络请求：
 
 ```json
 {
-  "providers": [
+  "items": [
     {
-      "name": "deepseek",
+      "id": "openai",
       "type": "openai",
-      "base_url": "https://api.deepseek.com/v1",
-      "status": "healthy",
-      "last_check": "2026-07-15T17:11:00Z",
-      "latency_ms": 234,
-      "models": ["deepseek-chat", "deepseek-reasoner"],
-      "default_model": "deepseek-chat",
-      "rate_limit": {
-        "requests_per_minute": 60,
-        "tokens_per_minute": 100000
-      }
+      "models": [{"id": "gpt-4o", "name": "GPT-4o"}]
     }
   ]
 }
 ```
 
-#### 6.5.9 mcp_list
+完整 model item 使用 canonical `provider.ModelInfo`。不返回 API key、base URL、health、latency、rate limit 或 default model。
 
-列出 MCP Server 连接状态。
-
-**Parameters Schema：**
+## 10. mcp_list
 
 ```json
 {
   "type": "object",
   "properties": {
-    "server_name": {
-      "type": "string",
-      "description": "Filter by server name. Empty = all servers."
-    }
-  }
-}
-```
-
-**返回示例：**
-
-```json
-{
-  "mcp_servers": [
-    {
-      "name": "filesystem",
-      "transport": "stdio",
-      "status": "connected",
-      "tools_count": 4,
-      "tools": ["read_file", "write_file", "list_dir", "search_files"],
-      "last_ping": "2026-07-15T17:11:30Z",
-      "uptime_seconds": 3600
-    }
-  ]
-}
-```
-
-#### 6.5.10 log_query
-
-查询运行时日志，支持级别、时间范围、关键词过滤。
-
-**Parameters Schema：**
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "level": {
-      "type": "string",
-      "enum": ["debug", "info", "warn", "error"],
-      "default": "info"
-    },
-    "since": {
-      "type": "string",
-      "description": "Start time (RFC3339 or relative like '1h', '30m')"
-    },
-    "until": {
-      "type": "string",
-      "description": "End time (RFC3339 or relative). Empty = now."
-    },
-    "keyword": {
-      "type": "string",
-      "description": "Keyword to filter log messages"
-    },
-    "component": {
-      "type": "string",
-      "description": "Filter by component (e.g. 'tool', 'provider', 'agent')"
-    },
-    "limit": {
-      "type": "integer",
-      "default": 50,
-      "max": 500
-    }
-  }
-}
-```
-
-**返回内容：**
-
-- 匹配的日志条目列表（时间、级别、组件、消息、附加字段）
-- 按 `limit` 截断，超限时返回总数和是否截断的标记
-- 支持相对时间（如 `since: "1h"` 表示最近 1 小时）
-
-#### 6.5.11 metric_query
-
-查询运行时指标。
-
-**Parameters Schema：**
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "metric": {
-      "type": "string",
-      "description": "Metric name. Empty = return all available metric names.",
-      "default": ""
-    },
-    "since": {
-      "type": "string",
-      "description": "Start time for time-series data"
-    },
-    "until": {
-      "type": "string",
-      "description": "End time. Empty = now."
-    },
-    "step": {
-      "type": "string",
-      "description": "Aggregation step for time-series (e.g. '1m', '5m', '1h')",
-      "default": "5m"
-    },
-    "labels": {
-      "type": "object",
-      "description": "Label filters, e.g. {\"tool\": \"shell\"}"
-    }
-  }
-}
-```
-
-**可用指标：**
-
-| 指标 | 类型 | 说明 |
-|------|------|------|
-| `tool.calls_total` | Counter | Tool 调用总次数 |
-| `tool.calls_duration` | Histogram | Tool 执行耗时分布 |
-| `tool.calls_errors` | Counter | Tool 执行错误次数 |
-| `tool.concurrent` | Gauge | 当前并发执行数 |
-| `provider.requests_total` | Counter | Provider 请求总数 |
-| `provider.requests_duration` | Histogram | Provider 请求耗时 |
-| `provider.tokens_input` | Counter | 输入 Token 总数 |
-| `provider.tokens_output` | Counter | 输出 Token 总数 |
-| `provider.errors` | Counter | Provider 错误次数 |
-| `session.active` | Gauge | 活跃 Session 数 |
-| `runtime.memory_alloc` | Gauge | 内存分配量 |
-| `runtime.goroutines` | Gauge | Goroutine 数量 |
-
-
-### 6.6 管理系列工具
-
-管理系列工具让 Agent 能够执行**管理操作**——安装/卸载 Skill、探测 Provider 健康状态等。
-
-#### 6.6.1 skill_install
-
-安装一个 Skill。
-
-**Parameters Schema：**
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "source": {
-      "type": "string",
-      "description": "Skill source: local path, git URL, or registry name"
-    },
-    "name": {
-      "type": "string",
-      "description": "Skill name (for registry lookup). Optional if source is a direct path/URL."
-    },
-    "version": {
-      "type": "string",
-      "description": "Specific version to install. Empty = latest."
-    },
-    "auto_bind": {
-      "type": "boolean",
-      "default": true,
-      "description": "If true, automatically bind the skill to the calling agent."
-    }
+    "server_name": {"type": "string", "minLength": 1}
   },
-  "required": ["source"]
+  "additionalProperties": false
 }
 ```
 
-**行为：**
+过滤并返回 `mcp.Manager.List() []ServerStatus`。省略 `server_name` 返回全部；结果字段与 Remote MCP 列表相同，不包含 command、args、URL、headers、env 或 Token。
 
-- 从本地路径、Git URL 或 Registry 下载 Skill
-- 解压到 skills 目录
-- 加载 Skill 的 Tool 和配置
-- `auto_bind=true` 时自动将 Skill 的 Tool 绑定到当前 Agent
+## 11. 最小验证
 
-#### 6.6.2 skill_uninstall
-
-卸载一个 Skill。
-
-**Parameters Schema：**
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "name": {
-      "type": "string",
-      "description": "Skill name to uninstall"
-    },
-    "force": {
-      "type": "boolean",
-      "default": false,
-      "description": "If true, uninstall even if bound to active agents."
-    },
-    "keep_files": {
-      "type": "boolean",
-      "default": false,
-      "description": "If true, keep skill files on disk, only unregister."
-    }
-  },
-  "required": ["name"]
-}
-```
-
-**行为：**
-
-- 从 Tool Manager 注销 Skill 提供的所有 Tool
-- 从所有 Agent 解绑
-- `force=false` 时，如果 Skill 绑定到活跃 Agent 则拒绝卸载
-- `keep_files=false` 时删除 Skill 目录
-
-#### 6.6.3 skill_enable / skill_disable
-
-启用或禁用一个已安装的 Skill。
-
-**Parameters Schema (skill_enable)：**
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "name": {
-      "type": "string",
-      "description": "Skill name to enable"
-    },
-    "agent_id": {
-      "type": "string",
-      "description": "Agent ID to bind. Empty = all agents."
-    }
-  },
-  "required": ["name"]
-}
-```
-
-**Parameters Schema (skill_disable)：**
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "name": {
-      "type": "string",
-      "description": "Skill name to disable"
-    },
-    "agent_id": {
-      "type": "string",
-      "description": "Agent ID to unbind from. Empty = all agents."
-    }
-  },
-  "required": ["name"]
-}
-```
-
-**行为：**
-
-- `skill_enable` — 注册 Skill 的 Tool 到 Tool Manager，绑定到指定 Agent
-- `skill_disable` — 从指定 Agent 解绑，注销 Tool（但保留 Skill 文件和配置）
-- 禁用是运行时操作，不修改磁盘配置
-
-#### 6.6.4 provider_health
-
-主动探测 Provider 健康状态。
-
-**Parameters Schema：**
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "provider": {
-      "type": "string",
-      "description": "Provider name to check. Empty = check all providers."
-    },
-    "timeout": {
-      "type": "integer",
-      "description": "Probe timeout in seconds",
-      "default": 10
-    }
-  }
-}
-```
-
-**返回示例：**
-
-```json
-{
-  "providers": [
-    {
-      "name": "deepseek",
-      "status": "healthy",
-      "latency_ms": 234,
-      "models_available": ["deepseek-chat", "deepseek-reasoner"],
-      "rate_limit_remaining": 45,
-      "rate_limit_reset": "2026-07-15T17:12:00Z",
-      "error": null
-    },
-    {
-      "name": "openai",
-      "status": "unhealthy",
-      "latency_ms": 0,
-      "error": "connection timeout"
-    }
-  ]
-}
-```
-
-**行为：**
-
-- 向 Provider 发送轻量级探测请求（如 `/models` 端点）
-- 记录响应延迟
-- 检查速率限制头
-- 更新 Provider 的健康状态缓存
-- 可作为故障转移的决策依据
-
-### 6.7 内置 Tool 安全策略汇总
-
-| Tool | 安全机制 |
-|------|---------|
-| `shell` | 命令白/黑名单、工作目录限制、输出截断 |
-| `http` | 域名白/黑名单、重定向限制、响应截断 |
-| `file_read/write/list/delete` | 路径白/黑名单、文件大小限制 |
-| `config_query` | 敏感字段自动脱敏 |
-| `config_set` | 路径白/黑名单、persist 开关、类型校验 |
-| `config_reload` | 路径限制 |
-| `config_scheme` | 只读，无风险 |
-| `config_save` | 路径限制、密钥自动转引用、自动备份 |
-| `config_diff` | 只读，无风险 |
-| `runtime_status` | `detail=full` 需要更高权限 |
-| `agent_inspect` | `include_context=true` 需要更高权限 |
-| `session_inspect` | `include_tool_results=true` 需要更高权限 |
-| `log_query` | 敏感日志脱敏 |
-| `metric_query` | 只读，无风险 |
-| `skill_install/uninstall` | 默认禁用，需显式启用 |
-| `skill_enable/disable` | 需要管理权限 |
-| `provider_health` | 只读探测，无风险 |
+1. 每个 Schema 拒绝未知字段和 trailing JSON。
+2. List 顺序稳定，nil slice 输出 `[]`。
+3. caller 无法列出其他 Agent、其他 Agent 的 Session 或未授权 Tool/Skill；不存在与越权结果不可区分。
+4. 输出中没有 Prompt、消息、Tool result、options、路径或 Secret。
+5. `provider_list` 不发网络请求；所有 Tool 都不修改 Manager 状态。
+6. 大列表仍由 Tool Manager 的 `max_result_tokens` 最终限制。
 
 ---
 
+*最后更新: 2026-07-22*

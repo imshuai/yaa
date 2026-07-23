@@ -7,15 +7,20 @@
 
 ## 8. Tool 与 Context 的交互
 
+本文件中的 Tool name 都表示 Agent/Session 侧 canonical name。实际请求在进入 Context
+之前已经按 [Provider-safe Tool alias 契约](provider.md) 深拷贝投影；Context 只看到
+wire alias，但不能持有映射或把投影结果写回 Session。
+
 ### 8.1 Tool 结果在 Context 中的表示
 
 Tool 执行结果以 `role="tool"` 的 Message 加入 Context：
 
 ```go
 // Tool 结果 → Context Message
-func toolResultToMessage(callID string, result ToolResult) provider.Message {
+func toolResultToMessage(callID, canonicalName string, result ToolResult) provider.Message {
     return provider.Message{
         Role:       "tool",
+        Name:       canonicalName,
         Content:    result.Content,
         ToolCallID: callID,
     }
@@ -30,7 +35,7 @@ messages: [
   {role: "assistant", content: "", tool_calls: [
       {id: "call_1", function: {name: "http", arguments: "{\"url\":\"...\"}"}}
   ]},
-  {role: "tool",      content: "{\"temp\": 25, \"weather\": \"晴\"}", tool_call_id: "call_1"},
+  {role: "tool", name: "http", content: "{\"temp\": 25, \"weather\": \"晴\"}", tool_call_id: "call_1"},
   {role: "assistant", content: "北京现在 25°C，晴天。"}
 ]
 ```
@@ -86,4 +91,3 @@ messages: [
 - 无 Tool Call 的轮次可以丢弃 `reasoning_content`
 
 ---
-

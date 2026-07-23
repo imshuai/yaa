@@ -1,183 +1,95 @@
 # Storage 系统设计
 
-> Yaa! Yet Another Agent Runtime
-> 文档路径: `docs/storage/` (原计划单文件 `docs/storage.md`，拆分为多文件)
-> 依赖: `docs/architecture.md` §3.13
+> 根 KV 持久化抽象
+> 配置: [Storage 配置](config-ref.md)
 
 ---
 
-## 1. 概述
+## 1. 职责
 
-### 1.1 什么是 Storage
+根 Storage 是简单的 Key-Value 存储，v1 只服务 Session snapshot。Memory 需要复合主键、查询和 Version，因此使用自己的 `memory.ContentStore`；不要把两套接口混为一谈。
 
-Storage 是 Yaa! Runtime 的**底层持久化抽象**，为上层模块提供统一的 Key-Value 存储接口。
+| 组件 | 抽象 | 默认用途 |
+|------|------|----------|
+| Root Storage | KV + 可选 TTL | Session snapshot |
+| Memory ContentStore | 复合 item + 查询 | Agent long-term Memory |
+| 文件系统 | 文件 | Config、Skill 资源、日志 |
 
-| 层级 | 抽象 | 用途 |
-|------|------|------|
-| Memory | 语义记忆 + 向量检索 | Agent 长期记忆 |
-| **Storage** | **KV 存储 + TTL** | **Session 持久化、配置缓存、状态存储** |
-| 文件系统 | 原始文件 | Skill 资源、日志、配置文件 |
-
-Storage 不直接面向 Agent，而是作为 Runtime 基础设施，被 Session、Memory、Config 等模块依赖。
-
-### 1.2 设计理念
-
-| 特性 | 说明 |
-|------|------|
-| **零 CGO** | 默认实现使用纯 Go SQLite，保证 Windows 7 兼容 |
-| **单文件** | 默认 SQLite 单文件部署，简化运维 |
-| **可替换** | 通过接口抽象，支持 BoltDB、内存等多种后端 |
-| **TTL 原生** | 接口层面支持过期时间，适配缓存场景 |
-| **前缀扫描** | `Keys(prefix)` 支持按命名空间批量查询 |
-
-### 1.3 核心原则
-
-1. **接口优先** — 上层只依赖 `Storage` 接口，不绑定具体实现
-2. **零依赖默认** — 默认实现不引入 CGO，纯 Go 可交叉编译
-3. **配置驱动** — 通过 `config.yaml` 的 `runtime.storage.type` 切换后端
-4. **向后兼容** — 接口新增方法使用默认实现，不破坏已有代码
-
----
+根 Storage 后端只有 `sqlite` 和 `memory`。SQLite 使用纯 Go `modernc.org/sqlite`，不需要 CGO；memory 后端用于测试或明确接受进程退出丢失的运行。
 
 ## 2. 核心接口
 
 ```go
-// Storage 是 Yaa! 的底层 Key-Value 存储抽象。
-// 所有上层模块（Session、Memory、Config 等）通过此接口访问持久化数据。
 type Storage interface {
-    // Get 根据 key 读取数据，key 不存在时返回 ErrNotFound。
     Get(key string) ([]byte, error)
-
-    // Set 写入数据，可选 TTL；TTL 到期后 key 自动删除。
     Set(key string, value []byte, ttl ...time.Duration) error
-
-    // Delete 删除指定 key，key 不存在时不报错。
     Delete(key string) error
-
-    // Has 判断 key 是否存在（且未过期）。
     Has(key string) (bool, error)
-
-    // Keys 返回匹配指定前缀的所有 key，无匹配时返回空切片。
     Keys(prefix string) ([]string, error)
-}
-```
-
-### 2.1 错误定义
-
-```go
-var (
-    // ErrNotFound 表示 key 不存在或已过期
-    ErrNotFound = errors.New("storage: key not found")
-    // ErrClosed 表示 Storage 已关闭
-    ErrClosed = errors.New("storage: already closed")
-)
-```
-
-### 2.2 可选接口
-
-```go
-// Closer 提供优雅关闭能力，所有实现应支持。
-type Closer interface {
     Close() error
 }
 
-// Stats 提供存储统计信息（可选，用于监控）。
-type Stats interface {
-    Stats() StorageStats
-}
+const MaxValueBytes = 16 << 20
 
-type StorageStats struct {
-    KeyCount    int64   // 总 key 数量
-    TotalBytes  int64   // 总数据大小（估算）
-    HitCount    int64   // Get 命中次数
-    MissCount   int64   // Get 未命中次数
-}
+var (
+    ErrNotFound     = errors.New("storage: key not found")
+    ErrClosed       = errors.New("storage: already closed")
+    ErrInvalidKey   = errors.New("storage: invalid key")
+    ErrInvalidTTL   = errors.New("storage: invalid ttl")
+    ErrInvalidPath  = errors.New("storage: invalid path")
+    ErrValueTooLarge = errors.New("storage: value too large")
+)
+
+type Clock interface { Now() time.Time }
 ```
 
----
+契约：
 
-## 3. 实现对比
+- key 非空、必须是合法 UTF-8、最多 512 bytes；value 最多 `MaxValueBytes`。超限 value 返回 `ErrValueTooLarge`。实现必须拷贝输入和输出 byte slice。
+- `Set` 最多接收一个 TTL 参数；未传或值为 0 表示永不过期；负值拒绝。
+- `Get`/`Has`/`Keys` 不返回已过期 key；`Get` 对缺失返回 `ErrNotFound`。
+- `Delete` 对缺失 key 幂等成功。
+- 所有方法在 Close 后返回 `ErrClosed`（Close 本身幂等）。
+- `Keys(prefix)` 只返回匹配前缀的 key，并按字节升序排序。
+- 接口没有 `context.Context`。一次方法调用开始后不可由调用方取消；上层只能在调用前检查 context，并在方法返回后完成自己的提交。
 
-| 特性 | SQLite | BoltDB | Memory |
-|------|--------|--------|--------|
-| **依赖** | modernc.org/sqlite (纯 Go) | go.etcd.io/bbolt | 无 |
-| **CGO** | ❌ 零 CGO | ❌ 零 CGO | ❌ 零 CGO |
-| **持久化** | ✅ 单文件 `.db` | ✅ 单文件 `.bolt` | ❌ 进程内 |
-| **TTL 支持** | ✅ 轮询清理 | ✅ 轮询清理 | ✅ timer |
-| **前缀扫描** | ✅ SQL `LIKE` | ✅ 前缀游标 | ✅ 内存过滤 |
-| **并发模型** | SQL 事务 | B+Tree 读写锁 | sync.RWMutex |
-| **适合场景** | **生产默认** | 高写入吞吐 | 测试 / 临时缓存 |
-| **跨平台** | ✅ Windows 7+ | ✅ Windows 7+ | ✅ 全平台 |
-| **数据可检视** | ✅ sqlite3 CLI | ❌ 需工具 | ❌ |
-| **体积开销** | ~中 | ~小 | ~零 |
-
-### 3.1 选型建议
-
-```text
-生产部署 → SQLite（默认，零配置，可检视）
-高写入场景 → BoltDB（B+Tree 写入优化）
-单元测试 → Memory（快速，无磁盘 IO）
-```
-
----
-
-## 4. 配置参考
-
-```yaml
-# yaa.yaml
-runtime:
-  storage:
-    type: sqlite          # sqlite | boltdb | memory
-    path: ./data/yaa.db   # SQLite / BoltDB 文件路径
-    # ttl_interval: 60s   # TTL 清理轮询间隔（可选）
-    # wal: true           # SQLite WAL 模式（可选，默认 true）
-```
-
----
-
-## 5. 使用示例
+Stats 是可选观察接口，不能成为业务依赖：
 
 ```go
-// 初始化 Storage
-store, err := storage.New(cfg.Storage)
-if err != nil {
-    log.Fatal("failed to init storage: %v", err)
-}
-defer store.Close()
-
-// 基本读写
-if err := store.Set("agent:default:name", []byte("Pico")); err != nil {
-    log.Fatal(err)
-}
-val, err := store.Get("agent:default:name")
-// val == []byte("Pico")
-
-// 带 TTL 的写入（5 分钟后自动过期）
-store.Set("session:abc:token", []byte("xyz"), 5*time.Minute)
-
-// 前缀扫描 — 列出所有 agent 的 key
-keys, _ := store.Keys("agent:")
-
-// 判断存在
-exists, _ := store.Has("session:abc:token")
-
-// 删除
-store.Delete("session:abc:token")
+type Stats interface { Stats() StorageStats }
+type StorageStats struct { KeyCount, TotalBytes, HitCount, MissCount int64 }
 ```
 
----
+## 3. TTL
 
-## 文档索引
+TTL 由后端统一实现：读取时惰性隐藏，后台 worker 每 60 秒批量删除已过期 rows。清理周期是实现常量，不是 Config 字段；需要不同周期时应先增加版本化配置并同步所有后端。
+
+Session 永远不传 TTL。Session 的 `ttl`/`max_lifetime` 是状态机 policy，不能让 Storage 自动删除 snapshot。
+
+## 4. 初始化与关闭
+
+```go
+store, err := storage.New(cfg.Runtime.Storage)
+if err != nil {
+    return nil, err
+}
+// Runtime owns the lifecycle.
+defer store.Close()
+```
+
+`storage.New` 根据 `runtime.storage.type` 创建 SQLite 或 memory 实现；未知类型、SQLite path 为空、schema migration 失败都返回错误。Runtime 只关闭一次根 Storage，Session Manager 不调用 Close。
+
+## 5. 文档索引
 
 | 文件 | 内容 |
 |------|------|
-| [sqlite.md](sqlite.md) | SQLite 实现 — 表结构、WAL 模式、TTL 清理、SQL 细节 |
-| [alternatives.md](alternatives.md) | BoltDB 与内存存储 — Bucket 设计、前缀游标、TTL 清理、内存实现 |
-| [integration.md](integration.md) | 与各模块的集成 — Session / Memory / Config 的存储交互 |
-| [config-ref.md](config-ref.md) | 配置参考 — 全局配置、后端切换、路径与参数 |
-| [decisions.md](decisions.md) | 设计决策（ST-001 ~ ST-NNN）+ 模块关系 |
-| [checklist.md](checklist.md) | 实现检查清单 |
+| [sqlite.md](sqlite.md) | SQLite 表结构、事务、TTL 与实现要点 |
+| [alternatives.md](alternatives.md) | 内存后端与后端选择 |
+| [integration.md](integration.md) | Session 与 Memory 的所有权边界 |
+| [config-ref.md](config-ref.md) | `runtime.storage` 字段 |
+| [decisions.md](decisions.md) | Storage 设计决策 |
+| [checklist.md](checklist.md) | 实现和门禁 |
 
 ---
 
-*最后更新: 2025-07-17*
+*最后更新: 2026-07-22*

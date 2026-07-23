@@ -1,127 +1,41 @@
 # Storage 设计决策
 
-> 文档路径: `docs/storage/decisions.md`
-> 上级: `docs/storage/README.md` §9
+> 上级: [Storage 系统设计](README.md)
 
 ---
 
-## 9. 设计决策
+## ST-001：SQLite 是默认根 KV
 
-### ST-001: SQLite 为默认存储后端
+使用 `modernc.org/sqlite` 的纯 Go驱动，默认单文件 `./data/yaa.db`。它满足零 CGO、单文件备份和目标平台交叉编译；WAL 与 busy timeout 是实现常量，不增加配置旋钮。
 
-**决策：** 生产环境默认使用 SQLite（modernc.org/sqlite 纯 Go 实现），而非 BoltDB 或其他方案。
+## ST-002：v1 只有 sqlite 和 memory
 
-**理由：**
-- 纯 Go 实现，零 CGO，保证 Windows 7 兼容和交叉编译
-- 单文件部署，运维简单，无需额外数据库服务
-- 数据可检视（sqlite3 CLI 直接查看），便于调试
-- 生态成熟，WAL 模式下并发读性能优秀
+Memory 后端覆盖测试/临时运行，SQLite 覆盖持久化。第三种后端在有测量证据前不进入 enum，避免额外依赖和迁移矩阵。
 
-**影响：** 默认实现需处理 WAL 模式配置和 TTL 轮询清理。
+## ST-003：TTL 是接口能力，不是 Session 生命周期
 
----
+`Set(key,value,ttl...)` 保留可选 TTL，所有后端一致实现惰性隐藏和 batch cleanup。Session snapshot 永不传 TTL；它的 TTL/max lifetime 由 Session 状态机处理。
 
-### ST-002: TTL 在接口层面原生支持
+## ST-004：Close 属于核心接口
 
-**决策：** `Set(key, value, ttl...)` 将 TTL 作为接口签名的一部分，而非外层包装。
+Runtime 必须可靠释放数据库和 worker，因此 `Close()` 直接属于 Storage。所有实现都支持幂等 Close，不需要调用方做可选接口类型断言。
 
-**理由：**
-- 上层模块（Session、Memory、Config）广泛需要过期语义
-- 接口层面统一 TTL，避免每个调用方自行实现定时删除
-- `ttl ...time.Duration` 可变参数使 TTL 可选，不破坏简单写入
+## ST-005：Keys 只有前缀和稳定排序
 
-**影响：** 所有后端实现必须支持 TTL 清理；SQLite/BoltDB 采用后台轮询，Memory 采用 timer。
+`Keys(prefix)` 足以完成 Session Restore；不提供全查询 DSL。SQLite 使用 literal prefix SQL，memory 使用 `strings.HasPrefix`，两者都按 key 字节升序。
 
----
+## ST-006：Memory 不复用根 KV 接口
 
-### ST-003: 上层只依赖 Storage 接口，不绑定实现
+Memory item 需要复合主键、Version、查询排序和原子 upsert，使用专用 ContentStore。根 Storage v1 只保存 `session:<id>` 完整 snapshot。
 
-**决策：** Session、Memory、Config 等模块只依赖 `Storage` 接口，具体后端通过配置切换。
+## ST-007：固定安全边界
 
-**理由：**
-- 接口优先原则，保持上层模块与存储实现解耦
-- 单元测试可注入 Memory 实现，零磁盘 IO
-- 未来可扩展新后端（如 Redis）而不修改上层代码
+key 512 bytes、value 16 MiB、cleanup tick 60 秒和 batch 1000 是 v1 常量。实际负载证明需要调整前不增加配置字段；两种后端使用相同限制。
 
-**影响：** 接口新增方法需提供默认实现，保证向后兼容。
+## ST-008：严格恢复
+
+SQLite schema 版本未知、integrity check 失败或任何 Session snapshot 损坏都会使 Runtime Not Ready。Storage 不跳过、删除或自动修复业务 values；恢复决策属于 Session Manager。
 
 ---
 
-### ST-004: 前缀扫描通过 Keys(prefix) 实现
-
-**决策：** 提供 `Keys(prefix string)` 方法支持按命名空间批量查询，而非全量 `Keys()` 或复杂查询。
-
-**理由：**
-- Yaa! 的 key 采用 `module:scope:field` 层级命名，前缀扫描天然适配
-- 全量 `Keys()` 容易误用导致性能问题
-- 不需要 SQL 级复杂查询，KV 模型足够
-
-**影响：** SQLite 用 `LIKE 'prefix%'`，BoltDB 用前缀游标，Memory 用内存过滤。
-
----
-
-### ST-005: 可选接口分离 Closer 和 Stats
-
-**决策：** `Close()` 和 `Stats()` 不放入核心 `Storage` 接口，而是作为可选接口（`Closer`、`Stats`）。
-
-**理由：**
-- 核心 `Storage` 接口保持精简（5 个方法）
-- Memory 实现无需 `Close()` 也能工作
-- Stats 仅用于监控场景，非核心路径
-
-**影响：** 调用方需通过类型断言检测可选能力；所有持久化实现应实现 `Closer`。
-
----
-
-## 10. 模块关系
-
-```text
-┌──────────────────────────────────────────────────────────────┐
-│                         Runtime                                │
-│                                                                │
-│  ┌──────────┐    ┌──────────┐    ┌──────────────────────┐   │
-│  │ Session  │    │ Memory   │    │ Config / State       │   │
-│  │ Manager  │    │ Manager  │    │ Manager              │   │
-│  └────┬─────┘    └────┬─────┘    └──────────┬───────────┘   │
-│       │               │                     │                │
-│       └───────────────┼─────────────────────┘                │
-│                       │                                       │
-│                  ┌────▼─────┐                                 │
-│                  │ Storage  │  (接口抽象)                      │
-│                  │ Interface│                                 │
-│                  └────┬─────┘                                 │
-│           ┌───────────┼───────────┐                           │
-│           ▼           ▼           ▼                           │
-│     ┌──────────┐ ┌──────────┐ ┌──────────┐                   │
-│     │ SQLite   │ │ BoltDB   │ │ Memory   │                   │
-│     │ Impl     │ │ Impl     │ │ Impl     │                   │
-│     │ (默认)   │ │          │ │ (测试)   │                   │
-│     └────┬─────┘ └────┬─────┘ └──────────┘                   │
-│          │            │                                       │
-│     ┌────▼─────┐ ┌────▼─────┐                                  │
-│     │ yaa.db   │ │ yaa.bolt │                                  │
-│     │ (WAL)    │ │          │                                  │
-│     └──────────┘ └──────────┘                                  │
-│                                                                │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  TTL 清理                                              │   │
-│  │  SQLite/BoltDB: 后台 goroutine 轮询 (默认 60s)         │   │
-│  │  Memory: time.AfterFunc 精确过期                        │   │
-│  └──────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────┘
-
-依赖方向:
-  Session Manager → Storage (会话持久化)
-  Memory Manager → Storage (记忆索引/缓存)
-  Config Manager → Storage (配置缓存)
-  Storage Interface ← config.yaml 切换后端
-```
-
-**依赖关系：**
-- Storage 是最底层基础设施，不依赖 Runtime 其他模块
-- 所有持久化实现通过 `storage.New(cfg)` 工厂方法创建
-- TTL 清理逻辑封装在各实现内部，对上层透明
-
----
-
-*最后更新: 2025-07-17*
+*最后更新: 2026-07-22*

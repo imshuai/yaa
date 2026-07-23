@@ -1,313 +1,249 @@
 # Tool Manager
 
-> 文档路径: `docs/tool/manager.md`
-> 上级: `docs/tool/README.md` §3-4
+> 上级: [Tool 系统设计](README.md)
 
 ---
 
-## 3. Tool Manager
+## 1. 职责
 
-### 3.1 职责
+Tool Manager 是 Tool 的唯一注册、发现、鉴权和执行入口。它负责：
 
-Tool Manager 是 Tool 系统的中枢，负责：
+- 保存 builtin、plugin、MCP Tool 及 canonical `config.ToolConfig`；
+- 按 `AgentConfig.Tools []string` 过滤能力；
+- 校验 JSON Schema、应用 timeout、有限重试和结果上限；
+- 在 Runtime 全局和 Session 两层限制并发；
+- 将当前 Agent 可用 Tool 与 Session 历史冻结为 Provider wire 投影。
 
-1. **注册** — 内置 Tool 启动注册、自定义 Tool 动态注册
-2. **发现** — 列出所有可用 Tool 及其 Schema
-3. **查找** — 按名称查找 Tool 实例
-4. **权限** — 检查 Agent 是否有权使用某 Tool
-5. **执行** — 调度 Tool 执行（含超时、并发、结果截断）
-6. **转换** — 将 Tool 转换为 `ToolDef` 供 Provider 使用
+Manager 不从 HTTP identity 推导 Agent，不执行 Skill，也不提供 Remote 直接执行端点。
 
-### 3.2 接口定义
+---
+
+## 2. 类型与 API
 
 ```go
-// Manager 管理 Tool 的注册、查找和执行。
+type ExecutionScope struct {
+    AgentID   string
+    SessionID string // MCP 等非 Session 调用为空
+}
+
 type Manager struct {
-    tools    map[string]Tool           // name → Tool 实例
-    configs  map[string]ToolConfig     // name → 配置
-    mu       sync.RWMutex
-    logger   *slog.Logger
+    tools         map[string]Tool
+    configs       map[string]config.ToolConfig
+    reload        *config.ReloadManager
+    providers     *provider.Manager
+    agentBindings map[string]agentToolBinding
+    globalGate    chan struct{}
+
+    mu           sync.RWMutex
+    sessionMu    sync.Mutex
+    sessionGates map[string]*sessionGate
+    logger       *slog.Logger
 }
 
-// ToolConfig 是 Tool 的运行时配置。
-type ToolConfig struct {
-    Enabled  bool          `yaml:"enabled"`
-    Timeout  time.Duration `yaml:"timeout"`
-    MaxRetry int           `yaml:"max_retry"`
-    // 厂商/Tool 特有的配置，如 Shell 的 allowed_commands
-    Options  map[string]any `yaml:"options"`
+type agentToolBinding struct {
+    AllowAll  bool
+    Allowed   map[string]struct{}
+    Overrides map[string]agentToolOverride
 }
 
-// Register 注册一个 Tool。
-func (m *Manager) Register(tool Tool, config ToolConfig) error
+// Agent override 没有 Enabled；nil 表示字段未出现。
+type agentToolOverride struct {
+    Timeout *time.Duration
+    Options map[string]any // nil=未出现；非 nil 时按 key 覆盖 root options
+}
 
-// Unregister 注销一个 Tool。
+type EffectiveToolConfig struct {
+    Timeout  time.Duration
+    MaxRetry int
+    Options  map[string]any
+}
+
+// RetryableError 是 Tool 对“尚未产生副作用且可安全重试”的显式 opt-in。
+type RetryableError interface {
+    error
+    Retryable() bool
+}
+
+func NewManager(
+    reload *config.ReloadManager,
+    providers *provider.Manager,
+    logger *slog.Logger,
+) (*Manager, error)
+
+func (m *Manager) Register(tool Tool, cfg config.ToolConfig, source string) error
 func (m *Manager) Unregister(name string) error
-
-// Get 按名称查找 Tool。
 func (m *Manager) Get(name string) (Tool, error)
-
-// List 列出所有已注册的 Tool。
 func (m *Manager) List() []ToolInfo
-
-// ListForAgent 列出 Agent 可用的 Tool（应用权限过滤）。
 func (m *Manager) ListForAgent(agentID string) []ToolInfo
-
-// CheckPermission 检查 Agent 是否有权使用某 Tool。
 func (m *Manager) CheckPermission(agentID, toolName string) bool
-
-// ToToolDefs 将指定 Tool 列表转换为 Provider 可用的 ToolDef 列表。
-func (m *Manager) ToToolDefs(toolNames []string) ([]provider.ToolDef, error)
-
-// Execute 执行指定 Tool。
-func (m *Manager) Execute(ctx context.Context, agentID, toolName string, params map[string]any) (ToolResult, error)
-
-// ExecuteBatch 并发执行多个 Tool Call。
-func (m *Manager) ExecuteBatch(ctx context.Context, agentID string, calls []provider.ToolCall) ([]ToolResult, error)
+func (m *Manager) ToToolDefs(agentID string, history []provider.Message) (*ProviderToolProjection, error)
+func (m *Manager) Execute(ctx context.Context, scope ExecutionScope, toolName string, params map[string]any) (ToolResult, error)
+func (m *Manager) ExecuteBatch(ctx context.Context, scope ExecutionScope, calls []provider.ToolCall) ([]ToolResult, error)
 ```
 
-### 3.3 ToolInfo
+`NewManager` 拒绝 nil 依赖，从 `reload.Current()` 深拷贝每个 Agent 的 restart-required `tools` allowlist 与已经严格解码的 `tools_config` 到 `agentBindings`，并按初始 `ToolsConfig` 创建两个 gate。Agent override 解码后只能产生 presence-aware `Timeout` 和 `Options`；出现 `enabled` 或其他 key 是配置错误，不能复用含 `Enabled` 的 root `config.ToolConfig`。Provider 集合由 Provider Manager 持有，不由 Tool Manager 关闭。`AgentID` 永远必填；空值或未知 Agent 返回 `ErrPermissionDenied`。Agent turn 必须传真实 `SessionID`。MCP Expose Server 使用配置的 `mcp.server.agent_id`，并把 `SessionID` 留空，因此只使用 Runtime 全局 gate。
+
+### 2.1 ToolInfo
 
 ```go
-// ToolInfo 是 Tool 的元信息，用于列表展示。
 type ToolInfo struct {
     Name        string          `json:"name"`
     Description string          `json:"description"`
     Parameters  json.RawMessage `json:"parameters"`
-    Enabled     bool           `json:"enabled"`
-    Source      string          `json:"source"`  // "builtin" | "plugin" | "mcp"
+    Enabled     bool            `json:"enabled"`
+    Source      string          `json:"source"` // builtin | plugin | mcp
 }
 ```
 
-### 3.4 注册流程
+`List` 包含 disabled Tool，按 `Name` 升序返回深拷贝。`ListForAgent` 只包含 enabled 且授权的 Tool。暂时 unavailable 的 Plugin/MCP 稳定 Proxy 仍可出现在定义中，执行时返回对应 unavailable sentinel。
 
-```text
-启动时:
-  │
-  ├─ 1. 注册内置 Tool
-  │     ├─ 通用执行类 (Shell, HTTP, File)
-  │     │   └─ 从 config.yaml 读取 tools.builtin.* 配置
-  │     │      └─ enabled=false 的跳过
-  │     │
-  │     ├─ 配置管理类 (Config Query/Set/Reload/Scheme/Save/Diff)
-  │     │   └─ 依赖 Config Manager 初始化完成
-  │     │   └─ config_set 默认启用，其他默认启用
-  │     │   └─ 应用 blocked_paths 安全策略
-  │     │
-  │     └─ 内视与管理类 (Runtime/Agent/Session/Tool/Skill/Provider/MCP/Log/Metric/Skill管理/Provider探测)
-  │         └─ 依赖 Runtime、Agent Manager、Session Manager 等组件初始化完成
-  │         └─ 只读内视工具默认启用
-  │         └─ 管理类工具 (skill_install/uninstall/enable/disable) 默认禁用
-  │
-  ├─ 2. 注册插件 Tool
-  │     └─ 从 config.yaml 读取 tools.plugins.* 配置
-  │        └─ 加载 .so 插件，调用 Register 注册
-  │
-  ├─ 3. 注册 MCP Tool
-  │     └─ MCP Client 连接外部 Server
-  │        └─ 将 MCP Tool 转换为 Yaa! Tool 注册
-  │
-  └─ 4. 应用 Agent 权限配置
-        └─ 从 agents[].tools 读取白名单
-           └─ 未配置白名单 = 可用所有 Tool
-```
+### 2.2 ProviderToolProjection
 
-### 3.5 权限模型
+`ToToolDefs` 返回一次 turn 使用的不可变 `ProviderToolProjection`，而不是调用方可修改的裸 `[]provider.ToolDef`。它只把当前 enabled、authorized Tool 放入 definitions，同时把历史 canonical Tool name 纳入 `canonical -> alias` 映射和全局碰撞检查；历史专用名称不进入 executable 反查表。具体算法、深拷贝字段、`specific` ToolChoice 和 direct/stream 反查见 [Provider-safe Tool alias 契约](provider.md)。
 
-```yaml
-# Agent 级别 Tool 权限
-agents:
-  - id: "safe-agent"
-    tools: ["http", "file_read"]    # 白名单：只能用这两个 Tool
-
-  - id: "full-access-agent"
-    tools: []                        # 空数组 = 可用所有已注册 Tool
-
-  - id: "restricted-agent"
-    tools:
-      allow: ["file_read"]           # 白名单
-      deny: ["shell"]                # 黑名单（优先级高于 allow）
-```
-
-**权限规则：**
-
-| 配置 | 含义 |
-|------|------|
-| `tools: [...]` | 白名单模式，只能用列表中的 Tool |
-| `tools: []` 或未配置 | 可用所有已注册 Tool |
-| `tools.deny: [...]` | 黑名单，即使 allow 中有也被拒绝 |
-| 未注册的 Tool | 永远不可用，无论权限配置如何 |
-
-**权限检查流程：**
-
-```text
-ToolManager.Execute(agentID, toolName, params)
-  │
-  ├─ 1. 查找 Tool 实例 → 不存在则返回 ErrToolNotFound
-  │
-  ├─ 2. 检查 Tool 是否 Enabled → 否则返回 ErrToolDisabled
-  │
-  ├─ 3. 检查 Agent 权限
-  │     ├─ Agent 有白名单 → toolName 必须在白名单中
-  │     ├─ Agent 有黑名单 → toolName 不能在黑名单中
-  │     └─ 无白名单 → 允许
-  │
-  ├─ 4. 参数校验（JSON Schema）
-  │     └─ 不通过则返回 ErrInvalidParams（含校验错误详情）
-  │
-  ├─ 5. 执行 Tool（带超时 context）
-  │
-  └─ 6. 结果截断 + 返回
-```
+Runtime 启动 binding 校验必须对每个 Agent 的当前 definitions 执行一次空历史投影；每次 turn 仍用当前 Session snapshot 重新构造并冻结投影。`ExecuteBatch` 不接受 wire alias，只接受 Agent 已完整反查为 canonical name 的 calls。
 
 ---
 
-## 4. Tool 执行引擎
+## 3. 注册与 enabled
 
-### 4.1 单次执行流程
+启动顺序固定为 builtin -> plugin proxy -> MCP proxy。`Register`：
 
-```go
-func (m *Manager) Execute(ctx context.Context, agentID, toolName string, params map[string]any) (ToolResult, error) {
-    // 1. 查找 Tool
-    tool, err := m.Get(toolName)
-    if err != nil {
-        return ToolResult{}, err
-    }
+1. 校验 canonical name 是合法 UTF-8、1..256 bytes 且无 Unicode 控制字符，并校验 source、description 和 Parameters JSON Schema；
+2. 拒绝重复 name；
+3. 深拷贝 schema、配置和 options；
+4. 无论 `cfg.Enabled` 为何都写入注册表。
 
-    // 2. 权限检查
-    if !m.CheckPermission(agentID, toolName) {
-        return ToolResult{}, ErrPermissionDenied
-    }
+保留 disabled 条目使 Config、`ToolInfo` 和 `ErrToolDisabled` 的语义一致。`Unregister` 只用于 Plugin/MCP Manager 永久停止后的 catalog 清理；暂时断线只把稳定 Proxy 置 unavailable，builtin 不在运行时注销。
 
-    // 3. 参数校验
-    if err := validateParams(tool.Parameters(), params); err != nil {
-        return ToolResult{IsError: true, Content: fmt.Sprintf("参数校验失败: %v", err)}, nil
-    }
+所有来源共用同一 canonical name 规则；不能为了某个 Provider 把点号、Unicode 或数字开头的名称改写后注册。Provider-safe 限制只在 turn-local wire 投影中处理。重复 canonical name 继续由 `Register` 拒绝；不同 canonical name 的 alias 碰撞由启动 binding 与 `ToToolDefs` 返回 `ErrToolAliasCollision`。
 
-    // 4. 超时控制
-    config := m.configs[toolName]
-    timeout := config.Timeout
-    if timeout == 0 {
-        timeout = 30 * time.Second // 全局默认
-    }
-    execCtx, cancel := context.WithTimeout(ctx, timeout)
-    defer cancel()
+`resolveConfig` 每次从同一个 `reload.Current()` snapshot 读取 root hot 字段，并与冻结的 Agent override 按以下顺序合并：
 
-    // 5. 重试
-    var result ToolResult
-    maxRetry := config.MaxRetry
-    for attempt := 0; attempt <= maxRetry; attempt++ {
-        result, err = tool.Execute(execCtx, params)
-        if err == nil {
-            break
-        }
-        // 不可重试的错误直接返回
-        if !isRetryable(err) {
-            break
-        }
-        // 指数退避
-        if attempt < maxRetry {
-            backoff := time.Duration(1<<attempt) * time.Second
-            select {
-            case <-execCtx.Done():
-                return ToolResult{}, execCtx.Err()
-            case <-time.After(backoff):
-            }
-        }
-    }
-
-    // 6. 结果截断
-    result.Content = truncateResult(result.Content, MaxToolResultTokens)
-
-    // 7. 记录日志
-    m.logger.Info("tool executed",
-        "tool", toolName,
-        "agent", agentID,
-        "error", err,
-        "is_error", result.IsError,
-    )
-
-    return result, err
-}
+```text
+tools.default_timeout
+  <- tools.builtin.<name>.timeout
+  <- agents[].tools_config.<name>.timeout
 ```
 
-### 4.2 并发执行
+Options 同样按 map key 覆盖；nil Agent `Options` 表示未出现，非 nil 空 map 表示没有新增 key，不会清空 root map。最终 timeout 限制在 `tools.max_timeout` 内。`Enabled` 只来自 root Tool 配置，Agent override 无权改变；`MaxRetry` 只来自 `tools.default_max_retry`，不在 ToolConfig/Agent override 重复声明。结果限长从该 snapshot 找到同一 Agent 当前的 Provider ID/Model，经 `providers.Get` 获得 estimator；找不到 Agent/Provider 或估算失败都返回硬错误，不注入未受限 Content。一次 Execute 不再读取第二个 snapshot。
 
-当 LLM 在一轮中返回多个 Tool Call 时，Yaa! 并发执行：
+---
 
-```go
-func (m *Manager) ExecuteBatch(ctx context.Context, agentID string, calls []provider.ToolCall) ([]ToolResult, error) {
-    results := make([]ToolResult, len(calls))
-    var wg sync.WaitGroup
+## 4. 权限
 
-    for i, call := range calls {
-        wg.Add(1)
-        go func(idx int, c provider.ToolCall) {
-            defer wg.Done()
-
-            // 解析参数
-            var params map[string]any
-            if err := json.Unmarshal([]byte(c.Function.Arguments), &params); err != nil {
-                results[idx] = ToolResult{
-                    IsError: true,
-                    Content: fmt.Sprintf("参数解析失败: %v", err),
-                }
-                return
-            }
-
-            // 执行
-            result, err := m.Execute(ctx, agentID, c.Function.Name, params)
-            if err != nil {
-                results[idx] = ToolResult{
-                    IsError: true,
-                    Content: fmt.Sprintf("Tool 执行失败: %v", err),
-                }
-                return
-            }
-            results[idx] = result
-        }(i, call)
-    }
-
-    wg.Wait()
-    return results, nil
-}
-```
-
-**并发控制：**
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `tools.max_concurrent` | 5 | 同一 Agent 同时执行的最大 Tool 数 |
-| `tools.max_concurrent_per_session` | 3 | 同一 Session 内最大并发 Tool 数 |
-
-超过并发上限的 Tool Call 排队等待，而非直接拒绝。
-
-### 4.3 超时与取消
+Canonical 配置只有：
 
 ```yaml
-# 全局默认
-tools:
-  default_timeout: 30s
-  max_timeout: 300s          # Tool 可配置的最大超时上限
-
-  builtin:
-    shell:
-      timeout: 60s           # Shell 超时
-    http:
-      timeout: 30s
-    file:
-      timeout: 10s
+agents:
+  - id: safe-agent
+    tools: [http, file_read]
+  - id: full-access-agent
+    tools: []
 ```
 
-**超时层次（优先级递增）：**
+规则：
 
-1. `tools.default_timeout` — 全局默认
-2. `tools.builtin.<name>.timeout` — Tool 级别配置
-3. Agent 配置覆盖 — `agents[].tools_config.<name>.timeout`
-4. Session 运行时覆盖 — API 请求中指定
+- `tools: []` 或省略表示允许所有已注册 Tool；
+- 非空数组是精确 name allowlist；
+- 不存在 `allow`/`deny` object shape；
+- 未注册或 disabled Tool 永远不可执行；
+- `CheckPermission` 只回答 Agent allowlist，调用方仍需检查存在与 enabled。
 
-**取消传播：**
+Tool name 来自模型，不能作为 principal。所有调用都必须携带 Runtime 已解析的真实 `AgentID`。
 
-- Session 关闭 → context 取消 → 所有进行中的 Tool 执行被取消
-- 用户中断对话 → 同上
-- Tool 内部应尊重 context.Done()，及时退出
+---
+
+## 5. 并发 gate
+
+`tools.max_concurrent` 是整个 Runtime 同时运行的 Tool 上限；`tools.max_concurrent_per_session` 是同一非空 Session 的子上限。两者在 Manager 构造时创建，变更需要重启。
+
+```go
+type sessionGate struct {
+    sem  chan struct{}
+    refs int
+}
+```
+
+acquire 顺序为 Session gate -> global gate，release 逆序。创建/引用 Session gate 时在 `sessionMu` 下增加 refs；release 后减少 refs，降为 0 时从 map 删除，避免每个历史 Session 永久占用内存。等待任一 gate 都使用：
+
+```go
+select {
+case sem <- struct{}{}:
+case <-ctx.Done():
+    return nil, context.Cause(ctx)
+}
+```
+
+不得在持有 `mu` 或 `sessionMu` 时等待 channel。gate 等待必须保留 caller 设置的 cancel cause（例如 Agent Stop 或 Runtime shutdown），不能收窄为 `ctx.Err()`。空 `SessionID` 跳过 Session gate，但仍获取 global gate。
+
+---
+
+## 6. Execute
+
+单次执行顺序固定为：
+
+1. 校验 `scope.AgentID`；查找 Tool。
+2. 检查 config enabled；disabled 返回 `ErrToolDisabled`。
+3. 检查 Agent allowlist；拒绝返回 `ErrPermissionDenied`。
+4. 用注册时保存的 JSON Schema 校验 params；失败返回 `ErrInvalidParams`。
+5. 解析一个 `EffectiveToolConfig` snapshot。
+6. 获取 Session/global gate；等待可由 caller context 取消。
+7. 以 Go 1.20 的 `context.WithCancelCause(ctx)` 和 `time.AfterFunc(effective.Timeout, ...)` 创建一次带 `ErrToolTimeout` cause 的 `callCtx`；Tool 调用、退避和全部重试共用它。
+8. 每次 Tool 返回或退避结束后先检查 caller `ctx`，再检查 child `callCtx`；只有两者都有效时，才用 `var retryable RetryableError; errors.As(err, &retryable)` 判定是否重试。
+9. 使用 Agent Provider 的 token estimator 将 `Content` 限制到 `max_result_tokens`。
+10. release gate，返回结果并记录不含 params/content 的结构化日志。
+
+核心错误优先级可直接实现为：
+
+```go
+callCtx, cancel := context.WithCancelCause(ctx)
+timer := time.AfterFunc(effective.Timeout, func() {
+    cancel(ErrToolTimeout)
+})
+defer func() {
+    timer.Stop()
+    cancel(nil)
+}()
+
+result, err := tool.Execute(callCtx, scope, params)
+if ctx.Err() != nil {
+    return ToolResult{}, context.Cause(ctx)
+}
+if callCtx.Err() != nil {
+    return ToolResult{}, context.Cause(callCtx)
+}
+
+var retryable RetryableError
+if err != nil && errors.As(err, &retryable) && retryable.Retryable() {
+    // 在同一个 callCtx 内等待退避并开始下一 attempt。
+}
+```
+
+caller cancel/deadline 已发生时始终返回 `context.Cause(ctx)`；只有 caller 仍有效而 Manager timer 先触发时，`context.Cause(callCtx)` 才是稳定的 `ErrToolTimeout`。不能把 caller deadline、Agent Stop 或 Runtime shutdown 改写为 Tool timeout。每次重试和可取消退避后重复同一顺序；cleanup 必须先 `timer.Stop()` 再 `cancel(nil)`，且只能在读取两个 cause 之后执行，不能先 cancel 再把人为产生的 `context.Canceled` 当成执行失败。
+
+Go 1.20 没有 `context.WithTimeoutCause`（该 API 从 Go 1.21 才提供），因此不能在目标 toolchain 下引用它。上述 `WithCancelCause` + `time.AfterFunc` 是 v1 的唯一兼容实现；timer callback 与 cleanup 的并发取消依赖 Context 的 first-cause-wins 语义。
+
+返回 `Retryable()==true` 即由 Tool 保证本次尚未产生外部副作用；Manager 不自行推断。`errors.As` 的 target 必须是指向接口变量的 `&retryable`，不能写成不可编译的 `*RetryableError`。参数错误、权限错误、取消、timeout、`ToolResult{IsError:true}` 和可能已经产生副作用的错误不重试。MCP Proxy 一旦成功发送 `tools/call`，其后发生的断线、timeout 或结果不确定错误都必须分类为不可重试，避免 Manager 在外层重放远端副作用。Manager 不按错误字符串或 `net.Error.Temporary` 猜测 retryability。
+
+---
+
+## 7. ExecuteBatch
+
+调用前置条件是所有 `calls[i].Function.Name` 已由 Agent 使用当前 turn 的冻结投影精确反查为 canonical name。Batch 不认识 Provider alias，也不尝试 hash、猜测或反查；该边界避免 alias 被传入 MCP `remoteName` 或持久化链路。
+
+Batch 保持输入顺序：`results[i]` 永远对应 `calls[i]`。实现最多启动
+`min(len(calls), tools.max_concurrent, tools.max_concurrent_per_session)` 个 worker；空 Session 不应用最后一个上限。worker 从共享原子 index 取下一项并调用同一个 `Execute`，不得绕过 gate、权限或 timeout。
+
+每个 call 的 `Function.Arguments` 必须严格解码为一个 JSON object，拒绝 trailing token。参数/Tool 执行错误通过 `tool.ErrorResult` 转换为该 call 的 `ToolResult{IsError:true}`，让 Agent 仍可组成完整 Tool unit。worker 返回时先检查共享 caller `ctx.Err()`：只有它非 nil 才使 Batch 等待全部 worker 后返回 `context.Cause(ctx)`；Tool 自己的子 context timeout/cancel 而 caller 仍有效时只生成安全单项结果。
+
+Batch 不另加 retry loop，结果顺序不受完成顺序影响。
+
+---
+
+## 8. 配置更新边界
+
+- timeout、options、`default_max_retry`、`max_result_tokens` 在下一次调用读取新 snapshot；
+- enabled、Tool 集合、`max_concurrent`、`max_concurrent_per_session` 需要重启；
+- 运行中的调用固定使用开始时的 effective snapshot；
+- Agent `tools`/`tools_config` 结构变更需要重启。

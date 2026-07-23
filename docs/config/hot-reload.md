@@ -1,281 +1,178 @@
 # 配置热更新
 
-> Yaa! Yet Another Agent Runtime
-> 依赖: [README.md](README.md) §1.2, [loading.md](loading.md), [validation.md](validation.md)
+> 文档路径: `docs/config/hot-reload.md`
+> 依赖: [loading.md](loading.md)、[validation.md](validation.md)
 
 ---
 
-## 1. 概述
+## 1. 契约
 
-热更新（Hot Reload）允许 Yaa! Runtime 在不重启进程的前提下，感知配置文件变更并应用新配置。这保证了 Agent 会话不中断、连接不断开，是生产环境长稳运行的关键能力。
+热更新只应用明确列入 allowlist 的纯配置值。任何需要重新绑定端口、重建客户端、切换存储、启动进程、改变注册表或重建并发 gate 的字段都保持旧 snapshot，并在 `ReloadResult` 中标记 `restart_required`。
 
-### 1.1 核心目标
+固定流程：
 
-| 目标 | 说明 |
-|------|------|
-| **零停机** | 配置变更后无需重启 Runtime 进程 |
-| **原子替换** | 新配置整体校验通过后才替换旧配置，拒绝半成品状态 |
-| **变更传播** | 仅通知受影响的模块，避免全量刷新 |
-| **优雅降级** | 校验失败时保留旧配置，记录错误并发出告警 |
-| **防抖** | 编辑器保存触发多次事件时只处理一次 |
+```text
+file event
+  -> debounce
+  -> serialize reload
+  -> config.Load(path, flags)
+  -> validate bindings
+  -> diff(old, candidate)
+  -> classify allowlist/restart-required
+  -> atomic.Value.Store(candidate)  (only when no restart path)
+```
 
----
+`config.Load` 已完成解析、迁移、环境变量展开、presence-aware 解码和基础校验；热更新不得重复实现其中任何阶段。`ReloadManager` 是 watcher 与 `config_reload` Tool 共用的唯一发布入口。
 
 ## 2. 文件监听
 
-### 2.1 fsnotify 集成
-
-Yaa! 使用 [fsnotify](https://github.com/fsnotify/fsnotify) 监听配置文件变更：
+监听配置文件所在目录，以覆盖编辑器的临时文件 + Rename 保存方式。只处理目标路径的 `Write|Create|Rename|Remove`，300ms 防抖；文件暂时不存在时保留旧配置，下一次 Create 重新尝试。
 
 ```go
-package config
-
-import (
-	"context"
-	"path/filepath"
-	"time"
-
-	"github.com/fsnotify/fsnotify"
-)
-
 type Watcher struct {
-	fw       *fsnotify.Watcher
-	path     string
-	onChange func()
-	debounce time.Duration
+    fs        *fsnotify.Watcher
+    path      string
+    debounce  time.Duration
+    reload    func() (ReloadResult, error)
+    onReload  func(ReloadResult)
+    onError   func(error)
 }
 
-func NewWatcher(path string, onChange func()) (*Watcher, error) {
-	fw, err := fsnotify.NewWatcher()
-	if err != nil {
-		return nil, err
-	}
+func (w *Watcher) Run(ctx context.Context) error {
+    defer w.fs.Close()
+    timer := time.NewTimer(time.Hour)
+    if !timer.Stop() {
+        <-timer.C
+    }
+    defer timer.Stop()
+    var timerC <-chan time.Time
 
-	// 监听文件所在目录，兼容编辑器原子写入（删除+创建）
-	dir := filepath.Dir(path)
-	if err := fw.Add(dir); err != nil {
-		fw.Close()
-		return nil, err
-	}
-
-	return &Watcher{
-		fw:       fw,
-		path:     filepath.Clean(path),
-		onChange: onChange,
-		debounce: 300 * time.Millisecond,
-	}, nil
-}
-
-func (w *Watcher) Run(ctx context.Context) {
-	var timer *time.Timer
-
-	for {
-		select {
-		case <-ctx.Done():
-			w.fw.Close()
-			return
-
-		case event, ok := <-w.fw.Events:
-			if !ok {
-				return
-			}
-			// 仅关心目标文件的 Write/Create/Rename
-			if filepath.Clean(event.Name) != w.path {
-				continue
-			}
-			if event.Op&(fsnotify.Write|fsnotify.Create) == 0 {
-				continue
-			}
-			// 防抖：重置定时器，合并短时间内的多次事件
-			if timer != nil {
-				timer.Stop()
-			}
-			timer = time.AfterFunc(w.debounce, w.onChange)
-
-		case err, ok := <-w.fw.Errors:
-			if !ok {
-				return
-			}
-			// TODO: 记录日志，可考虑重连 watcher
-			_ = err
-		}
-	}
+    for {
+        select {
+        case <-ctx.Done():
+            return context.Cause(ctx)
+        case err, ok := <-w.fs.Errors:
+            if !ok {
+                return nil
+            }
+            if err != nil && w.onError != nil {
+                w.onError(fmt.Errorf("config watcher: %w", err))
+            }
+        case event, ok := <-w.fs.Events:
+            if !ok {
+                return nil
+            }
+            if filepath.Clean(event.Name) != w.path ||
+                event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) == 0 {
+                continue
+            }
+            if !timer.Stop() && timerC != nil {
+                select {
+                case <-timer.C:
+                default:
+                }
+            }
+            timer.Reset(w.debounce)
+            timerC = timer.C
+        case <-timerC:
+            timerC = nil
+            result, err := w.reload()
+            if err != nil {
+                if w.onError != nil {
+                    w.onError(err)
+                }
+                continue
+            }
+            if w.onReload != nil {
+                w.onReload(result)
+            }
+        }
+    }
 }
 ```
 
-### 2.2 防抖机制
+`Run` 对两个 fsnotify channel 都检查 `ok`，统一负责关闭 watcher 和 timer；reload 在同一个 goroutine 内执行，不会在 `Run` 返回后遗留 callback。Watcher 错误由 Runtime supervisor 记录并重建 watcher，当前 snapshot 不清空。
 
-编辑器（如 vim、vscode）保存文件时可能触发多次 Write 事件或触发 Rename + Create 组合。通过 300ms 防抖定时器合并事件，确保只触发一次重载。
-
----
-
-## 3. 变更传播
-
-### 3.1 订阅模式
-
-模块通过 `Subscribe()` 注册回调，配置变更时仅通知感兴趣的模块：
+## 3. 原子发布
 
 ```go
+var ErrConfigNotActive = errors.New("config reload manager not active")
+
+type ReloadResult struct {
+    Applied         bool     `json:"applied"`
+    Changed         []string `json:"changed"`
+    RestartRequired bool     `json:"restart_required"`
+    Paths           []string `json:"paths"` // 仅 restart-required paths
+}
+
 type ReloadManager struct {
-	cfgPath string
-	loader  *Loader
-	current *Config
-	mu      sync.RWMutex
-	subs    []Subscriber
+    path             string
+    flags            map[string]any
+    validateBindings func(*Config) error
+    value            atomic.Value // stores *Config; snapshots are immutable
+    reload           sync.Mutex   // serializes watcher/tool requests
+    active           bool         // protected by reload
 }
 
-type Subscriber interface {
-	// OnConfigReload 接收新旧配置，返回 error 表示该模块应用失败
-	OnConfigReload(oldCfg, newCfg *Config) error
-	// Name 返回模块名，用于日志和错误追踪
-	Name() string
-}
-
-func (m *ReloadManager) Subscribe(s Subscriber) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.subs = append(m.subs, s)
-}
-
-func (m *ReloadManager) reload() error {
-	// 1. 加载新配置
-	newCfg, err := m.loader.Load(m.cfgPath)
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
-	}
-
-	// 2. 校验新配置
-	if err := Validate(newCfg); err != nil {
-		return fmt.Errorf("validate config: %w", err)
-	}
-
-	// 3. 原子替换 + 逐模块通知
-	m.mu.Lock()
-	oldCfg := m.current
-	m.mu.Unlock()
-
-	// 4. 逐个通知订阅者，任一失败则回滚
-	applied := make([]Subscriber, 0, len(m.subs))
-	for _, s := range m.subs {
-		if err := s.OnConfigReload(oldCfg, newCfg); err != nil {
-			// 回滚已应用的模块
-			for _, done := range applied {
-				_ = done.OnConfigReload(newCfg, oldCfg)
-			}
-			return fmt.Errorf("subscriber %s apply failed: %w", s.Name(), err)
-		}
-		applied = append(applied, s)
-	}
-
-	// 5. 所有模块成功后才替换全局引用
-	m.mu.Lock()
-	m.current = newCfg
-	m.mu.Unlock()
-	return nil
-}
+func NewReloadManager(initial *Config, path string, flags map[string]any, validateBindings func(*Config) error) (*ReloadManager, error)
+func (m *ReloadManager) Activate() error
+func (m *ReloadManager) Current() *Config
+func (m *ReloadManager) Reload() (ReloadResult, error)
 ```
 
-### 3.2 传播流程
+Runtime 只执行一次 `initial := config.Load(path, flags)`。`NewReloadManager` 拒绝 nil，并立即保存这个已经通过基础校验的不可变 snapshot，因此 bootstrap 组件可以读取 `Current()`，且不会对配置文件做第二次读取。构造后 `path`、`flags` 和 validator 不变，`flags` 的 map 在构造时深拷贝。
 
-```text
-文件变更
-  │
-  ▼
-Watcher (防抖 300ms)
-  │
-  ▼
-ReloadManager.reload()
-  ├─ 1. Load(path)        → 新 Config
-  ├─ 2. Validate(newCfg)  → 校验失败则中止，保留旧配置
-  ├─ 3. 逐模块 OnReload() → 任一失败则回滚
-  └─ 4. 原子替换 m.current
-```
+Provider/Tool/Plugin/MCP/Skill catalog 使用同一个 `initial` 建立后，Runtime 调用一次 `Activate()`。它在 `reload` mutex 下对当前初始 snapshot 执行 `validateBindings`，成功后设置 `active=true`；失败保持 inactive 并触发 Runtime 逆序 rollback。`Reload()` 在 active 前返回 `ErrConfigNotActive`。Watcher、`config_query`、`config_reload` 和 Remote API 只能在 Activate 成功后启动，因此未完成 binding 的 bootstrap snapshot 不会成为外部可见配置。
 
----
+`Reload` 的核心语义：
 
-## 4. 原子替换
+1. 持有 `reload` mutex，要求 `active=true`，读取旧 snapshot。
+2. `Load` 候选文件并执行 `validateBindings`。
+3. 计算并按字典序排序 `Changed`。
+4. 计算 restart-required paths；非空时返回 `Applied=false, RestartRequired=true, Paths=...`，不调用 `Store`，且 `error=nil`。
+5. 没有 restart path 时原子 `Store` 候选，返回 `Applied=true, RestartRequired=false`。
 
-### 4.1 原则
+Load、绑定校验或内部发布错误返回非 nil error，旧 snapshot 保持不变。调用方不得修改 `Current()` 返回的字段、slice 或 map；需要可变数据的模块必须复制自己的字段。
 
-- **整体替换**：新配置作为不可变对象整体替换，不存在部分更新的中间态
-- **读多写少**：运行时使用 `sync.RWMutex` 保护，读操作无锁竞争
-- **回滚保护**：任一订阅模块应用失败，已应用的模块逐个回滚
+## 4. 唯一 hot-reload allowlist
 
-### 4.2 配置访问
+数组元素必须按稳定 ID/name 匹配；新增、删除或修改 ID 一律需要重启。
 
-```go
-func (m *ReloadManager) Get() *Config {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.current
-}
-```
+| 路径 | 生效时机 |
+|------|----------|
+| `log.level` | 下一条日志 |
+| `agents[].model` | 下一次模型请求 |
+| `agents[].system_prompt` | 下一次 Context 构建 |
+| `agents[].max_tokens`, `agents[].temperature` | 下一次模型请求 |
+| `tools.default_timeout`, `tools.max_timeout`, `tools.default_max_retry`, `tools.max_result_tokens` | 下一次 Tool 调用 |
+| `tools.builtin.<name>.timeout`, `tools.builtin.<name>.options` | 下一次对应 Tool 调用 |
+| `session.max_messages`, `session.max_message_bytes`, `session.ttl`, `session.max_lifetime`, `session.persist`, `agents[].session.*` | reload 后新建的 Session |
+| `session.max_sessions_per_agent` | 下一次 Create |
+| `session.cleanup_interval` | 下一次 cleanup ticker 重置 |
+| `context.*`, `agents[].context.*` | 下一次 Context 构建 |
+| `memory.max_items`, `memory.default_ttl`, `memory.eviction_policy` | 下一次 Agent turn 或 Remote Memory 请求 |
+| `memory.expire_interval`, `memory.expire_batch_size` | 下一次 cleanup worker tick |
+| `agents[].memory.{max_items,default_ttl,eviction_policy}` | 下一次该 Agent turn 或 Remote Memory 请求 |
 
----
+以下分组全部需要重启：
 
-## 5. 热更新支持范围
+- `runtime.storage.*`、`runtime.api.*`、`runtime.auth.*`
+- Provider 新增/删除及 `providers[].*`
+- Agent 新增/删除、ID/provider/tools/skills、`agents[].planner.*`、`agents[].tools_config`、`agents[].skills_config`
+- 根 `planner.*`、Planner Executor 的 `max_concurrent`
+- `mcp.*`、`plugins.*`
+- `skills.dir`、Skill 新增/删除、`skills.per_skill.<name>.enabled` 或结构/options 变化
+- Tool 新增/删除、`tools.builtin.<name>.enabled`、`tools.max_concurrent`、`tools.max_concurrent_per_session`
+- `memory.enabled`, `memory.storage.*`, `memory.vector.*`, `memory.embedding.*`
+- `agents[].memory.enabled`, `agents[].memory.vector.*`
+- `log.format`, `log.output`
 
-### 5.1 配置项热更新分类
+若一批变更同时包含可热更新和需重启路径，整批不应用。已创建 Session 使用 snapshot 中持久化的 resolved policy；reload 不扫描、不改写现有 Session，也不改变其 TTL、max lifetime 或 persist 语义。Context/Session 的 `validateBindings` 必须在 `Store` 前完成所有 Agent 的有效配置检查。
 
-| 配置分组 | 配置项 | 热更新 | 说明 |
-|----------|--------|:------:|------|
-| **HTTP Server** | `http.addr` | ❌ 需重启 | 监听地址变更需重新绑定端口 |
-| | `http.read_timeout` | ✅ | 下次请求生效 |
-| | `http.write_timeout` | ✅ | 下次请求生效 |
-| | `http.max_header_bytes` | ✅ | 下次请求生效 |
-| **Logging** | `log.level` | ✅ | 立即生效 |
-| | `log.format` | ✅ | 立即生效 |
-| | `log.output` | ✅ | 下次写入生效 |
-| **Provider** | `providers.*.api_key` | ✅ | 下次请求生效 |
-| | `providers.*.model` | ✅ | 下次请求生效 |
-| | `providers.*.base_url` | ✅ | 下次请求生效 |
-| | `providers.*.timeout` | ✅ | 下次请求生效 |
-| | `providers` 新增/删除 | ❌ 需重启 | 结构变更需重新初始化 |
-| **Agent** | `agents.*.system_prompt` | ✅ | 新会话生效 |
-| | `agents.*.max_tokens` | ✅ | 新会话生效 |
-| | `agents.*.temperature` | ✅ | 新会话生效 |
-| | `agents` 新增/删除 | ❌ 需重启 | 结构变更需重新初始化 |
-| **Skill** | `skills.*.enabled` | ✅ | 立即生效 |
-| | `skills.*.config` | ✅ | 下次调用生效 |
-| **MCP** | `mcp.servers.*.command` | ❌ 需重启 | 子进程需重启 |
-| | `mcp.servers.*.args` | ❌ 需重启 | 子进程需重启 |
-| | `mcp.servers.*.env` | ❌ 需重启 | 子进程需重启 |
-| **Memory** | `memory.backend` | ❌ 需重启 | 后端切换需重新初始化 |
-| | `memory.max_size` | ✅ | 下次写入生效 |
-| **Session** | `session.max_idle` | ✅ | 立即生效 |
-| | `session.max_count` | ✅ | 立即生效 |
+## 5. 结果与可观测性
 
-### 5.2 判断原则
-
-| 判断维度 | 热更新 ✅ | 需重启 ❌ |
-|----------|----------|-----------|
-| **资源绑定** | 无外部资源依赖 | 绑定端口、文件句柄、子进程 |
-| **结构变更** | 仅修改值 | 新增/删除数组元素或 map 键 |
-| **连接状态** | 无状态或短生命周期请求 | 长连接、子进程、持久化后端 |
-| **数据一致性** | 新配置从下次操作生效即可 | 需要迁移已有数据 |
+文件监听失败只记录结构化日志并保留旧快照。`config_reload` Tool 直接返回 `ReloadResult`；成功或 restart-required 结果只包含路径，不包含旧/新 Secret 值。失败记录 `config.reload_failed`（错误分类、路径和 request ID），不通过 Remote SSE 广播；Remote API 不提供 `/api/v1/config/reload`。
 
 ---
 
-## 6. 错误处理
-
-| 场景 | 行为 |
-|------|------|
-| 配置文件语法错误 | 保留旧配置，日志记录解析错误，告警 |
-| 校验失败 | 保留旧配置，日志记录校验错误，告警 |
-| 模块应用失败 | 回滚已应用模块，保留旧配置，日志记录失败模块 |
-| 文件被删除 | 保留旧配置，日志告警，等待文件恢复后自动恢复监听 |
-| Watcher 系统错误 | 保留旧配置，日志告警，尝试重建 Watcher |
-
----
-
-## 7. 最佳实践
-
-1. **编辑器原子写入**：vim 等编辑器使用 "删除+创建" 方式保存，Watcher 应监听目录而非文件本身
-2. **防抖时间**：300ms 适合大多数编辑器；SSD 上可降至 100ms
-3. **灰度验证**：生产环境可在 `OnConfigReload` 中加入灰度逻辑，先对小比例 Agent 生效
-4. **审计日志**：每次热更新记录变更前后的 diff，便于追溯
-5. **配置备份**：热更新前自动备份当前配置，支持一键回滚
-
----
-
-*最后更新: 2025-07-17*
+*最后更新: 2026-07-22*

@@ -1,252 +1,225 @@
-# Plugin 接口详解
+# Plugin RPC 接口
 
-## 概述
+> 文档路径: `docs/plugin/interface.md`
+> 上级: [README.md](README.md)
+> 目标 IDL: `api/plugin/v1/plugin.proto`
 
-Plugin 是 Yaa! Runtime 的扩展机制，允许第三方在不修改核心代码的情况下向 Runtime 注入新能力。Plugin 接口遵循 Go interface 兼容性规则：新增方法必须带默认实现（通过嵌入接口或默认结构体），确保已发布的插件在版本升级时不会编译失败。
+---
 
-## 文件结构
+## 1. 边界
 
+Runtime 只作为 gRPC Client 连接 Plugin 进程提供的 gRPC Server。没有反向 Runtime gRPC Server；Plugin 不接收 Runtime 指针、Manager、数据库连接或内部 Go interface。
+
+```text
+Runtime Plugin Manager
+  └─ gRPC Client ── local IPC ── Plugin gRPC Server
+       └─ Tool Proxy                 └─ Tool handler
 ```
-plugin/
-├── plugin.go    # Plugin 接口定义与默认实现
-├── manager.go   # 插件管理器（注册、生命周期、依赖解析）
-└── loader.go    # 插件加载器（发现、实例化、配置注入）
+
+Unix 使用 Unix Socket；Windows 7 使用仅绑定 loopback 的 TCP。MVP 不接受远程 Plugin endpoint。
+
+## 2. 生命周期
+
+```text
+Handshake(runtime_protocol="1", expected_plugin_id)
+  → HandshakeResponse(protocol_version, plugin_id, plugin_version, startup_nonce)
+Init(expanded_config)
+  → Ack
+Ready()
+  → ReadyResponse(capabilities)
+Health()
+  → HealthResponse
+Stop()
+  → Ack
 ```
 
-## Plugin 接口定义
-
-### 核心接口
+Runtime 为每次启动生成 32-byte random nonce，并只通过 `YAA_PLUGIN_STARTUP_NONCE` 子进程环境传入。Plugin SDK 的 HandshakeResponse 必须原样回显 `startup_nonce`；Runtime 使用 constant-time compare 同时校验 nonce、身份和 RPC major。Handshake 不返回 capability。Init 成功后 Runtime 调用 Ready 并缓存 capability；Manifest `provides[]` 与 Ready 结果的 type/name/description/schema 集合必须精确一致，之后才注册 Proxy。
 
 ```go
-// Plugin 是所有插件必须实现的核心接口。
-// 新版本新增方法时，通过嵌入 PluginV2 等子接口实现向后兼容。
 type Plugin interface {
-    // ID 返回插件的全局唯一标识符，格式为 reverse-DNS，如 "com.yaa.plugin.metrics"。
     ID() string
-
-    // Name 返回插件的人类可读名称，如 "Metrics Collector"。
-    Name() string
-
-    // Version 返回插件语义化版本号，如 "1.2.0"。
     Version() string
-
-    // Init 在插件实例化后、启动前调用，用于读取配置、建立连接等准备工作。
-    // 返回 error 表示初始化失败，Runtime 将阻止插件启动。
-    Init(ctx context.Context, cfg Config) error
-
-    // Start 启动插件，使其进入工作状态。
-    // 对于后台任务型插件，此处应启动 goroutine 并立即返回。
-    Start(ctx context.Context) error
-
-    // Stop 停止插件，释放所有资源。
-    // Runtime 保证 Stop 在 Init/Start 成功后才会调用。
-    // ctx 超时后 Runtime 将强制回收资源。
+    Init(ctx context.Context, cfg map[string]any) error
+    Capabilities() []CapabilityDescriptor
+    Health(ctx context.Context) HealthStatus
     Stop(ctx context.Context) error
+}
 
-    // Health 返回插件当前健康状态。
-    // Runtime 定期调用以进行存活检测。
-    Health() HealthStatus
+type CapabilityDescriptor struct {
+    Type   string         `json:"type"` // v1 只有 tool
+    Name   string         `json:"name"`
+    Description string    `json:"description"`
+    Schema map[string]any `json:"schema,omitempty"`
 }
 ```
 
-### 健康状态
+Plugin SDK 可把该进程内接口适配到生成的 gRPC Server，但 Runtime 不依赖此 Go interface。
+
+## 3. IDL 服务
+
+当前仓库处于文档阶段，下面代码块是完整、唯一权威的 v1 IDL。开始实现时必须先原样落到 `api/plugin/v1/plugin.proto`，再生成 `pkg/pluginrpc/gen`；proto 落地后由该文件接管唯一 wire contract，本代码块应删除或明确降为非权威镜像。生成代码不得手工修改，CI 必须校验 proto、生成物和任何保留镜像的一致性。仓库模块路径以当前 Git remote 对应的 `github.com/imshuai/yaa` 为准。
+
+```proto
+syntax = "proto3";
+
+package yaa.plugin.v1;
+
+option go_package = "github.com/imshuai/yaa/pkg/pluginrpc/gen;pluginv1";
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+service PluginService {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc Init(InitRequest) returns (Ack);
+  rpc Ready(ReadyRequest) returns (ReadyResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Stop(StopRequest) returns (Ack);
+
+  rpc InvokeTool(ToolRequest) returns (ToolResponse);
+}
+
+message Ack {}
+
+message HandshakeRequest {
+  string runtime_protocol = 1;
+  string expected_plugin_id = 2;
+}
+
+message HandshakeResponse {
+  string protocol_version = 1;
+  string plugin_id = 2;
+  string plugin_version = 3;
+  string startup_nonce = 4;
+}
+
+message InitRequest {
+  google.protobuf.Struct config = 1;
+}
+
+message ReadyRequest {}
+
+enum CapabilityType {
+  CAPABILITY_TYPE_UNSPECIFIED = 0;
+  CAPABILITY_TYPE_TOOL = 1;
+}
+
+message CapabilityDescriptor {
+  CapabilityType type = 1;
+  string name = 2;
+  google.protobuf.Struct schema = 3;
+  string description = 4;
+}
+
+message ReadyResponse {
+  repeated CapabilityDescriptor capabilities = 1;
+}
+
+message HealthRequest {}
+
+enum HealthLevel {
+  HEALTH_LEVEL_UNSPECIFIED = 0;
+  HEALTH_LEVEL_HEALTHY = 1;
+  HEALTH_LEVEL_DEGRADED = 2;
+  HEALTH_LEVEL_UNHEALTHY = 3;
+}
+
+message HealthResponse {
+  HealthLevel level = 1;
+  string message = 2;
+  google.protobuf.Timestamp observed_at = 3;
+}
+
+message StopRequest {}
+
+message ToolRequest {
+  string plugin_id = 1;
+  string request_id = 2;
+  string agent_id = 3;
+  string session_id = 4;
+  string name = 5;
+  google.protobuf.Struct arguments = 6;
+}
+
+message ToolResult {
+  string content = 1;
+  bool is_error = 2;
+  google.protobuf.Struct meta = 3;
+}
+
+enum ToolErrorCode {
+  TOOL_ERROR_CODE_UNSPECIFIED = 0;
+  TOOL_ERROR_CODE_INVALID_ARGUMENT = 1;
+  TOOL_ERROR_CODE_TIMEOUT = 2;
+  TOOL_ERROR_CODE_UNAVAILABLE = 3;
+  TOOL_ERROR_CODE_INTERNAL = 4;
+}
+
+message ToolError {
+  ToolErrorCode code = 1;
+  string message = 2;
+  bool retryable = 3;
+}
+
+message ToolResponse {
+  string request_id = 1;
+  oneof outcome {
+    ToolResult result = 2;
+    ToolError error = 3;
+  }
+}
+```
+
+每个业务请求都包含 `plugin_id` 和 `request_id`；ToolRequest 还必须携带 Tool Manager 已验证的 `agent_id` 和真实 `session_id`（非 Session 调用为空）。deadline 与取消只由 gRPC context 传播，不复制成可能漂移的载荷字段。`ToolResponse.request_id` 必须精确回显请求值，且 `outcome` 恰有一个分支；缺失、错 ID 或未知 enum 都是 `ErrPluginProtocolIncompatible`，Proxy 必须使当前 handle unavailable 并通过 `RPCClient.Terminate()` 回收进程和 transport。响应只能返回可序列化数据，不返回 Go type name 或进程内地址。
+
+## 4. Capability 载荷
+
+### 4.1 Tool
+
+```json
+{
+  "plugin_id": "weather",
+  "request_id": "call_01",
+  "agent_id": "default",
+  "session_id": "ses_01J...",
+  "name": "weather",
+  "arguments": {"city": "Shanghai"}
+}
+```
+
+Tool response 的 result 映射为统一 `tool.ToolResult`；error 映射为 typed hard error。`retryable=true` 只允许在 Plugin 能保证尚未产生外部副作用时设置，Proxy 再实现 Tool Manager 的 `RetryableError`；timeout、结果不确定或已经产生副作用时必须为 false。error message 使用稳定、脱敏且不超过 512 UTF-8 bytes 的文本。Plugin 不能从 arguments 推导或覆盖 execution scope。
+
+## 5. 健康与错误
 
 ```go
-// HealthStatus 描述插件的健康状况。
 type HealthStatus struct {
-    Status    HealthLevel // 健康等级
-    Message   string      // 人类可读描述
-    Timestamp time.Time   // 检测时间
-}
-
-type HealthLevel int
-
-const (
-    HealthHealthy   HealthLevel = iota // 正常运行
-    HealthDegraded                     // 降级运行（部分功能不可用）
-    HealthUnhealthy                    // 异常（需要重启）
-    HealthUnknown                      // 未知（尚未检测）
-)
-```
-
-### 接口方法一览
-
-| 方法 | 调用时机 | 返回值说明 | 是否可阻塞 |
-|------|---------|-----------|-----------|
-| `ID()` | 全生命周期 | 插件唯一标识 | 否 |
-| `Name()` | 全生命周期 | 可读名称 | 否 |
-| `Version()` | 全生命周期 | 语义化版本 | 否 |
-| `Init()` | 加载后、启动前 | error 非 nil 则阻止启动 | 是（受超时控制） |
-| `Start()` | Init 成功后 | error 非 nil 则标记启动失败 | 是（受超时控制） |
-| `Stop()` | 关闭/重启时 | error 非 nil 记录日志 | 是（受超时控制） |
-| `Health()` | 定期巡检 | HealthStatus | 否（应快速返回） |
-
-## 插件能力注册
-
-Plugin 通过 `Capabilities()` 方法向 Runtime 声明自身提供的能力。Runtime 根据能力注册表将插件功能接入对应子系统。
-
-### 能力接口
-
-```go
-// Capability 描述插件向 Runtime 注册的能力。
-type Capability struct {
-    Type     CapabilityType // 能力类型
-    Name     string         // 能力名称（在同类中唯一）
-    Instance any            // 能力实例（由 Runtime 类型断言后使用）
-}
-
-type CapabilityType string
-
-const (
-    CapToolProvider  CapabilityType = "tool_provider"  // 提供 Tool
-    CapSkillProvider CapabilityType = "skill_provider" // 提供 Skill
-    CapHook          CapabilityType = "hook"           // 生命周期 Hook
-    CapMiddleware    CapabilityType = "middleware"      // 中间件
-    CapStorage       CapabilityType = "storage"        // 存储后端
-    CapProvider      CapabilityType = "provider"       // LLM Provider
-)
-```
-
-### 能力注册扩展接口
-
-```go
-// PluginWithCapabilities 是可选接口，插件按需实现。
-// 未实现该接口的插件被视为"纯生命周期插件"。
-type PluginWithCapabilities interface {
-    Plugin
-    Capabilities() []Capability
+    Level     string    `json:"level"` // healthy | degraded | unhealthy | unknown
+    Message   string    `json:"message"`
+    Timestamp time.Time `json:"timestamp"`
 }
 ```
 
-### 能力类型对照表
+Health 必须在 `plugins.health_timeout` 内返回。单次失败只标记 degraded，不杀进程；自动重启只由运行期间意外进程退出触发。
 
-| 能力类型 | 接口 | Runtime 接入点 | 典型场景 |
-|---------|------|---------------|---------|
-| `tool_provider` | `ToolProvider` | Tool Registry | 自定义工具集 |
-| `skill_provider` | `SkillProvider` | Skill Manager | 领域技能包 |
-| `hook` | `LifecycleHook` | Event Bus | 会话前后处理 |
-| `middleware` | `Middleware` | Request Pipeline | 请求拦截/转换 |
-| `storage` | `StorageBackend` | Storage Layer | 自定义存储引擎 |
-| `provider` | `LLMProvider` | Provider Manager | 接入新 LLM |
+gRPC status 到 Runtime error 的唯一映射见 [errors.md](errors.md)。错误 message 必须脱敏并限制长度；Plugin 堆栈只写 Plugin 自己的日志。
 
-## 完整示例：自定义指标插件
+## 6. 版本兼容
 
-```go
-package metrics
+`protocol_version` 是 RPC major 字符串。MVP Runtime 和 Plugin 都只支持 `"1"`，不相等即拒绝启动。同一 major 只允许新增可忽略的 Protobuf 字段；v1 Handshake 没有 supported-capability 输入，且 Runtime 要求 Manifest/Ready capability 精确相等，因此新增 capability type、删除字段、复用 field number 或改变语义都必须升级 major。
 
-import (
-    "context"
-    "fmt"
-    "time"
-)
+Plugin 的业务 `version` 与 `requires_runtime` 使用 SemVer，但不替代 RPC major 检查。SDK 不提供 `PluginV2` 类型断言。
 
-// MetricsPlugin 收集 Runtime 运行指标并暴露给 Prometheus。
-type MetricsPlugin struct {
-    id      string
-    version string
-    config  MetricsConfig
-    server  *http.Server
-    healthy bool
-}
+## 7. 目录
 
-// --- Plugin 接口实现 ---
-
-func (p *MetricsPlugin) ID() string         { return "com.yaa.plugin.metrics" }
-func (p *MetricsPlugin) Name() string       { return "Metrics Collector" }
-func (p *MetricsPlugin) Version() string    { return p.version }
-
-func (p *MetricsPlugin) Init(ctx context.Context, cfg Config) error {
-    if err := cfg.Decode(&p.config); err != nil {
-        return fmt.Errorf("metrics: decode config: %w", err)
-    }
-    if p.config.Port == 0 {
-        p.config.Port = 9090 // 默认端口
-    }
-    return nil
-}
-
-func (p *MetricsPlugin) Start(ctx context.Context) error {
-    mux := http.NewServeMux()
-    mux.HandleFunc("/metrics", p.handleMetrics)
-    p.server = &http.Server{
-        Addr:    fmt.Sprintf(":%d", p.config.Port),
-        Handler: mux,
-    }
-    go func() {
-        _ = p.server.ListenAndServe()
-    }()
-    p.healthy = true
-    return nil
-}
-
-func (p *MetricsPlugin) Stop(ctx context.Context) error {
-    p.healthy = false
-    if p.server != nil {
-        return p.server.Shutdown(ctx)
-    }
-    return nil
-}
-
-func (p *MetricsPlugin) Health() HealthStatus {
-    level := HealthHealthy
-    if !p.healthy {
-        level = HealthUnhealthy
-    }
-    return HealthStatus{
-        Status:    level,
-        Message:   fmt.Sprintf("listening on :%d", p.config.Port),
-        Timestamp: time.Now(),
-    }
-}
-
-// --- PluginWithCapabilities 实现 ---
-
-func (p *MetricsPlugin) Capabilities() []Capability {
-    return []Capability{
-        {Type: CapMiddleware, Name: "metrics_collector", Instance: p},
-    }
-}
-
-// --- 工厂函数 ---
-
-func New() Plugin {
-    return &MetricsPlugin{version: "1.0.0"}
-}
+```text
+api/plugin/v1/plugin.proto       # 目标：落地后成为唯一 wire contract（当前待创建）
+pkg/pluginrpc/gen/               # 目标：由 protoc 生成（当前待创建）
+pkg/pluginrpc/client.go          # Runtime client adapter
+pkg/pluginrpc/server.go          # Plugin SDK server adapter
+pkg/pluginrpc/transport.go       # Unix Socket / loopback TCP
+internal/plugin/                 # Runtime Manager/Loader/Proxy
 ```
 
-## 向后兼容策略
+---
 
-| 场景 | 策略 | 说明 |
-|------|------|------|
-| 新增方法 | 嵌入默认实现结构体 | 旧插件不实现新方法也能编译 |
-| 修改方法签名 | 新建 V2 接口 | 保留旧接口，Runtime 双重断言 |
-| 废弃方法 | 标注 `// Deprecated` | 保留 2 个大版本后移除 |
-| 能力扩展 | 新增 CapabilityType | 不影响已有能力注册 |
-
-```go
-// 默认实现结构体，供插件嵌入以获得新方法的默认行为。
-type PluginBase struct{}
-
-func (PluginBase) Health() HealthStatus {
-    return HealthStatus{Status: HealthUnknown, Timestamp: time.Now()}
-}
-
-// 未来版本新增方法示例：
-// type PluginV2 interface {
-//     Plugin
-//     Reload(ctx context.Context) error  // 热重载
-// }
-// PluginBase 实现 Reload 的默认 no-op 版本。
-```
-
-## Plugin 与 Manager/Loader 的协作关系
-
-```
-Loader 发现插件 → 实例化 Plugin → 调用 Init(cfg)
-    → Manager 注册到插件表
-    → 调用 Start() → 注册 Capabilities → 接入子系统
-    → 定期调用 Health() 巡检
-    → 关闭时调用 Stop() → 注销 Capabilities → 从插件表移除
-```
-
-Manager 负责维护插件依赖图、启动顺序和并行控制；Loader 负责从配置或文件系统发现插件并实例化。两者通过 `Plugin` 接口与插件交互，不依赖具体实现类型。
+*最后更新: 2025-07-17*

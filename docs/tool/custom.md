@@ -32,7 +32,7 @@ func (t *MyTool) Parameters() json.RawMessage {
     }`)
 }
 
-func (t *MyTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
+func (t *MyTool) Execute(ctx context.Context, scope ExecutionScope, params map[string]any) (ToolResult, error) {
     input, _ := params["input"].(string)
 
     // 模拟处理
@@ -49,52 +49,36 @@ func (t *MyTool) Execute(ctx context.Context, params map[string]any) (ToolResult
 
 ### 7.2 注册方式
 
-#### 方式一：配置文件声明（推荐）
+#### 方式一：Plugin RPC（第三方二进制能力）
 
 ```yaml
-tools:
-  custom:
-    - name: "my_tool"
-      type: "plugin"
-      plugin: "my_plugin.so"    # Go 插件文件
+plugins:
+  entries:
+    - id: "my-tool-plugin"
       enabled: true
-      timeout: 60s
-      options:
+      config:
         api_key: "${MY_API_KEY}"
 ```
 
-#### 方式二：编程注册
+Plugin Manager 根据 Manifest 的 Tool capability 创建 `Tool` Proxy 并注册到 Tool Manager，Runtime 不加载共享库。
+
+#### 方式二：编程注册（仅内置 Tool）
 
 ```go
-// 在插件 init() 中注册
-func init() {
-    toolManager.Register(&MyTool{}, ToolConfig{
+func registerBuiltins(toolManager *Manager) error {
+    return toolManager.Register(&MyTool{}, config.ToolConfig{
         Enabled: true,
         Timeout: 60 * time.Second,
-    })
+    }, "builtin")
 }
 ```
 
 #### 方式三：MCP 桥接
 
-通过 MCP 协议将外部工具注册为 Yaa! Tool（详见 `mcp.md`）。
+通过 MCP 协议将外部工具注册为 Yaa! Tool（详见 [MCP 系统设计](../mcp/README.md)）。
 
-### 7.3 插件接口
+### 7.3 Plugin Tool Proxy
 
-```go
-// ToolPlugin 是 Tool 插件的入口接口。
-// 插件 .so 文件必须导出一个实现此接口的变量 `ToolPluginInstance`。
-type ToolPlugin interface {
-    // Init 初始化插件，读取配置。
-    Init(config map[string]any) error
-
-    // Tools 返回插件提供的所有 Tool 实例。
-    Tools() []Tool
-}
-
-// 导出符号
-var ToolPluginInstance ToolPlugin = &MyPlugin{}
-```
+`PluginToolProxy` 位于 `internal/plugin` 并实现本包的 `Tool` interface；本包不导入 Plugin 模块，避免循环依赖。唯一结构和 scope/wire 转换见 [Plugin Tool 集成](../plugin/integration.md#2-tool-集成)。Tool Manager 只通过 `Register(tool, cfg, "plugin")` 接收该 Proxy。
 
 ---
-

@@ -1,14 +1,37 @@
 # Skill API
 
-> [← 返回索引](./INDEX.md)
+> [返回索引](INDEX.md) · canonical 模型见 [Skill Manager](../skill/manager.md)
 
----
+Skill API 只读取启动时冻结的 Manager snapshot，不重新扫描文件。列表和详情使用显式 DTO，不直接序列化包含绝对路径与 options 的 `skill.Entry`。
+
+## DTO
+
+```go
+type SkillSummary struct {
+    Name        string       `json:"name"`
+    Description string       `json:"description"`
+    Version     string       `json:"version"`
+    Status      skill.Status `json:"status"` // loaded | disabled
+}
+
+type SkillView struct {
+    Name        string       `json:"name"`
+    Description string       `json:"description"`
+    Version     string       `json:"version"`
+    Author      string       `json:"author"`
+    Tools       []string     `json:"tools"`  // Skill.Tools：已注册 Tool 依赖
+    Skills      []string     `json:"skills"` // Skill.Skills：Prompt 依赖
+    Status      skill.Status `json:"status"`
+    LoadedAt    time.Time    `json:"loaded_at"`
+    Prompt      string       `json:"prompt"`
+}
+```
+
+所有 slice 按 name 升序并输出空数组而不是 null；`Tools` 使用 Skill 声明的 canonical Tool name，不投影 Provider alias。可选 string 输出空串。DTO 省略 `Entry.Path` 和全部 frontmatter/root/Agent options，避免绝对路径与开放配置 map 泄露。Status 的 wire 值由 string 类型本身固定，不把 Go enum integer 输出到 JSON。
 
 ## GET /api/v1/skills
 
-列出所有已加载的 Skill。
-
-**响应 data:**
+返回全部 loaded/disabled Skill 的 `SkillSummary`，按 name 升序，不分页：
 
 ```json
 {
@@ -17,78 +40,36 @@
       "name": "weather",
       "description": "Get current weather and forecasts",
       "version": "1.0.0",
-      "triggers": ["weather", "temperature", "forecast"],
-      "enabled": true,
-      "loaded_at": "2025-07-15T10:00:00Z"
+      "status": "loaded"
     }
-  ],
-  "total": 1
+  ]
 }
 ```
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `triggers` | []string | 触发关键词列表 |
-| `loaded_at` | string | Skill 加载时间 |
-
----
-
 ## GET /api/v1/skills/:name
 
-获取 Skill 详情。
-
-**响应 data:**
+返回 `SkillView`：
 
 ```json
 {
   "name": "weather",
   "description": "Get current weather and forecasts",
   "version": "1.0.0",
-  "triggers": ["weather", "temperature", "forecast"],
-  "enabled": true,
-  "tools": ["web_search", "web_fetch"],
-  "workflow": "Read SKILL.md → Parse location → Fetch weather → Return result",
-  "loaded_at": "2025-07-15T10:00:00Z"
+  "author": "example",
+  "tools": ["http"],
+  "skills": [],
+  "status": "loaded",
+  "loaded_at": "2026-07-22T01:00:00Z",
+  "prompt": "# Weather\n\nUse the HTTP tool..."
 }
 ```
+
+未知 name 返回 404 / `40401`；Manager 未 Ready 返回 503 / `50301`。Disabled Skill 是已知资源，仍返回 200 和 `status:"disabled"`。
+
+## 调用边界
+
+v1 没有 Skill invoke、install、uninstall、enable、disable 或 reload API。Skill Prompt 只在已知 Agent/Session turn 中按启动 Config 注入，并参与普通 Tool loop；协议见 [调用契约](../skill/invocation.md)。
 
 ---
 
-## POST /api/v1/skills/:name/invoke
-
-手动触发 Skill 执行。
-
-**请求 Body:**
-
-```json
-{
-  "session_id": "ses_01J...",
-  "input": "What's the weather in Shanghai?",
-  "arguments": {}
-}
-```
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `session_id` | string | ❌ | 关联的 Session ID，留空则在临时上下文中执行 |
-| `input` | string | ✅ | 触发输入文本 |
-| `arguments` | object | ❌ | 额外参数 |
-
-**响应 data:**
-
-```json
-{
-  "skill": "weather",
-  "session_id": "ses_01J...",
-  "result": {
-    "location": "Shanghai",
-    "temperature": 35,
-    "condition": "cloudy",
-    "humidity": 78
-  },
-  "tool_calls": [
-    { "name": "web_search", "arguments": { "query": "Shanghai weather" } }
-  ],
-  "duration_ms": 1200
-}
-```
+*最后更新: 2026-07-22*

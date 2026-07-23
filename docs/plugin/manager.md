@@ -1,450 +1,406 @@
-# Plugin Manager 详解
+# Plugin Manager
 
-> Plugin Manager 负责插件的加载、依赖解析、生命周期管理、启用/禁用及隔离。
-> Plugin 是 Yaa! 扩展能力的核心机制，允许在不修改 Runtime 主体的前提下增加 Tool、Provider、Skill 等能力。
-
----
-
-## 1. 设计目标
-
-| 目标 | 说明 |
-|------|------|
-| **热插拔** | Runtime 运行期间可动态加载、卸载插件，无需重启 |
-| **依赖安全** | 自动解析插件依赖关系，检测循环依赖与缺失依赖 |
-| **生命周期可控** | 每个插件拥有独立的状态机，支持优雅启停 |
-| **隔离性** | 插件之间资源隔离，单个插件崩溃不影响 Runtime |
-| **配置驱动** | 插件通过 YAML 配置声明，遵循 Config over Code 原则 |
-| **向后兼容** | 插件接口变更遵循 Go interface 兼容规则，提供适配层 |
+> 文档路径: `docs/plugin/manager.md`
+> 上级: [README.md](README.md)
+> 依赖: [loader.md](loader.md)、[config-ref.md](config-ref.md)
 
 ---
 
-## 2. 核心接口
+## 1. 职责与状态
+
+Manager 负责发现结果、依赖图、启用决策、启动顺序、Proxy 注册、健康检查、进程监控和关闭。单个 Plugin 失败进入启动报告并继续处理其他 Plugin；若最终 Agent/Skill binding 引用其缺失 Tool，Runtime 不进入 Ready。
 
 ```go
-// Plugin 是所有插件必须实现的核心接口
-type Plugin interface {
-    // Manifest 返回插件元信息
-    Manifest() Manifest
-    // Init 在插件加载时调用，接收 Runtime 注入的上下文
-    Init(ctx *PluginContext) error
-    // Start 启动插件资源（如连接池、后台协程）
-    Start() error
-    // Stop 停止插件，释放资源
-    Stop() error
-    // Provide 返回插件向 Runtime 注入的能力扩展点
-    Provide() Extensions
-}
+type PluginState string
 
-// Manifest 描述插件元信息
-type Manifest struct {
-    ID          string   // 唯一标识，如 "weather-provider"
-    Name        string   // 人类可读名称
-    Version     string   // 语义化版本号
-    Description string
-    Author      string
-    Dependencies []Dependency // 依赖的其他插件或 Runtime 版本
-    Category    Category      // Tool / Provider / Skill / Hook
-}
+const (
+    StateDiscovered PluginState = "discovered"
+    StateStarting   PluginState = "starting"
+    StateReady      PluginState = "ready"
+    StateError      PluginState = "error"
+    StateStopped    PluginState = "stopped"
+)
 
-// Dependency 描述插件依赖
-type Dependency struct {
-    ID      string // 插件 ID 或 "runtime"
-    Version string // 版本约束，如 ">=1.2.0"
-}
-
-// Extensions 是插件可提供的扩展点集合
-type Extensions struct {
-    Tools    []tool.Tool
-    Providers []provider.Provider
-    Skills   []skill.Skill
-    Hooks    []Hook
-}
-
-// PluginContext 是 Runtime 注入给插件的运行上下文
-type PluginContext struct {
-    Config  *config.Config
-    Storage storage.Storage
-    Logger  *slog.Logger
-}
-```
-
----
-
-## 3. 插件加载流程
-
-```text
-Runtime 启动
-  │
-  ▼
-扫描插件目录 (./plugins/*.so 或 ./plugins/*/plugin.yaml)
-  │
-  ├─ 内置插件: Go interface 直接注册
-  ├─ 外部插件: 使用 Go plugin 包加载 .so 文件
-  └─ 声明式插件: 解析 YAML，通过配置注册 Tool/Provider
-  │
-  ▼
-解析每个插件的 Manifest
-  │
-  ▼
-依赖拓扑排序（检测循环依赖 → 报错退出）
-  │
-  ▼
-按排序顺序逐个执行：
-  1. Init(ctx)    — 注入运行上下文
-  2. Start()      — 启动资源
-  3. Provide()    — 注册扩展能力到对应 Registry
-  │
-  ▼
-所有插件就绪，Runtime 标记为 Ready
-```
-
----
-
-## 4. 依赖解析
-
-Plugin Manager 使用 **有向无环图（DAG）** 进行拓扑排序，确保被依赖的插件先加载。
-
-```go
-// Resolver 依赖解析器
-type Resolver struct {
-    plugins map[string]*node // 插件依赖图
-}
-
-type node struct {
-    manifest  Manifest
-    dependsOn []*node
-    state     PluginState
-}
-
-// Resolve 执行拓扑排序，返回加载顺序
-func (r *Resolver) Resolve() ([]string, error) {
-    var order []string
-    visited := make(map[string]bool)
-    visiting := make(map[string]bool) // 用于检测循环依赖
-
-    var visit func(n *node) error
-    visit = func(n *node) error {
-        if visited[n.manifest.ID] {
-            return nil
-        }
-        if visiting[n.manifest.ID] {
-            return fmt.Errorf("检测到循环依赖: 插件 %s", n.manifest.ID)
-        }
-        visiting[n.manifest.ID] = true
-
-        for _, dep := range n.dependsOn {
-            if dep == nil {
-                return fmt.Errorf("缺少依赖: %s 依赖的插件不存在", n.manifest.ID)
-            }
-            if err := visit(dep); err != nil {
-                return err
-            }
-        }
-
-        visiting[n.manifest.ID] = false
-        visited[n.manifest.ID] = true
-        order = append(order, n.manifest.ID)
-        return nil
-    }
-
-    for _, n := range r.plugins {
-        if err := visit(n); err != nil {
-            return nil, err
-        }
-    }
-    return order, nil
-}
-```
-
-| 场景 | 处理方式 |
-|------|----------|
-| 缺少依赖 | 启动阶段直接报错，列出缺失的插件 ID |
-| 循环依赖 | 启动阶段检测到后报错，拒绝启动 |
-| 版本不兼容 | 对比 Manifest.Version 约束，不满足则跳过并告警 |
-| 可选依赖 | 标注 `optional: true` 时，缺失不影响加载 |
-
----
-
-## 5. 生命周期管理
-
-每个插件拥有独立的状态机：
-
-```text
-Discovered → Loaded → Initialized → Started → (Paused ↔ Started) → Stopped → Unloaded
-```
-
-| 状态 | 说明 | 触发条件 |
-|------|------|----------|
-| Discovered | 插件被发现但未加载 | 扫描目录完成 |
-| Loaded | 插件代码/配置已加载 | 文件解析成功 |
-| Initialized | Init() 执行成功 | 依赖注入完成 |
-| Started | Start() 执行成功 | 资源就绪 |
-| Paused | 临时暂停，保留状态 | 手动暂停或资源不足 |
-| Stopped | Stop() 执行成功 | 手动停止或 Runtime 关闭 |
-| Unloaded | 资源完全释放 | 卸载插件 |
-
-```go
-// Manager 管理所有插件的生命周期
-type Manager struct {
-    plugins map[string]*PluginEntry
-    mu      sync.RWMutex
-    resolver *Resolver
-    logger  *slog.Logger
-}
-
-type PluginEntry struct {
-    Plugin    Plugin
+type Entry struct {
+    Descriptor PluginDescriptor
+    Client    *RPCClient
+    Handle    *ProxyHandle
+    ProxyNames []string
     State     PluginState
-    Config    *PluginConfig
-    LoadedAt  time.Time
+    Health    HealthStatus
+    Config    map[string]any
+    Enabled   *bool
+    StartedAt time.Time
+    LastError error
 }
 
-// Load 加载单个插件
-func (m *Manager) Load(p Plugin) error {
-    m.mu.Lock()
-    defer m.mu.Unlock()
+type Manager struct {
+    loader               *Loader
+    tools                *tool.Manager
+    entries              map[string]*Entry
+    discoveryDiagnostics []error
+    config               config.PluginsConfig
+    runCtx               context.Context
+    runCancel            context.CancelFunc
+    stopping             atomic.Bool
+    lifecycleMu          sync.Mutex // 关闭启动 gate，禁止 wg.Add 与 wg.Wait 竞态
+    mu                    sync.RWMutex
+    logger                *slog.Logger
+    wg                    sync.WaitGroup
+    stopOnce              sync.Once
+    stopDone              chan struct{}
+    stopErr               error
+}
 
-    manifest := p.Manifest()
-    if _, exists := m.plugins[manifest.ID]; exists {
-        return fmt.Errorf("插件 %s 已存在", manifest.ID)
+type ProxyHandle struct { client atomic.Pointer[RPCClient] }
+
+func (h *ProxyHandle) Load() (*RPCClient, error) {
+    client := h.client.Load()
+    if client == nil {
+        return nil, ErrPluginUnavailable
+    }
+    return client, nil
+}
+
+func (h *ProxyHandle) Store(client *RPCClient) { h.client.Store(client) }
+
+func (h *ProxyHandle) Invalidate(client *RPCClient) bool {
+    return h.client.CompareAndSwap(client, nil)
+}
+
+func clonePluginConfig(src map[string]any) map[string]any {
+    if src == nil {
+        return map[string]any{}
+    }
+    dst := make(map[string]any, len(src))
+    for key, value := range src {
+        dst[key] = clonePluginConfigValue(value)
+    }
+    return dst
+}
+
+func clonePluginConfigValue(value any) any {
+    switch value := value.(type) {
+    case map[string]any:
+        return clonePluginConfig(value)
+    case []any:
+        cloned := make([]any, len(value))
+        for i, item := range value {
+            cloned[i] = clonePluginConfigValue(item)
+        }
+        return cloned
+    default:
+        return value // nil、string、bool 和数值均为 JSON scalar。
+    }
+}
+
+func NewManager(
+    ctx context.Context,
+    cfg config.PluginsConfig,
+    loader *Loader,
+    tools *tool.Manager,
+    logger *slog.Logger,
+) (*Manager, error) {
+    if ctx == nil || loader == nil || tools == nil || logger == nil {
+        return nil, errors.New("plugin manager: nil dependency")
+    }
+    runCtx, cancel := context.WithCancel(ctx)
+    m := &Manager{
+        loader: loader, tools: tools, config: cfg,
+        entries: make(map[string]*Entry),
+        runCtx: runCtx, runCancel: cancel,
+        logger: logger, stopDone: make(chan struct{}),
     }
 
-    ctx := &PluginContext{
-        Config:  m.config,
-        Storage: m.storage,
-        Logger:  m.logger.With("plugin", manifest.ID),
+    descriptors, diagnostics := loader.Discover()
+    for _, d := range descriptors {
+        m.entries[d.Manifest.ID] = &Entry{
+            Descriptor: d, State: StateDiscovered,
+            Health: HealthStatus{Level: "unknown"},
+            Config: map[string]any{},
+        }
     }
-
-    if err := p.Init(ctx); err != nil {
-        return fmt.Errorf("插件 %s 初始化失败: %w", manifest.ID, err)
+    for _, diagnostic := range diagnostics {
+        m.discoveryDiagnostics = append(m.discoveryDiagnostics, diagnostic)
+        if diagnostic.PluginID == "" {
+            continue
+        }
+        e := m.entries[diagnostic.PluginID]
+        if e == nil {
+            e = &Entry{
+                State: StateError, Health: HealthStatus{Level: "unknown"},
+                Config: map[string]any{},
+            }
+            if diagnostic.Descriptor != nil {
+                e.Descriptor = *diagnostic.Descriptor
+            }
+            m.entries[diagnostic.PluginID] = e
+        }
+        e.State = StateError
+        e.LastError = errors.Join(e.LastError, diagnostic)
     }
-    if err := p.Start(); err != nil {
-        return fmt.Errorf("插件 %s 启动失败: %w", manifest.ID, err)
+    for _, configured := range cfg.Entries {
+        e := m.entries[configured.ID]
+        if e == nil {
+            err := fmt.Errorf("%w: %s", ErrPluginNotFound, configured.ID)
+            m.discoveryDiagnostics = append(m.discoveryDiagnostics, err)
+            e = &Entry{
+                State: StateError, LastError: err,
+                Health: HealthStatus{Level: "unknown"}, Config: map[string]any{},
+            }
+            m.entries[configured.ID] = e
+        }
+        e.Enabled = configured.Enabled
+        e.Config = clonePluginConfig(configured.Config)
     }
-
-    m.plugins[manifest.ID] = &PluginEntry{
-        Plugin:   p,
-        State:    StateStarted,
-        LoadedAt: time.Now(),
-    }
-
-    // 将插件提供的能力注册到对应 Registry
-    exts := p.Provide()
-    m.registerExtensions(exts)
-
-    m.logger.Info("插件加载成功", "id", manifest.ID, "version", manifest.Version)
-    return nil
+    return m, nil
 }
 ```
 
----
+`NewManager` 把每个规范化的 `PluginDescriptor` 原样冻结在对应 Entry，再合并 `plugins.entries[]` 的 enabled/config；后续启动和重启始终复用该 Descriptor，不能从可变路径重新解析。`Descriptor.Manifest` 是唯一 Manifest 来源。Config Loader 必须先把配置归一化为 `map[string]any`、`[]any` 和 JSON scalar；`clonePluginConfig` 再递归复制所有 map/slice，避免调用方修改嵌套值，此后 Descriptor/Config/Enabled 均不可变。该实现只使用 Go 1.20 标准库。空 ID discovery diagnostic 只进入 StartupReport；带 ID diagnostic 和显式配置引用的缺失 ID 都建立 `error` Entry。所有该 Plugin 的 Proxy 共享启动时创建的同一个 `ProxyHandle`；handle 在运行期退出和重启期间保留，`Load` 对 nil 返回 `ErrPluginUnavailable`。`mu` 保护 Entry 的 Client/Handle/ProxyNames/State/Health/StartedAt/LastError；任何 RPC、进程等待或退避都不得持有该锁。
 
-## 6. 启用 / 禁用
-
-Plugin Manager 支持运行时动态启用和禁用插件，无需重启 Runtime。
+## 2. 依赖图
 
 ```go
-// Enable 启用已注册但被禁用的插件
-func (m *Manager) Enable(id string) error {
-    m.mu.Lock()
-    defer m.mu.Unlock()
+type Dependency struct {
+    ID       string `yaml:"id"`
+    Version  string `yaml:"version"`
+    Optional bool   `yaml:"optional"`
+}
+```
 
-    entry, ok := m.plugins[id]
-    if !ok {
-        return fmt.Errorf("插件 %s 未注册", id)
-    }
-    if entry.State == StateStarted {
-        return nil // 已经在运行
-    }
+Manager 在启动任何进程前完成 ID 唯一性、缺失依赖、SemVer range 和循环检查，再做稳定拓扑排序。Optional dependency 缺失只记 WARN；存在但版本不匹配仍记 WARN 并按“不可用”处理。
 
-    if err := entry.Plugin.Start(); err != nil {
-        return err
-    }
-    entry.State = StateStarted
-    m.registerExtensions(entry.Plugin.Provide())
-    return nil
+启动某 Entry 前，所有非 optional dependency 必须是 `ready`。依赖被禁用或启动失败时，下游 Entry 进入 `error`，错误包含完整依赖链，不再尝试启动。
+
+## 3. 启动
+
+```go
+type StartupReport struct {
+    Diagnostics []error
+    FailedIDs   []string
 }
 
-// Disable 禁用插件，停止其提供的所有能力
-func (m *Manager) Disable(id string) error {
-    m.mu.Lock()
-    defer m.mu.Unlock()
-
-    entry, ok := m.plugins[id]
-    if !ok {
-        return fmt.Errorf("插件 %s 未注册", id)
-    }
-
-    // 检查是否有其他插件依赖它
-    for _, other := range m.plugins {
-        for _, dep := range other.Plugin.Manifest().Dependencies {
-            if dep.ID == id {
-                return fmt.Errorf("无法禁用 %s: 插件 %s 依赖它", id, other.Plugin.Manifest().ID)
+func (m *Manager) StartAll() StartupReport {
+    report := StartupReport{Diagnostics: append([]error(nil), m.discoveryDiagnostics...)}
+    finish := func() StartupReport {
+        sort.Strings(report.FailedIDs)
+        unique := report.FailedIDs[:0]
+        for _, id := range report.FailedIDs {
+            if len(unique) == 0 || unique[len(unique)-1] != id {
+                unique = append(unique, id)
             }
         }
+        report.FailedIDs = unique
+        return report
     }
-
-    if err := entry.Plugin.Stop(); err != nil {
-        return err
+    m.lifecycleMu.Lock()
+    if m.stopping.Load() {
+        m.lifecycleMu.Unlock()
+        report.Diagnostics = append(report.Diagnostics, context.Canceled)
+        return finish()
     }
-    entry.State = StateStopped
-    m.unregisterExtensions(entry.Plugin.Provide())
-    return nil
-}
-```
+    m.wg.Add(1) // Stop 的 gate 关闭前登记整个启动流程。
+    m.lifecycleMu.Unlock()
+    defer m.wg.Done()
 
----
+    order, errs := m.resolveDependencies()
+    report.Diagnostics = append(report.Diagnostics, errs...)
 
-## 7. 插件隔离
-
-| 隔离维度 | 机制 | 说明 |
-|----------|------|------|
-| **崩溃隔离** | panic recovery | 每个插件调用包裹 `recover()`，单插件 panic 不影响 Runtime |
-| **资源隔离** | 独立 context + timeout | 每个插件操作有独立超时与取消控制 |
-| **日志隔离** | 独立 Logger | 每个插件拥有带插件 ID 标签的 Logger |
-| **配置隔离** | 独立配置命名空间 | 插件配置存储在 `plugins.<id>` 命名空间下 |
-| **状态隔离** | 独立状态机 | 每个插件维护独立状态，互不干扰 |
-
-```go
-// safeCall 包装插件调用，实现 panic 隔离
-func (m *Manager) safeCall(id string, fn func() error) (err error) {
-    defer func() {
-        if r := recover(); r != nil {
-            m.logger.Error("插件 panic", "plugin", id, "panic", r)
-            err = fmt.Errorf("插件 %s panic: %v", id, r)
+    m.mu.RLock()
+    for id, e := range m.entries {
+        if e.State == StateError {
+            report.FailedIDs = append(report.FailedIDs, id)
         }
-    }()
-    return fn()
+    }
+    m.mu.RUnlock()
+
+    if !m.config.AutoStart {
+        m.mu.Lock()
+        for _, e := range m.entries {
+            if e.State == StateDiscovered {
+                e.State = StateStopped
+            }
+        }
+        m.mu.Unlock()
+        return finish()
+    }
+
+    for _, id := range order {
+        e := m.entries[id]
+        m.mu.RLock()
+        state := e.State
+        m.mu.RUnlock()
+        if state != StateDiscovered {
+            continue
+        }
+        if !effectiveEnabled(e) {
+            m.mu.Lock()
+            e.State = StateStopped
+            m.mu.Unlock()
+            continue
+        }
+        if err := m.requireReadyDependencies(e); err != nil {
+            m.fail(e, err)
+            report.Diagnostics = append(report.Diagnostics, err)
+            report.FailedIDs = append(report.FailedIDs, id)
+            continue
+        }
+
+        m.mu.Lock()
+        e.State = StateStarting
+        m.mu.Unlock()
+        startCtx, cancel := context.WithTimeout(m.runCtx, m.config.StartupTimeout)
+        client, err := m.loader.Start(startCtx, e.Descriptor, e.Config)
+        cancel()
+        if err != nil {
+            m.fail(e, err)
+            report.Diagnostics = append(report.Diagnostics, err)
+            report.FailedIDs = append(report.FailedIDs, id)
+            continue
+        }
+
+        handle, names, rollback, err := m.registerProxies(e, client)
+        if err != nil {
+            rollback()
+            _ = client.Terminate()
+            failure := fmt.Errorf("%w: %v", ErrPluginCapabilityConflict, err)
+            m.fail(e, failure)
+            report.Diagnostics = append(report.Diagnostics, failure)
+            report.FailedIDs = append(report.FailedIDs, id)
+            continue
+        }
+
+        m.lifecycleMu.Lock()
+        if m.stopping.Load() {
+            m.lifecycleMu.Unlock()
+            rollback()
+            _ = client.Terminate()
+            break
+        }
+        m.mu.Lock()
+        e.Client, e.Handle, e.ProxyNames = client, handle, names
+        e.StartedAt = time.Now()
+        e.State = StateReady // Proxy 全部注册成功后才 Ready
+        handle.Store(client) // Entry 发布完成后才开放调用。
+        m.wg.Add(1)          // lifecycleMu 保证 Stop 关闭 gate 后不再 Add。
+        m.mu.Unlock()
+        m.lifecycleMu.Unlock()
+        go m.monitor(e)
+    }
+    return finish()
+}
+
+func effectiveEnabled(e *Entry) bool {
+    if e.Enabled != nil {
+        return *e.Enabled
+    }
+    return e.Descriptor.Manifest.DefaultEnabled
+}
+
+func (m *Manager) registerProxies(e *Entry, client *RPCClient) (
+    handle *ProxyHandle,
+    names []string,
+    rollback func(),
+    err error,
+) {
+    handle = &ProxyHandle{}
+    rollback = func() {
+        handle.Store(nil)
+        for i := len(names) - 1; i >= 0; i-- {
+            _ = m.tools.Unregister(names[i])
+        }
+    }
+    for _, capability := range client.Capabilities {
+        if capability.Type != "tool" {
+            return handle, names, rollback, ErrPluginProtocolIncompatible
+        }
+        proxy, err := NewPluginToolProxy(e.Descriptor.Manifest.ID, capability, handle)
+        if err != nil {
+            return handle, names, rollback, err
+        }
+        if err := m.tools.Register(proxy, config.ToolConfig{Enabled: true}, "plugin"); err != nil {
+            return handle, names, rollback, err
+        }
+        names = append(names, capability.Name)
+    }
+    return handle, names, rollback, nil
 }
 ```
 
----
+`registerProxies` 必须事务化：返回成功前任何部分注册失败都注销本次已经注册的 Proxy，并终止、Wait、清理刚启动的进程。新 Proxy 的 handle 初始为 nil；只有 StartAll 在 `lifecycleMu` gate 内发布完整 Entry 后才 `Store(client)`，因此 Stop 与启动并发时不会短暂暴露未受 Manager 管理的 Client。`PluginToolProxy` 位于 `internal/plugin` 并实现 `tool.Tool`，避免 `internal/tool` 反向导入 Plugin 形成 import cycle。`m.fail` 在 `mu` 下更新 State/LastError，`requireReadyDependencies` 在 `mu.RLock` 下读取依赖状态。StartAll 只处理仍为 `StateDiscovered` 的 Entry，已有 discovery/DAG error 不会被覆盖；所有返回路径都对累积的 `FailedIDs` 去重排序。StartupReport 是 non-fatal diagnostics；Runtime 在随后唯一的 `Config.Activate(binding)` 中决定缺失 capability 是否阻止 Ready。初始 `StartAll` 对每个 Plugin 只尝试一次，`restart.*` 不能用于 Dial/Handshake/Init/Ready 的启动失败。
 
-## 8. 插件配置
+## 4. 进程退出与重启
 
-```yaml
-# yaa.yaml 插件配置示例
-plugins:
-  - id: "weather-provider"
-    enabled: true
-    source: "./plugins/weather/weather.so"
-    config:
-      api_key: "${WEATHER_API_KEY}"
-      cache_ttl: 600s
+Runtime 尚未进入 Stop 时，无论 exit code 是否为 0，Plugin 退出都视为 unexpected。唯一 monitor 等待 `RPCClient.Exited` 关闭并读取 `WaitErr()`，先将 `ProxyHandle` 原子置空，使调用立即返回 `ErrPluginUnavailable`，再关闭旧 RPC transport、清理旧 endpoint并清空 Entry client。随后才按 `restart.enabled/max_attempts/backoff` 重启。每次重启生成新 nonce，重新执行 Handshake/Init/Ready，并要求 capabilities 与首次注册的 type/name/description/schema 集合精确相等；不相等则终止新进程并计为一次失败。成功后原子替换 handle 中的 Client，现有 Proxy 恢复服务。
 
-  - id: "custom-tools"
-    enabled: true
-    source: "builtin"       # 内置插件
-    config:
-      timeout: 30s
-```
+monitor 的唯一循环同时 select 当前 `Exited`、health ticker 和 `runCtx.Done()`，并在开始退避、调用 Loader 前、以及发布新 Client 前检查停止状态。Loader 启动使用 `context.WithTimeout(m.runCtx, startup_timeout)`；发布时先持有 `lifecycleMu` 再持有 `mu`，仅当 `stopping=false` 且 Entry 仍指向本轮预期状态时才能写入 `e.Client` 和 `handle.Store(newClient)`。检查失败时在锁外立即 `newClient.Terminate()`。这样 Stop 一旦在 `lifecycleMu` 下关闭 gate，任何已在退避、Dial 或 Ready 阶段的重启都不能再发布进程。RPC、退避、Wait 和 cleanup 全部在锁外执行。
 
----
+重启窗口并非透明：在途请求失败，不自动 replay；依赖该 Plugin 的其他 Plugin 不级联重启。达到上限后 Entry 保持 `error`，Proxy 继续返回 unavailable，直到 Runtime 重启。每个 restart client 都只有一个 Wait goroutine；monitor 循环切换到新的 `Exited` channel，Manager 不直接等待 OS process handle。StopAll 设置 `stopping` 后，monitor 从 `runCtx.Done()` 退出，资源清理由 StopAll 的幂等方法统一完成。
 
-## 9. 卸载流程
+Health RPC 使用 `health_timeout`。monitor 在 `mu` 下更新 Entry.Health snapshot；单次失败只把健康级别更新为 degraded，不 Kill/重启进程，只有实际进程退出触发自动重启。
 
-```text
-收到卸载请求 (API / 配置热更新)
-  │
-  ▼
-检查是否有其他插件依赖目标插件
-  │
-  ├─ 有依赖 → 拒绝卸载，返回依赖列表
-  └─ 无依赖 → 继续
-  │
-  ▼
-调用 Stop() 停止插件
-  │
-  ▼
-从各 Registry 注销插件提供的 Tool / Provider / Skill
-  │
-  ▼
-调用 Cleanup() 释放底层资源（关闭连接、清理临时文件）
-  │
-  ▼
-从 Manager 中移除插件条目
-  │
-  ▼
-记录日志，通知监听者（通过 SSE/WS 事件推送）
-```
-
----
-
-## 10. Remote API 集成
-
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/api/v1/plugins` | GET | 列出所有插件及状态 |
-| `/api/v1/plugins/:id` | GET | 获取插件详情 |
-| `/api/v1/plugins/:id/enable` | POST | 启用插件 |
-| `/api/v1/plugins/:id/disable` | POST | 禁用插件 |
-| `/api/v1/plugins/:id` | DELETE | 卸载插件 |
+## 5. 关闭
 
 ```go
-// GET /api/v1/plugins
-func (s *Server) handleListPlugins(w http.ResponseWriter, r *http.Request) {
-    plugins := s.pluginManager.List()
-    respondJSON(w, http.StatusOK, plugins)
+func (m *Manager) StopAll(ctx context.Context) error {
+    m.stopOnce.Do(func() {
+        // 先同步关闭启动/发布 gate 和所有 Proxy，再让 teardown 收拢资源。
+        m.lifecycleMu.Lock()
+        m.stopping.Store(true)
+        m.mu.Lock()
+        for _, e := range m.entries {
+            if e.Handle != nil {
+                e.Handle.Store(nil)
+            }
+        }
+        m.mu.Unlock()
+        m.runCancel()
+        m.lifecycleMu.Unlock()
+
+        go func() {
+            m.stopErr = m.teardown()
+            close(m.stopDone)
+        }()
+    })
+
+    select {
+    case <-m.stopDone:
+        return m.stopErr
+    case <-ctx.Done():
+        return context.Cause(ctx)
+    }
 }
 
-// POST /api/v1/plugins/:id/enable
-func (s *Server) handleEnablePlugin(w http.ResponseWriter, r *http.Request) {
-    id := chi.URLParam(r, "id")
-    if err := s.pluginManager.Enable(id); err != nil {
-        respondError(w, http.StatusBadRequest, err)
-        return
-    }
-    respondJSON(w, http.StatusOK, map[string]string{"status": "enabled"})
+func (m *Manager) Done() <-chan struct{} { return m.stopDone }
+
+func (m *Manager) WaitStopped() error {
+    <-m.stopDone
+    return m.stopErr
 }
 ```
-
----
-
-## 11. 完整加载流程图
 
 ```text
-┌─────────────┐     ┌──────────────┐     ┌─────────────────┐
-│  扫描目录    │────▶│  解析 Manifest │────▶│  依赖解析 (DAG)  │
-│  .so / .yaml │     │  版本/依赖/类型 │     │  拓扑排序        │
-└─────────────┘     └──────────────┘     └────────┬────────┘
-                                                 │
-                                          有循环依赖? ──Yes──▶ 报错退出
-                                                 │ No
-                                                 ▼
-                                    ┌────────────────────────┐
-                                    │  按拓扑顺序逐个加载       │
-                                    │                         │
-                                    │  Init(ctx) ──▶ Start()  │
-                                    │       │           │      │
-                                    │    失败? ◀──       │      │
-                                    │       │           ▼      │
-                                    │   跳过并告警   Provide()  │
-                                    │       │           │      │
-                                    │       ▼           ▼      │
-                                    │   记录日志   注册到 Registry│
-                                    └────────────────────────┘
-                                                 │
-                                                 ▼
-                                    ┌────────────────────────┐
-                                    │  所有插件就绪            │
-                                    │  Runtime → Ready        │
-                                    │  推送事件 (SSE/WS)       │
-                                    └────────────────────────┘
+Runtime.Stop
+  → stopping=true
+  → reverse startup order
+  → set ProxyHandle unavailable
+  → RPC Stop with stop_timeout
+  → wait process; timeout Kill+Wait
+  → unregister proxies
+  → cleanup endpoint
+  → state=stopped
 ```
 
----
+关闭期的进程退出不触发重启。所有 Kill 后都必须 Wait，所有 endpoint 都必须 cleanup。
 
-## 12. 事件通知
+`teardown` 先 `m.wg.Wait()`，确保 StartAll、monitor、health 和 restart goroutine 全部离开且不再写 Entry；Proxy 已在 gate 关闭时同步 unavailable。随后按逆拓扑处理每个 Entry，在 `mu` 下取走 Client/ProxyNames，再在锁外为该 Client 创建一个独立 `stop_timeout` deadline：若进程尚未退出，先调用 RPC Stop，再用同一个剩余预算等待 `Exited`；预算耗尽则调用 `KillAndWait`。是否调用 Stop 只由进程是否已经退出决定，不能由 handle 是否 nil 决定。最后无条件读取 `WaitErr`、关闭 transport、注销全部 Proxy、cleanup endpoint并在 `mu` 下标记 stopped。某一步失败不能跳过后续 Plugin 或 cleanup，最终用 `errors.Join` 返回全部错误。
 
-插件状态变更通过 Runtime 事件总线广播，客户端可通过 SSE/WebSocket 订阅：
+调用方 `ctx` 只限制本次 `StopAll` 等待时间；到期后后台 teardown 继续运行，后续 `StopAll` 调用等待同一个 `stopDone` 并取得同一个最终错误。Runtime 即使收到 `StopAll` 的 deadline error，也必须在关闭 Tool Manager 和退出主进程前等待 `Done()`，再用 `WaitStopped()` 取得最终聚合错误；因此 teardown 不会越过 Plugin → Tool 的 owner 顺序，也不会因 Go 主进程退出而遗留子进程。`Done/WaitStopped` 只能在已经调用 `StopAll` 后等待。
 
-| 事件 | 触发时机 | Payload |
-|------|----------|---------|
-| `plugin.loaded` | 插件加载完成 | `{id, version, loaded_at}` |
-| `plugin.started` | 插件启动成功 | `{id}` |
-| `plugin.stopped` | 插件停止 | `{id, reason}` |
-| `plugin.error` | 插件发生错误 | `{id, error}` |
-| `plugin.unloaded` | 插件卸载完成 | `{id}` |
+## 6. 对外边界
+
+v1 Remote API 索引没有 Plugin 管理端点，也没有 `plugin_list/plugin_health` Tool schema，因此本模块只承诺 Runtime health、结构化日志和指标。未来增加任何端点或 Tool 时，先在 Remote API/Tool 文档登记请求、响应、权限和错误语义。
 
 ---
 

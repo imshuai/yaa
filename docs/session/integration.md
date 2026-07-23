@@ -1,433 +1,97 @@
-# Session 与 Agent / Context / Memory 的集成
+# Session 集成
 
-> 文档路径: `docs/session/integration.md`
-> 上级: `docs/session/README.md` §2
-
----
-
-## 1. 概述
-
-Session 不是孤立存在的，它是 Yaa! 运行时中连接 Agent、Context、Memory 三大核心模块的枢纽。本文档描述 Session 如何被 Agent 管理和调度、Context 如何从 Session 消息历史构建 LLM 请求、以及 Memory 如何与 Session 关联实现跨会话记忆。
-
-```text
-┌─────────────────────────────────────────────────────────────┐
-│                        Agent                                 │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  Agent 管理 0..N 个 Session                             │  │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐            │  │
-│  │  │ Session A │  │ Session B │  │ Session C │            │  │
-│  │  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘            │  │
-│  └────────┼─────────────┼─────────────┼──────────────────┘  │
-│           │             │             │                      │
-│           ▼             ▼             ▼                      │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │              Context Builder                            │  │
-│  │  从 Session.Messages 构建 LLM 请求消息序列               │  │
-│  │  注入 System Prompt / Skill Prompt / Memory 摘要        │  │
-│  └───────────────────────┬────────────────────────────────┘  │
-│                           │                                   │
-│                           ▼                                   │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │              Memory Manager                             │  │
-│  │  写入: Session 关闭时归档消息摘要                        │  │
-│  │  读取: Session 创建时注入历史记忆摘要                     │  │
-│  └────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
-```
+> 上级: [Session 系统设计](README.md)
+> 相关模块: [Context](../context/README.md)、[Memory](../memory/README.md)、[Tool](../tool/README.md)、[Provider](../provider.md)
 
 ---
 
-## 2. Session 与 Agent 的集成
-
-### 2.1 Agent 对 Session 的管理
-
-Agent 是 Session 的拥有者。每个 Agent 维护一组 Session，负责创建、调度和清理。
-
-| 职责 | 方法 | 说明 |
-|------|------|------|
-| 创建 Session | `agent.NewSession()` | 委托 SessionManager.Create，自动绑定 AgentID |
-| 查找 Session | `agent.GetSession(id)` | 从 SessionManager 获取 |
-| 列出 Session | `agent.ListSessions()` | 返回该 Agent 下所有 Active/Paused Session |
-| 关闭 Session | `agent.CloseSession(id)` | 委托 SessionManager.Close |
-| 清理超时 | `agent.reapIdle()` | 定时关闭空闲 Session |
-
-### 2.2 Agent 调度 Session 的流程
-
-```go
-// Agent 处理一条用户消息的完整流程
-func (a *Agent) HandleMessage(ctx context.Context, sessionID string, content string) (*Response, error) {
-    // 1. 获取 Session，验证归属
-    sess, err := a.sessionMgr.Get(sessionID)
-    if err != nil {
-        return nil, fmt.Errorf("get session: %w", err)
-    }
-    if sess.AgentID != a.ID {
-        return nil, ErrSessionNotOwned
-    }
-
-    // 2. 追加用户消息
-    userMsg := Message{Role: RoleUser, Content: content}
-    if err := a.sessionMgr.AppendMessage(sessionID, userMsg); err != nil {
-        return nil, fmt.Errorf("append message: %w", err)
-    }
-
-    // 3. 从 Session 构建 Context
-    ctxBuilder := NewContextBuilder(a.config.Context)
-    llmMessages, err := ctxBuilder.Build(sess)
-    if err != nil {
-        return nil, fmt.Errorf("build context: %w", err)
-    }
-
-    // 4. 调用 LLM Provider
-    resp, err := a.provider.Chat(ctx, llmMessages)
-    if err != nil {
-        return nil, fmt.Errorf("llm chat: %w", err)
-    }
-
-    // 5. 追加助手消息
-    asstMsg := Message{Role: RoleAssistant, Content: resp.Content, ReasoningContent: resp.ReasoningContent, ToolCalls: resp.ToolCalls}
-    if err := a.sessionMgr.AppendMessage(sessionID, asstMsg); err != nil {
-        return nil, fmt.Errorf("append assistant message: %w", err)
-    }
-
-    // 6. 若有 Tool 调用，执行并追加结果
-    if len(resp.ToolCalls) > 0 {
-        toolResults := a.executeToolCalls(ctx, resp.ToolCalls)
-        for _, tr := range toolResults {
-            a.sessionMgr.AppendMessage(sessionID, tr)
-        }
-    }
-
-    return &Response{Content: resp.Content}, nil
-}
-```
-
-### 2.3 多 Session 并发模型
+## 1. 依赖方向
 
 ```text
-Agent
-  │
-  ├── Session A (goroutine 1) ── 串行处理消息
-  ├── Session B (goroutine 2) ── 串行处理消息
-  └── Session C (goroutine 3) ── 串行处理消息
-
-各 Session 间并行，Session 内串行（详见 concurrency.md）
+Remote API ──► Agent/Session Manager ──► Storage
+                       │
+                       ├──► Memory（可选读取/显式写入）
+                       ├──► Context Manager ──► Provider
+                       └──► Tool Manager ───────┘
 ```
 
----
+Session Manager 不依赖 Provider、Context、Tool 或 Memory 的实现；它只保存 Provider 的统一消息值，并提供状态、历史、持久化和串行边界。
 
-## 3. Session 与 Context 的集成
+## 2. Agent 完整 turn
 
-### 3.1 Context 构建流程
-
-Context Builder 负责将 Session 的消息历史转换为 LLM Provider 能接受的完整消息序列，并在其中注入 System Prompt、Skill Prompt 和 Memory 摘要。
-
-```text
-┌──────────┐     ┌──────────────────────┐     ┌───────────────┐
-│  Session  │────▶│  Context Builder     │────▶│  LLM Messages │
-│ Messages  │     │                      │     │  (最终请求)    │
-└──────────┘     │  1. System Prompt     │     └───────────────┘
-                  │  2. Memory 摘要      │
-                  │  3. Skill Prompt     │
-                  │  4. 历史消息 (截断)   │
-                  │  5. 当前用户消息      │
-                  └──────────────────────┘
-```
-
-### 3.2 Context Builder 实现
+完整 Provider/Tool/stream 状态机只在 [Agent 执行契约](../agent.md#4-唯一-turn-流程) 定义，Session 不维护第二份伪实现。边界固定为：Agent 调用
 
 ```go
-// ContextBuilder 从 Session 构建 LLM 请求消息序列。
-type ContextBuilder struct {
-    config     ContextConfig
-    memoryMgr  MemoryManager
-    skillMgr   SkillManager
-}
-
-type ContextConfig struct {
-    MaxMessages   int  // 最大历史消息数，默认 50
-    MaxTokens     int  // 最大 token 数估算，默认 8192
-    InjectMemory  bool // 是否注入 Memory 摘要，默认 true
-    InjectSystem  bool // 是否注入 System Prompt，默认 true
-}
-
-// Build 将 Session 消息历史转换为 LLM 消息序列。
-func (b *ContextBuilder) Build(sess *Session) ([]Message, error) {
-    var messages []Message
-
-    // 1. System Prompt
-    if b.config.InjectSystem {
-        messages = append(messages, Message{
-            Role:    RoleSystem,
-            Content: b.buildSystemPrompt(sess),
-        })
-    }
-
-    // 2. Memory 摘要（注入到 System 消息之后）
-    if b.config.InjectMemory {
-        memSummary, err := b.memoryMgr.GetSummary(sess.AgentID, sess.ID)
-        if err == nil && memSummary != "" {
-            messages = append(messages, Message{
-                Role:    RoleSystem,
-                Content: fmt.Sprintf("[Memory]\n%s", memSummary),
-            })
-        }
-    }
-
-    // 3. Skill Prompt 注入
-    skillPrompts := b.skillMgr.GetActivePrompts(sess.AgentID)
-    for _, sp := range skillPrompts {
-        messages = append(messages, Message{
-            Role:    RoleSystem,
-            Content: sp,
-        })
-    }
-
-    // 4. 历史消息（截断 + Token 估算）
-    history := b.truncateMessages(sess.Messages, b.config.MaxMessages, b.config.MaxTokens)
-    messages = append(messages, history...)
-
-    return messages, nil
-}
-
-// truncateMessages 按数量和 token 预算截断消息历史。
-func (b *ContextBuilder) truncateMessages(msgs []Message, maxMsgs, maxTokens int) []Message {
-    // 从末尾保留最近的消息
-    if len(msgs) > maxMsgs {
-        msgs = msgs[len(msgs)-maxMsgs:]
-    }
-
-    // 粗略 token 估算: 1 token ≈ 4 chars
-    totalTokens := 0
-    result := make([]Message, 0, len(msgs))
-    for i := len(msgs) - 1; i >= 0; i-- {
-        est := len(msgs[i].Content) / 4
-        if totalTokens+est > maxTokens {
-            break
-        }
-        totalTokens += est
-        result = append([]Message{msgs[i]}, result...)
-    }
-    return result
-}
-```
-
-### 3.3 消息序列构建示例
-
-| 步骤 | 来源 | Role | 内容示例 |
-|------|------|------|---------|
-| 1 | Agent 配置 | system | "你是 Yaa! 助手，负责…" |
-| 2 | Memory Manager | system | "[Memory] 用户偏好中文回复" |
-| 3 | Skill Manager | system | "可用工具: weather, web_search" |
-| 4 | Session 历史 | user | "今天天气怎么样？" |
-| 5 | Session 历史 | assistant | "让我查一下…" |
-| 6 | Session 历史 | tool | `{"temp": 28, "city": "上海"}` |
-| 7 | Session 历史 | assistant | "上海今天 28°C，晴天。" |
-| 8 | 当前请求 | user | "那明天呢？" |
-
----
-
-## 4. Session 与 Memory 的集成
-
-### 4.1 Memory 关联模型
-
-Memory 与 Session 的关系分两层：
-
-| 层级 | 作用域 | 生命周期 | 说明 |
-|------|--------|---------|------|
-| Agent 级 Memory | 跨所有 Session | Agent 存在期间 | 用户偏好、长期知识 |
-| Session 级 Memory | 单个 Session | Session 生命周期 | 本轮对话的关键事实摘要 |
-
-```text
-Agent
-  │
-  ├── Agent Memory (持久)     ─── 跨 Session 共享
-  │     "用户偏好中文、时区 UTC+8"
-  │
-  ├── Session A Memory
-  │     "用户在讨论天气，关注上海"
-  │
-  └── Session B Memory
-        "用户在调试代码，Go 项目"
-```
-
-### 4.2 Memory 写入时机
-
-```go
-// MemoryManager 在 Session 生命周期的关键节点写入记忆。
-type MemoryManager interface {
-    // OnMessage 在每条消息后更新 Session 级摘要
-    OnMessage(sess *Session, msg Message) error
-
-    // OnClose 在 Session 关闭时将摘要归档到 Agent 级 Memory
-    OnClose(sess *Session) error
-
-    // GetSummary 获取 Session 相关的记忆摘要（供 Context Builder 使用）
-    GetSummary(agentID, sessionID string) (string, error)
-}
-```
-
-### 4.3 Memory 写入实现
-
-```go
-// OnClose 在 Session 关闭时提取摘要并写入 Agent 级 Memory。
-func (m *MemoryManager) OnClose(sess *Session) error {
-    // 1. 从 Session 消息历史提取关键信息
-    summary := m.summarizeSession(sess.Messages)
-
-    // 2. 写入 Agent 级 Memory（持久化）
-    entry := MemoryEntry{
-        ID:        "mem_" + ulid.Make().String(),
-        AgentID:   sess.AgentID,
-        SessionID: sess.ID,
-        Content:   summary,
-        Type:      MemoryTypeSessionSummary,
-        CreatedAt: time.Now(),
-    }
-    if err := m.store.Save(entry); err != nil {
-        return fmt.Errorf("save memory: %w", err)
-    }
-
-    // 3. 清理 Session 级临时 Memory
-    m.sessionCache.Delete(sess.ID)
-
-    m.logger.Info("memory archived",
-        "agent_id", sess.AgentID,
-        "session_id", sess.ID,
-        "summary_len", len(summary))
-    return nil
-}
-
-// summarizeSession 用 LLM 提取对话摘要。
-func (m *MemoryManager) summarizeSession(msgs []Message) string {
-    if len(msgs) == 0 {
-        return ""
-    }
-
-    // 构建摘要请求
-    var sb strings.Builder
-    for _, msg := range msgs {
-        sb.WriteString(fmt.Sprintf("[%s] %s\n", msg.Role, msg.Content))
-    }
-
-    prompt := fmt.Sprintf("请用一段话总结以下对话的关键信息:\n\n%s", sb.String())
-    resp, err := m.provider.Chat(context.Background(), []Message{
-        {Role: RoleSystem, Content: "你是一个对话摘要助手。"},
-        {Role: RoleUser, Content: prompt},
+sessions.RunTurn(ctx, sessionID, turnID, onQueued,
+    func(turnCtx context.Context, turn *session.Turn) error {
+        return a.runTurn(turnCtx, turn, request)
     })
-    if err != nil {
-        m.logger.Warn("summarize failed, using fallback", "error", err)
-        // 降级: 取最后几条消息作为摘要
-        return m.fallbackSummary(msgs)
-    }
-    return resp.Content
-}
 ```
 
-### 4.4 Memory 读取与注入
+callback 的首个写操作必须是 `turn.AppendUser`；后续 `Turn.Append` 自动使用相同 Turn ID。Provider、Memory、Context、Planner 和 Tool 都只接收 `turnCtx`。实现必须保证：
 
-Session 创建或首次构建 Context 时，Memory Manager 检索 Agent 级历史记忆，注入到 Context 中：
+- user 消息成功写入后，即使 Provider 因取消失败，也保留该已接受输入；
+- Provider 的 delta 不直接写 Session；只有完整 final assistant 或完整 Tool unit 才能追加；
+- Agent 先以 canonical history 组装请求，再用冻结的 [Provider Tool projection](../tool/provider.md) 投影 alias；`Context.Build` 只处理已投影 request 副本，`built.Request.Messages` 不回写 Session，estimator 看到真实 wire alias；
+- Tool Manager 使用 `ExecuteBatch(turnCtx, tool.ExecutionScope{AgentID: a.id, SessionID: sessionID}, calls)`；result 按原始 ToolCalls 顺序组成一批，失败 Tool 也生成合法 `role=tool` result；
+- Agent 不在 Close、每条消息或 Restore 中隐式调用 Memory 摘要。
 
-```go
-// GetSummary 返回 Agent 级 + Session 级记忆摘要。
-func (m *MemoryManager) GetSummary(agentID, sessionID string) (string, error) {
-    var parts []string
+`Turn.AppendUser/Append` 使用 RunTurn 派生的 context 并直接在当前 runner task 内提交，不会再次进入队列。callback 不得把 `Turn` 传给其他 goroutine或保存到返回之后。
 
-    // 1. Agent 级 Memory（跨 Session 的长期记忆）
-    agentMems, err := m.store.ListByAgent(agentID, MemoryTypeAgentLongTerm)
-    if err == nil {
-        for _, mem := range agentMems {
-            parts = append(parts, mem.Content)
-        }
-    }
+## 3. Context 集成
 
-    // 2. Session 级 Memory（当前会话的实时摘要）
-    if cached, ok := m.sessionCache.Get(sessionID); ok {
-        parts = append(parts, cached.(string))
-    }
+Context 输入是 Agent 已完成 alias 投影的完整 `provider.ChatRequest`，至少包含：
 
-    return strings.Join(parts, "\n---\n"), nil
-}
-```
+- Agent/Skill 注入的 system messages（只存在于请求副本）；
+- Memory 返回的已选 items（只存在于请求副本）；
+- Session 的历史 `Payload`；
+- 当前 user、Tool definitions、ToolChoice、ResponseFormat、Extra 等完整请求字段。
+
+Context 按目标 Model 的窗口和 `ContextConfig` 执行 hybrid/truncate/reject。被裁剪或摘要的消息绝不写回 Session；同一 turn 的 assistant Tool call 与 results 仍由 Session 作为不可拆分 unit 保存。
+
+## 4. Memory 集成
+
+Memory v1 是 Agent-scoped long-term store；Session 历史本身就是 short-term source of truth，不再维护未定义的 Session summary cache。
+
+| 时机 | 行为 | 失败处理 |
+|------|------|----------|
+| Build 前 | Agent 按 AgentID、可选 SessionID 读取 Memory items | 返回 Memory 错误，未生成 assistant |
+| 用户明确保存 | Agent 调用 Memory `Put` | 按 Memory 契约报告错误 |
+| Close / Restore | 不自动摘要或 promote | 无隐式副作用 |
+| Context 返回 | 注入 request 副本 | 不追加 system 到 Session |
+
+Memory item 若带 SessionID，只是检索 scope；Session 删除不自动删除 Agent Memory，清理由 Memory API 明确执行。
+
+## 5. Tool 集成
+
+1. Agent 根据 Effective Tool 权限和 Session canonical history 创建一次冻结 `ProviderToolProjection`；definitions 只含当前 enabled/authorized Tool，history-only 名称只用于回传历史。
+2. Agent 深拷贝并投影完整请求（含历史 ToolCalls、tool `Name` 和 `specific` ToolChoice）后才调用 Context；Context 将 alias schema 纳入 token 估算，不持有映射。
+3. Provider 返回 assistant ToolCalls 后，Agent 对 direct/stream 使用同一精确 alias 反查；unknown/非法/history-only alias 返回 `ErrAgentProviderProtocol`，不执行、不发 `tool_call`、不提交 partial。
+4. 只有 canonical ToolCalls 才交给 Tool Manager 校验权限和参数并执行；Agent 将 canonical assistant ToolCalls 与每个 `role=tool` result 一次性传给 `Session.Append`。
+5. 成功提交后复用本 turn projection，重新构建并投影下一轮 Context，再次调用 Provider。
+
+Tool Manager 不直接修改 Session 内部 slice，也不把被截断的结果写成另一种消息类型。
+
+## 6. Remote API 集成
+
+资源管理端点定义在 [remote-api/session.md](../remote-api/session.md)，对话端点定义在 [remote-api/conversation.md](../remote-api/conversation.md)。Handler 只做认证、参数解码、Agent/Session 归属检查和错误映射；状态转换、容量、消息序列、持久化和事件由 Manager 负责。
+
+- `DELETE /sessions/:id` 是物理删除；`POST /close` 才是关闭。
+- `POST /pause`、`POST /resume` 明确驱动状态机。
+- `GET /messages` 只读取已提交 snapshot。
+- `/events` 可转发 Session mutation 事件；流式 token 使用 conversation frame。
+- 不提供 Session 级 `/context/compress`，因为 Context 视图是每次请求临时生成的。
+
+## 7. Runtime 初始化与 reload
+
+Runtime 初始化只使用 [架构文档](../architecture.md#31-runtime) 的唯一顺序；尤其不能合并其中的 `MCP.Prepare → Skill → Config.Activate(binding) → MCP.Activate` 阶段。Session Restore 成功前 API readiness 为 false。
+
+热更新解析新 Config 并完成 Provider/Model/Agent 绑定校验后：
+
+- 新建 Session 使用新根/Agent policy；
+- 已存在 Session 继续使用 snapshot 中的 resolved policy；
+- Context/Provider 在一个 turn 开始时复制同一 candidate 快照，不能中途混用旧值和新值。
 
 ---
 
-## 5. 三模块协作完整流程
-
-```text
-用户消息到达
-     │
-     ▼
-┌─────────────┐
-│  Agent       │  1. 识别目标 Session
-└──────┬──────┘  2. 验证归属与状态
-       │
-       ▼
-┌─────────────┐
-│  Session     │  3. AppendMessage(user)
-│  Manager     │  4. 状态检查 + 持久化
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐
-│  Memory      │  5. GetSummary(agentID, sessionID)
-│  Manager     │  6. 返回历史记忆摘要
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐
-│  Context     │  7. Build(sess)
-│  Builder     │  8. System + Memory + Skill + History
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐
-│  Provider    │  9. Chat(llmMessages)
-│              │  10. 返回 LLM 响应
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐
-│  Session     │  11. AppendMessage(assistant)
-│  Manager     │  12. 持久化
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐
-│  Memory      │  13. OnMessage(sess, msg)
-│  Manager     │  14. 更新 Session 级实时摘要
-└─────────────┘
-       │
-       ▼
-   返回响应给用户
-```
-
----
-
-## 6. 接口依赖关系
-
-```go
-// Agent 持有的依赖
-type Agent struct {
-    ID          string
-    config      AgentConfig
-    sessionMgr  SessionManager
-    contextBld  *ContextBuilder
-    memoryMgr   MemoryManager
-    skillMgr    SkillManager
-    provider    Provider
-    toolMgr     ToolManager
-}
-```
-
-| 依赖 | 接口 | Session 相关方法 | 调用时机 |
-|------|------|-----------------|---------|
-| SessionManager | `session.Manager` | Get / AppendMessage / Close | 每次消息处理 |
-| ContextBuilder | `*ContextBuilder` | Build(sess) | 每次 LLM 调用前 |
-| MemoryManager | `MemoryManager` | GetSummary / OnMessage / OnClose | Context 构建 + 消息后 + 关闭时 |
-| SkillManager | `SkillManager` | GetActivePrompts | Context 构建时 |
-| Provider | `Provider` | Chat | Context 构建后 |
-
----
-
-*最后更新: 2025-07-17*
+*最后更新: 2026-07-23*

@@ -1,13 +1,39 @@
-# 配置参考
+# Storage 配置参考
 
-> Yaa! Storage 配置详解
-> 依赖: `docs/storage/README.md` §4
+> 上级: [Storage 系统设计](README.md)
+> 根结构: [完整配置参考](../config/reference.md)
 
 ---
 
-## 1. 配置位置
+## 1. 类型
 
-Storage 配置位于 `config.yaml` 的 `runtime.storage` 段：
+```go
+type StorageConfig struct {
+    Type string `yaml:"type" json:"type"` // sqlite | memory
+    Path string `yaml:"path" json:"path"`
+}
+```
+
+`runtime.storage` 是唯一根 KV 配置位置。没有 `ttl_interval`、`wal`、`bucket` 或模块级 Storage override；strict decoder 对这些未知字段报错。
+
+## 2. 默认值和校验
+
+| 字段 | 默认值 | 校验 |
+|------|--------|------|
+| `type` | `sqlite` | `sqlite|memory` |
+| `path` | `./data/yaa.db` | sqlite 时非空；memory 忽略 |
+
+```go
+func DefaultStorageConfig() StorageConfig {
+    return StorageConfig{Type: "sqlite", Path: "./data/yaa.db"}
+}
+```
+
+路径在环境变量展开后校验。SQLite 创建父目录失败、文件不可写、schema 版本未知或 migration 失败都会使 Runtime Not Ready。`type=memory` 明确不持久化 Session snapshot。
+
+## 3. YAML
+
+SQLite：
 
 ```yaml
 runtime:
@@ -16,126 +42,24 @@ runtime:
     path: ./data/yaa.db
 ```
 
----
-
-## 2. 字段说明
-
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `type` | string | `sqlite` | 存储后端类型：`sqlite` / `boltdb` / `memory` |
-| `path` | string | `./data/yaa.db` | 数据文件路径（SQLite / BoltDB 有效，memory 忽略） |
-| `ttl_interval` | duration | `60s` | TTL 过期清理轮询间隔 |
-| `wal` | bool | `true` | SQLite WAL 模式开关（仅 SQLite） |
-| `bucket` | string | `yaa` | BoltDB Bucket 名称（仅 BoltDB） |
-
----
-
-## 3. 后端类型对比
-
-| 类型 | 持久化 | CGO | 文件后缀 | 适用场景 |
-|------|--------|-----|----------|----------|
-| `sqlite` | ✅ | ❌ | `.db` | 生产默认，数据可检视 |
-| `boltdb` | ✅ | ❌ | `.bolt` | 高写入吞吐 |
-| `memory` | ❌ | ❌ | — | 测试 / 临时缓存 |
-
----
-
-## 4. YAML 示例
-
-### 4.1 SQLite（默认）
-
-```yaml
-runtime:
-  storage:
-    type: sqlite
-    path: ./data/yaa.db
-    ttl_interval: 60s
-    wal: true
-```
-
-### 4.2 BoltDB
-
-```yaml
-runtime:
-  storage:
-    type: boltdb
-    path: ./data/yaa.bolt
-    ttl_interval: 30s
-    bucket: yaa
-```
-
-### 4.3 Memory（测试）
+Memory（测试/临时运行）：
 
 ```yaml
 runtime:
   storage:
     type: memory
-    ttl_interval: 10s
 ```
+
+## 4. 生效与安全
+
+`runtime.storage.*` 全部需要重启；reload 候选包含这些路径时整批拒绝。配置/健康 API 可以返回 type 和脱敏后的相对 path，但不能返回文件内容或操作系统错误中的敏感绝对目录。
+
+根 Storage 和 `memory.storage` 可以指向不同文件（默认如此），也可以显式使用同一 SQLite 文件；实现必须使用不同表名和 schema version namespace。
+
+## 5. TTL 说明
+
+TTL 是 `Storage.Set` 的调用参数，不是根配置。实现使用固定 60 秒 cleanup tick，并在读取时惰性隐藏过期 key。Session snapshot 写入不传 TTL；临时缓存 owner 若未来出现，必须在自身模块契约中声明具体 TTL。
 
 ---
 
-## 5. Go 代码示例
-
-### 5.1 从配置初始化
-
-```go
-package main
-
-import (
-    "log"
-    "time"
-    "github.com/imshuai/yaa/internal/storage"
-)
-
-func main() {
-    cfg := storage.Config{
-        Type:        "sqlite",
-        Path:        "./data/yaa.db",
-        TTLInterval: 60 * time.Second,
-        WAL:         true,
-    }
-
-    store, err := storage.New(cfg)
-    if err != nil {
-        log.Fatalf("init storage: %v", err)
-    }
-    defer store.Close()
-
-    // 写入，30 分钟 TTL
-    store.Set("session:abc:ctx", []byte("hello"), 30*time.Minute)
-
-    // 读取
-    val, err := store.Get("session:abc:ctx")
-    if err != nil {
-        log.Printf("get: %v", err)
-    }
-    log.Printf("value: %s", val)
-}
-```
-
-### 5.2 运行时切换后端
-
-```go
-// 测试场景快速切换到内存后端
-cfg := storage.Config{Type: "memory"}
-store, _ := storage.New(cfg)
-defer store.Close()
-```
-
----
-
-## 6. TTL 默认值
-
-| 使用方 | Key 前缀 | 默认 TTL |
-|--------|----------|----------|
-| Session | `session:` | 24h |
-| Config 缓存 | `config:` | 5m |
-| 临时状态 | `tmp:` | 1m |
-| 永久存储 | `agent:` | 无（不过期） |
-
-TTL 到期后由后台轮询协程自动清理，间隔由 `ttl_interval` 控制。
-
----
-
-*最后更新: 2025-07-17*
+*最后更新: 2026-07-22*

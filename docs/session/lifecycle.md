@@ -1,267 +1,133 @@
-# Session 生命周期管理
+# Session 生命周期
 
-> 文档路径: `docs/session/lifecycle.md`
-> 上级: `docs/session/README.md` §2
-
----
-
-## 1. 概述
-
-Session 生命周期是 Yaa! 会话管理的核心状态机。每个 Session 从创建到关闭，经历明确的状态转换，每个状态有严格的处理逻辑和允许的操作。
+> 上级: [Session 系统设计](README.md)
+> 配置: [Session 配置参考](config-ref.md)
 
 ---
 
-## 2. 状态定义
+## 1. 状态机
 
-```go
-type SessionState int
+`closed` 是终态。手动操作、清理任务和启动恢复都必须使用同一套转换函数，不能直接改字段。
 
-const (
-    SessionStateCreated SessionState = iota // 刚创建，尚未激活
-    SessionStateActive                       // 活跃，可接收消息
-    SessionStatePaused                       // 暂停，拒绝新消息
-    SessionStateClosed                       // 已关闭，终态
-)
-```
+| 当前状态 | 目标状态 | 触发 | 条件 |
+|----------|----------|------|------|
+| 不存在 | `created` | `Create` | Agent 存在、policy 合法、容量未满 |
+| `created` | `active` | 首个 turn user | `AppendUser` 与 Turn ID 同批提交 |
+| `created` | `paused` | TTL / restore | 空闲时间达到 TTL |
+| `created` | `closed` | Close / max lifetime / restore | — |
+| `active` | `paused` | Pause / TTL / restore | — |
+| `active` | `closed` | Close / max lifetime / restore | — |
+| `paused` | `active` | Resume | 尚未达到 max lifetime |
+| `paused` | `closed` | Close / max lifetime / restore | — |
+| `closed` | `closed` | Close | 幂等，无副作用 |
 
-| 状态 | 值 | 说明 | 可接收消息 | 可恢复 |
-|------|-----|------|-----------|--------|
-| `Created` | 0 | 刚创建，尚未接收首条消息 | ❌ | — |
-| `Active` | 1 | 正常交互中 | ✅ | — |
-| `Paused` | 2 | 临时暂停 | ❌ | ✅ |
-| `Closed` | 3 | 已关闭，终态 | ❌ | ❌ |
-
----
-
-## 3. 状态转换图
+不在表中的转换返回 `ErrInvalidStateTransition`。`Resume` 不会恢复 Closed Session；若当前时间已经达到 max lifetime，则返回 `ErrSessionExpired` 且不改变 Session。只有 cleanup 和启动 Restore 负责把该 Session 提交为 Closed。
 
 ```text
-            Create()
-               │
-               ▼
-         ┌──────────┐  首条消息
-         │ Created   │─────────────┐
-         └─────┬────┘              │
-               │                   ▼
-          Close()            ┌──────────┐
-               │             │ Active    │◄────────┐
-               ▼             └─────┬────┘          │
-         ┌──────────┐       Pause()  │             │ Resume()
-         │ Closed    │             │             │
-         └──────────┘             ▼             │
-                           ┌──────────┐          │
-                           │ Paused    │─────────┘
-                           └─────┬────┘
-                                  │
-                             Close()
-                                  │
-                                  ▼
-                           ┌──────────┐
-                           │ Closed    │  (终态)
-                           └──────────┘
+Create
+  │
+  ▼
+created ── first user ─────► active ◄── Resume ── paused
+   │                           │                    ▲
+   ├── TTL ────────────────────┼────────────────────┘
+   │                           └── Pause / TTL ─────┘
+   └──────────── Close / max_lifetime ─────────────┐
+                                                    ▼
+                                                  closed
 ```
+
+## 2. 时间字段
+
+| 字段 | 更新规则 | 用途 |
+|------|----------|------|
+| `CreatedAt` | Create 时设置一次 | `max_lifetime` 基准 |
+| `UpdatedAt` | 每次成功提交消息、状态或 metadata 变更 | 乐观观察和排序 |
+| `LastActivityAt` | Create、成功追加消息、Resume 时更新 | `ttl` 空闲基准 |
+
+Pause、Close 和 metadata 更新不刷新 `LastActivityAt`。所有比较使用 UTC，调用方在一次检查中传入同一个 `now`，避免边界漂移。
+
+## 3. 生命周期操作
+
+状态许可矩阵：
+
+| 操作 | `created` | `active` | `paused` | `closed` |
+|------|:---------:|:--------:|:--------:|:--------:|
+| RunTurn | ✅ | ✅ | `ErrSessionPaused` | `ErrSessionClosed` |
+| Pause | 非法转换 | ✅ | 非法转换 | `ErrSessionClosed` |
+| Resume | 非法转换 | 非法转换 | ✅ | `ErrSessionClosed` |
+| DeleteMessage / ClearMessages | ✅ | ✅ | ✅ | `ErrSessionClosed` |
+| Close | ✅ | ✅ | ✅ | 幂等成功 |
+| Delete | ✅ | ✅ | ✅ | ✅ |
+
+除表中幂等项外，状态错误不写 snapshot、不更新时间、不发布事件。
+
+### 3.1 Create
+
+Create 的提交顺序固定为：
+
+1. 校验 Agent 和 `max_sessions_per_agent`；只统计该 Agent 的非 Closed Session。
+2. 解析根配置、Agent override、Create override 并校验 `SessionPolicy`。
+3. 生成 `ses_<ULID>`，三个时间字段设为同一个 `now`，状态设为 `created`。
+4. `persist=true` 时同步写入 snapshot。
+5. 注册内存索引并发布 `session.created`。
+
+任一步失败都不得留下可查询的半成品。
+
+### 3.2 Pause 和 Resume
+
+- Pause 只允许 `active -> paused`；重复 Pause 返回 `ErrInvalidStateTransition`。
+- Resume 只允许 `paused -> active`，先检查 `max_lifetime`。
+- Resume 检查到 max lifetime 已到期时返回 `ErrSessionExpired`，不更新时间、不写 snapshot、不发事件。
+- Resume 成功时同时更新 `UpdatedAt` 与 `LastActivityAt`，防止下一次 cleanup 立即再次暂停。
+- 状态快照提交后发布一次 `session.state.changed`，payload 必须包含 `from`、`to`、`reason` 和 `occurred_at`。
+
+### 3.3 Close 和 Delete
+
+- Close 将任意非 Closed Session 转为 Closed，保留消息和 snapshot 供查询。
+- 对 Closed 调用 Close 返回 nil，不写 Storage、不更新时间、不发事件。
+- Delete 是物理删除：先删除持久 snapshot，再移除内存索引，最后发布 `session.deleted`。
+- Delete 不等同 Close；Remote API 分别暴露两个动作。
+
+## 4. TTL 与最大生命周期
+
+`cleanup_interval` 只决定检查频率，不参与过期时间计算。每次检查按以下顺序处理每个非 Closed Session：
+
+```go
+func desiredState(s *Session, now time.Time) State {
+    if s.Policy.MaxLifetime > 0 && !now.Before(s.CreatedAt.Add(s.Policy.MaxLifetime)) {
+        return StateClosed
+    }
+    if s.Policy.TTL > 0 &&
+        (s.State == StateCreated || s.State == StateActive) &&
+        !now.Before(s.LastActivityAt.Add(s.Policy.TTL)) {
+        return StatePaused
+    }
+    return s.State
+}
+```
+
+边界使用 `now >= deadline` 即到期。`max_lifetime` 优先于 TTL，因此同一次检查只提交最终的 Closed 状态。Paused Session 不因 TTL 再次变化，但仍受 max lifetime 限制。
+
+清理循环必须：
+
+- 使用 Manager 当前配置中的 `cleanup_interval`；
+- 逐个通过 Session FIFO gate 提交，避免与 turn 交叉；
+- 单个 Session 失败时记录 `session.error` 并继续检查其他 Session；
+- Runtime 关闭时响应 `ctx.Done()`。
+
+## 5. 启动恢复
+
+恢复顺序必须可重放且无事件重放：
+
+1. 枚举并排序 `session:` keys。
+2. 严格解码、校验 schema、ID、状态、消息序列、Turn ID 判重集和 resolved policy。
+3. 以同一个启动时间 `now` 先计算 max lifetime，再计算 TTL。
+4. 状态发生变化时同步覆写 snapshot；写入失败则恢复失败。
+5. 所有记录验证和必要覆写成功后，原子发布内存索引。
+6. 不发布 `session.created` 或 `session.state.changed`；只记录恢复统计日志。
+
+`persist=false` 的 Session 没有 snapshot，因此不会恢复。恢复完成前 Remote API 不得进入 Ready。
 
 ---
 
-## 4. 状态转换规则
-
-| 从 | 到 | 触发方法 | 前置条件 | 副作用 |
-|----|----|---------|---------|--------|
-| (无) | Created | `Create()` | AgentID 有效 | 分配 ULID、写入存储 |
-| Created | Active | 首条 `AppendMessage()` | State == Created | 更新 UpdatedAt |
-| Created | Closed | `Close()` | — | 标记终态 |
-| Active | Paused | `Pause()` | State == Active | 拒绝新消息 |
-| Active | Closed | `Close()` | State == Active | 归档消息 |
-| Paused | Active | `Resume()` | State == Paused | 恢复消息接收 |
-| Paused | Closed | `Close()` | State == Paused | 归档消息 |
-| Closed | * | — | **不允许** | — |
-
----
-
-## 5. 各状态处理逻辑
-
-### 5.1 Created
-
-```go
-func (m *Manager) Create(agentID string, opts ...SessionOption) (*Session, error) {
-    // 1. 验证 Agent 存在
-    if _, err := m.agentMgr.Get(agentID); err != nil {
-        return nil, fmt.Errorf("agent not found: %w", err)
-    }
-
-    // 2. 构造 Session
-    sess := &Session{
-        ID:        "sess_" + ulid.Make().String(),
-        AgentID:   agentID,
-        Messages:  []Message{},
-        State:     SessionStateCreated,
-        CreatedAt: time.Now(),
-        UpdatedAt: time.Now(),
-        Metadata:  make(map[string]any),
-    }
-
-    // 3. 应用选项
-    for _, opt := range opts {
-        opt(sess)
-    }
-
-    // 4. 持久化
-    if err := m.store.Save(sess); err != nil {
-        return nil, fmt.Errorf("persist session: %w", err)
-    }
-
-    // 5. 注册到内存索引
-    m.mu.Lock()
-    m.sessions[sess.ID] = sess
-    m.agentIdx[agentID] = append(m.agentIdx[agentID], sess.ID)
-    m.mu.Unlock()
-
-    m.logger.Info("session created", "session_id", sess.ID, "agent_id", agentID)
-    return sess, nil
-}
-```
-
-### 5.2 Active
-
-Active 是主要工作状态。消息处理流程：
-
-```go
-func (m *Manager) AppendMessage(sessionID string, msg Message) error {
-    sess, err := m.getLocked(sessionID)
-    if err != nil {
-        return err
-    }
-
-    // 状态检查
-    if sess.State == SessionStateCreated {
-        sess.State = SessionStateActive // 首条消息触发激活
-    }
-    if sess.State != SessionStateActive {
-        return ErrSessionNotActive
-    }
-
-    msg.ID = "msg_" + ulid.Make().String()
-    msg.CreatedAt = time.Now()
-    sess.Messages = append(sess.Messages, msg)
-    sess.UpdatedAt = time.Now()
-
-    // 异步持久化
-    return m.store.Save(sess)
-}
-```
-
-### 5.3 Paused
-
-```go
-func (m *Manager) Pause(sessionID string) error {
-    sess, err := m.getLocked(sessionID)
-    if err != nil {
-        return err
-    }
-    if sess.State != SessionStateActive {
-        return ErrInvalidStateTransition
-    }
-
-    sess.State = SessionStatePaused
-    sess.UpdatedAt = time.Now()
-    m.logger.Info("session paused", "session_id", sessionID)
-    return m.store.Save(sess)
-}
-```
-
-Paused 状态下：
-- `AppendMessage()` 返回 `ErrSessionPaused`
-- `Get()` / `GetMessages()` 正常工作（只读）
-- `Resume()` 可恢复到 Active
-
-### 5.4 Closed
-
-```go
-func (m *Manager) Close(sessionID string) error {
-    sess, err := m.getLocked(sessionID)
-    if err != nil {
-        return err
-    }
-    if sess.State == SessionStateClosed {
-        return nil // 幂等
-    }
-
-    sess.State = SessionStateClosed
-    sess.UpdatedAt = time.Now()
-
-    // 触发归档回调
-    if m.onClose != nil {
-        m.onClose(sess)
-    }
-
-    m.logger.Info("session closed", "session_id", sessionID,
-        "message_count", len(sess.Messages))
-    return m.store.Save(sess)
-}
-```
-
-Closed 状态下：
-- 所有写操作返回 `ErrSessionClosed`
-- `Get()` / `GetMessages()` 仍可读取（归档数据）
-- `Delete()` 可彻底移除
-
----
-
-## 6. 状态守卫
-
-所有公开方法通过状态守卫确保操作合法性：
-
-```go
-// ensureState 检查 Session 是否处于允许的状态。
-func (s *Session) ensureState(allowed ...SessionState) error {
-    for _, st := range allowed {
-        if s.State == st {
-            return nil
-        }
-    }
-    return fmt.Errorf("session %s is in %s state, expected one of %v",
-        s.ID, s.State, allowed)
-}
-```
-
-| 方法 | 允许的状态 |
-|------|----------|
-| `AppendMessage` | Created, Active |
-| `Pause` | Active |
-| `Resume` | Paused |
-| `Close` | Created, Active, Paused |
-| `Get` | 任意 |
-| `GetMessages` | 任意 |
-| `Delete` | 任意 |
-| `UpdateMetadata` | Created, Active, Paused |
-
----
-
-## 7. 超时与自动关闭
-
-```go
-// autoCloseTicker 定期检查并自动关闭超时 Session。
-func (m *Manager) autoCloseTicker(ctx context.Context) {
-    ticker := time.NewTicker(m.config.AutoCloseInterval)
-    defer ticker.Stop()
-
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        case <-ticker.C:
-            m.closeIdleSessions(m.config.IdleTimeout)
-        }
-    }
-}
-```
-
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `auto_close_interval` | 5m | 检查间隔 |
-| `idle_timeout` | 24h | 超时阈值 |
-| `max_lifetime` | 72h | 最大存活时间 |
-
----
-
-*最后更新: 2025-07-17*
+*最后更新: 2026-07-22*

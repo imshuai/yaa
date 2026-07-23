@@ -1,104 +1,57 @@
 # Planner 实现检查清单
 
-> 文档路径: `docs/planner/checklist.md`
-> 上级: `docs/planner/README.md`
+> 上级: [Planner 系统设计](README.md)
 
 ---
 
-## 核心接口与类型
+## 配置与构造
 
-- [ ] `Planner` 接口定义（`Plan(ctx, task, agent) (*Plan, error)`）
-- [ ] `Plan` 结构体定义（Steps, CreatedAt, Task）
-- [ ] `Step` 结构体定义（ID, Action, Input, Depends, Status, Output）
-- [ ] `StepStatus` 枚举（Pending, Running, Done, Failed, Skipped）
-- [ ] `PlannerConfig` 结构体定义（Type, Model, Temperature, MaxTokens, MaxConcurrent, Timeout, AutoSkip）
-- [ ] 错误变量定义（ErrPlanTimeout, ErrPlanParseFailed, ErrPlanEmpty 等）
+- [ ] `PlannerConfig` 字段、默认值和范围与 [config-ref.md](config-ref.md) 一致
+- [ ] `type=disabled` 时不创建 Planner/Executor
+- [ ] Agent override 在启动时合并并完整校验
+- [ ] Planner 配置变更报告 `restart_required`
 
-## 规划器实现
+## 生成
 
-- [ ] `LLMPlanner` 结构体（默认 LLM 驱动规划器）
-- [ ] 规划 Prompt 模板构建（包含任务描述、可用 Tool/Skill 列表）
-- [ ] LLM 调用（通过 Agent 的 Provider）
-- [ ] LLM 输出解析为 Plan 结构
-- [ ] 解析失败处理（重试一次后回退）
-- [ ] `RulePlanner` 结构体（规则驱动规划器，可选实现）
-- [ ] `DisabledPlanner` 结构体（空实现，直接返回 nil）
-- [ ] 规划器工厂函数（根据配置类型创建实例）
+- [ ] `PlanningInput` 只含当前 Agent 已授权能力
+- [ ] 规划调用继承 turn context，并额外应用规划 timeout
+- [ ] 模型只生成 `steps`；Plan ID/Task 来自可信输入
+- [ ] 使用结构化 JSON 编解码，不从 Markdown fence 截取 JSON
+- [ ] Provider 错误、JSON 错误和校验错误保持可 `errors.Is/As`
 
-## Step 依赖与 DAG
+## 校验
 
-- [ ] Step 依赖解析（`Depends []string`）
-- [ ] 循环依赖检测（DAG 校验）
-- [ ] 拓扑排序生成执行顺序
-- [ ] 依赖未满足时的错误处理
-- [ ] 可并行 Step 的识别（无相互依赖的 Step）
+- [ ] Step 数、ID、Action、Target 和能力校验在执行前完成
+- [ ] Depends 允许后向引用，但拒绝未知、自依赖和重复依赖
+- [ ] Kahn 算法拒绝所有环
+- [ ] `$step` 只引用直接依赖，且 object shape 严格
+- [ ] `ValidatePlan(plan, in)` 精确绑定可信 TurnID/Task/MaxSteps/Tool capabilities
+- [ ] 非法 Plan 不启动 goroutine、Tool 或 Provider Step
 
-## Plan 执行
+## 执行
 
-- [ ] `executePlan()` — 按拓扑顺序执行 Step
-- [ ] `executeStep()` — 单个 Step 执行（分发到 Tool/Skill/LLM）
-- [ ] `executeStepWithRetry()` — 带重试的 Step 执行
-- [ ] Step 超时控制（context.WithTimeout）
-- [ ] 已完成 Step 跳过（恢复场景）
-- [ ] Plan 执行中断处理（保存失败点到 Session）
+- [ ] 同一 Session 的 Planner 位于既有 turn FIFO gate 内
+- [ ] ready Step 按 Plan 数组顺序确定性调度
+- [ ] 并发数不超过 `max_concurrent`
+- [ ] 结果 map 只由调度 goroutine 写入
+- [ ] 首次失败停止新调度、取消运行节点并等待全部退出
+- [ ] 外部取消返回 `context` cause，无 goroutine/channel 泄漏
+- [ ] Executor 不重试、不持久化、不恢复 Plan
 
-## Agent 集成
+## 集成与安全
 
-- [ ] `shouldPlan()` — 简单任务检测逻辑
-- [ ] `planWithErrorHandling()` — 规划错误处理与降级
-- [ ] Agent 启动时初始化 Planner 实例
-- [ ] Plan 摘要注入 Context（限制 token 数）
-- [ ] auto_skip 配置生效
+- [ ] Tool 在执行时使用真实 `agentID`/`sessionID` 再次鉴权
+- [ ] Skill 只作为静态 Agent Prompt，不存在 Planner Skill action 或子循环
+- [ ] LLM Step 不携带 Tool definitions
+- [ ] Step 输出在依赖绑定前验证可 JSON 编码
+- [ ] Session snapshot、Remote 路由和 RBAC 均无 Plan 字段/resource
+- [ ] 日志与指标不泄露任务、输入、输出、prompt 或 secret
 
-## Session 集成
+## 最小测试
 
-- [ ] `Session.SetPlan()` — 挂载 Plan 到 Session
-- [ ] `Session.GetPlan()` — 获取当前 Plan
-- [ ] Session 恢复时加载未完成 Plan
-- [ ] Plan 持久化到 Storage
-- [ ] 从 Storage 恢复 Plan 状态
-
-## 配置
-
-- [ ] 全局 `planner` 配置段解析
-- [ ] Agent 级别 `planner` 配置覆盖
-- [ ] 配置合并逻辑（Agent > 全局 > 默认值）
-- [ ] 环境变量覆盖（`YAA_PLANNER_*`）
-- [ ] 配置项验证（timeout > 0, max_concurrent > 0 等）
-
-## 错误处理与重试
-
-- [ ] `ErrPlanTimeout` — 规划超时处理
-- [ ] `ErrPlanParseFailed` — 解析失败重试
-- [ ] `ErrPlanEmpty` — 空计划处理
-- [ ] `ErrPlanTooManySteps` — 步骤数上限检查
-- [ ] `ErrPlanCircularDep` — 循环依赖检测
-- [ ] `ErrStepExecutionFailed` — Step 失败重试（3 次指数退避）
-- [ ] `ErrStepTimeout` — Step 超时不重试
-- [ ] `ErrPlannerUnavailable` — Provider 故障降级
-- [ ] 降级逻辑：Planner 不可用时跳过规划
-
-## 可观测性
-
-- [ ] 规划开始日志（task, agent_id）
-- [ ] 规划完成日志（steps_count, duration）
-- [ ] 规划失败日志（error, type）
-- [ ] Step 执行日志（step_id, action, status, duration）
-- [ ] Step 重试日志（step_id, attempt）
-- [ ] 指标: `planner_plan_total` (Counter)
-- [ ] 指标: `planner_plan_failed_total` (Counter)
-- [ ] 指标: `planner_plan_duration` (Histogram)
-- [ ] 指标: `planner_step_total` (Counter, 标签: action, status)
-- [ ] 指标: `planner_step_retry_total` (Counter)
-- [ ] SSE 事件: `planner.plan.started`
-- [ ] SSE 事件: `planner.plan.completed`
-- [ ] SSE 事件: `planner.plan.failed`
-- [ ] SSE 事件: `planner.step.completed`
-- [ ] SSE 事件: `planner.step.failed`
-
-## Remote API
-
-- [ ] `GET /api/v1/sessions/:id/plan` — 获取当前 Plan
-- [ ] `POST /api/v1/sessions/:id/plan/retry` — 重试失败的 Step
-- [ ] `POST /api/v1/sessions/:id/plan/cancel` — 取消 Plan 执行
-- [ ] SSE: Plan 状态变化事件推送
+- [ ] 空 Plan、重复 ID、未知依赖、自依赖和环均失败且零调用
+- [ ] 独立节点达到并发上限，依赖节点只在全部成功后启动
+- [ ] 输入引用完整输出和直接 key 均正确解析
+- [ ] 首个 Step 失败后未启动节点为 skipped，运行节点被取消
+- [ ] turn cancel 与 timeout 后所有 worker 退出
+- [ ] 同一 Agent 无权使用的 Tool 即使由模型生成也被拒绝

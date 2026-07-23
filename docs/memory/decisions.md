@@ -1,181 +1,49 @@
 # Memory 设计决策
 
-> 文档路径: `docs/memory/decisions.md`
-> 上级: `docs/memory/README.md` §设计决策
+> 上级: [Memory 系统设计](README.md)
 
 ---
 
-## 设计决策
+## MM-001：v1 只有 Agent-scoped long-term
 
-### MM-001: 三层记忆架构，而非单一存储
+Session 保存完整消息和短期状态；Memory 不复制历史、不维护独立摘要层。`SessionID` 仅作为 item 来源和过滤 scope。
 
-**决策：** Memory 采用 Short-term / Long-term / Summary 三层架构，而非单一扁平存储。
+## MM-002：Put 是唯一 upsert 写契约
 
-**理由：**
-- 不同生命周期和访问模式的记忆需要不同的存储策略
-- 短期记忆频繁读写、随 Session 结束清除或晋升；长期记忆需要持久化和检索
-- 摘要记忆是 Context 压缩的产物，语义上独立于原始消息
-- 单一存储会导致检索噪音大、存储膨胀、性能下降
+公开 `Put(ctx,policy,item)` 按完整复合主键 upsert，避免创建/更新两套语义。内部唯一 commit 是 `ContentStore.CommitPut(item,victims,now)`，target 与容量 victims 同成同败。Promote 是显式的 scope 复制操作，最终仍使用同一提交规则。
 
-**影响：** `MemoryLayer` 枚举贯穿所有接口，存储后端需按层区分策略。
+## MM-003：ContentStore 是真实来源
 
----
+SQLite/Memory ContentStore 先提交 item；embedding 和 vector index 可重建。索引失败不回滚已提交内容，健康状态标记 degraded。
 
-### MM-002: 统一 Memory Interface，屏蔽存储差异
+## MM-004：v1 向量索引是进程内 exact cosine
 
-**决策：** 所有记忆操作通过 `Memory` interface 完成，存储后端（SQLite / 向量数据库 / 内存）通过配置切换。
+向量默认关闭。启用时使用纯 Go slice 和 exact cosine，不增加本地扩展或独立索引服务。默认 `max_items=10000` 是这个简单实现的明确上限；实测延迟或内存不满足后再引入新版本后端。
 
-**理由：**
-- 用户可能从原型（内存）到生产（SQLite）到规模化（向量数据库）逐步升级
-- 接口统一让上层逻辑不关心存储细节
-- 符合 Config over Code 原则
+## MM-005：纯 Go SQLite
 
-**影响：** 存储后端需实现 `Memory` interface，扩展能力通过 `MemoryExtended` 可选接口提供。
+本地内容存储使用 `modernc.org/sqlite`，零 CGO，保持目标平台可交叉编译。Memory SQLite 文件独立于根 KV Storage，因为查询和版本契约不同。
 
----
+## MM-006：TTL 与驱逐由 Manager 控制
 
-### MM-003: 检索优先，而非全量加载
+Default TTL 只在 Put 时解析；已有 ExpiresAt 不因配置 reload 改变。过期使用有限 batch 删除，驱逐只支持 FIFO 或最早 TTL，不依赖未持久化访问时间。Manager 在 Agent lock 内计算 victims，ContentStore 在同一事务/写锁内完成 victims 删除与 target upsert，提交后才发布事件。
 
-**决策：** 长期记忆通过 Search 检索后按需注入 Context，而非全量加载到 Context 窗口。
+## MM-007：严格 scope 与严格配置
 
-**理由：**
-- Context 窗口是稀缺资源，Token 预算有限
-- 长期记忆可能无限增长，全量加载不现实
-- 检索方式（语义 / 关键词）能精准匹配当前对话需求
+Get/Delete 必须提供完整 Scope；空 SessionID 在 Search/Clear 表示 Agent 全范围，Manager 的 Reindex 通过 `List` 使用同一全范围语义但只接收 `agentID`。未知配置字段、未知 Layer 和 Agent 越权启用一律拒绝。
 
-**影响：** Agent Loop 需在构建 Context 时插入 Memory 检索步骤，检索结果作为 System Message 注入。
+## MM-008：事件不泄露内容
 
----
+事件只包含 scope、key、Version、时间和有限 reason；日志/指标不记录 Content、metadata value、embedding、query 或凭据，高基数 ID 不进入 metric label。
 
-### MM-004: 向量搜索为主，关键词搜索为降级回退
+## MM-009：确定性优先
 
-**决策：** 优先使用向量语义搜索（需 Embedder），当向量搜索不可用时回退到关键词搜索。
+关键词结果、向量并列、TTL batch 和 eviction victim 都有稳定 tie-break。相同内容与相同时钟输入必须产生相同顺序，便于测试和重放。
 
-**理由：**
-- 语义搜索能理解"意思相近"的记忆，超越字面匹配
-- 但 Embedder 需要额外依赖（模型 / API），并非所有部署环境都具备
-- 优雅降级保证基本可用性
+## MM-010：没有隐式内容 fallback
 
-**影响：** Memory 实现需检测 Embedder 可用性，`Search` 方法内部自动选择搜索策略。
+ContentStore 失败向上传递，不将写入转存临时 map 后返回成功。只有向量检索可按显式 `fallback_to_keyword` 降级；Content commit 后的索引失败由 degraded + Reindex 修复。
 
 ---
 
-### MM-005: Agent 级记忆隔离，Session 级不独立存储
-
-**决策：** 记忆按 Agent 隔离，每个 Agent 拥有独立 Memory 空间；Session 不拥有独立 Memory，但短期记忆随 Session 生命周期管理。
-
-**理由：**
-- Agent 是能力主体，记忆应绑定到 Agent 而非单个对话
-- 同一 Agent 的多个 Session 共享长期记忆，实现跨对话连续性
-- Session 级独立 Memory 会导致记忆碎片化，难以关联
-
-**影响：** `MemoryManager` 以 `agentID` 为 key 管理 Memory 实例，短期记忆通过 `layer` 字段区分 Session。
-
----
-
-### MM-006: 短期记忆可晋升为长期记忆
-
-**决策：** 提供 `Promote` 操作，将短期记忆手动或自动晋升为长期记忆。
-
-**理由：**
-- 并非所有短期记忆都需要持久化，但也非全部应丢弃
-- Session 结束时，重要信息（用户偏好、关键决策）应保留
-- 晋升机制是"遗忘"与"记住"之间的可控阀门
-
-**影响：** `MemoryExtended` 接口包含 `Promote` 方法；晋升策略可配置（手动 / 自动 / 混合）。
-
----
-
-### MM-007: 记忆支持过期与淘汰机制
-
-**决策：** 记忆项支持 `ExpiresAt` 字段，并提供 `Expire` 方法清理过期记忆。
-
-**理由：**
-- 长期记忆无限增长会导致存储膨胀和检索性能下降
-- 部分记忆有自然过期时间（临时任务、限时上下文）
-- 主动淘汰是存储管理的必要手段
-
-**影响：** 存储后端需支持过期清理；可配置定期清理任务或手动触发。
-
----
-
-### MM-008: 扩展能力通过能力检测模式暴露
-
-**决策：** 核心 `Memory` interface 保持最小化，高级能力（批量、过滤、更新、晋升、计数）通过 `MemoryExtended` 可选接口暴露，调用方通过类型断言检测。
-
-**理由：**
-- 最小接口降低实现门槛，简单存储后端只需实现 5 个方法
-- 高级能力是"锦上添花"，不应强制所有后端实现
-- 能力检测模式是 Go 语言的惯用做法（如 `io.ReadWriter`）
-
-**影响：** 调用方需编写 `if ext, ok := mem.(MemoryExtended); ok { ... }` 防御代码。
-
----
-
-## 模块关系
-
-```text
-┌──────────────────────────────────────────────────────────────┐
-│                          Agent                                │
-│                                                                │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    │
-│  │ Context Mgr  │◄───│ Memory Mgr   │───►│ Session Mgr  │    │
-│  │ (注入检索结果)│    │ (实例管理)    │    │ (短期记忆来源)│    │
-│  └──────────────┘    └──────┬───────┘    └──────────────┘    │
-│                              │                                 │
-│               ┌──────────────┼──────────────┐                │
-│               │              │              │                 │
-│        ┌──────▼─────┐ ┌──────▼─────┐ ┌─────▼──────┐          │
-│        │ Memory     │ │ Memory     │ │ Memory    │          │
-│        │ (Agent A)  │ │ (Agent B)  │ │ (Agent C) │          │
-│        └──────┬─────┘ └──────┬─────┘ └─────┬────┘          │
-│               │              │              │                 │
-│        ┌──────▼──────────────▼──────────────▼────┐           │
-│        │            Memory Store                  │           │
-│        │  ┌──────────┐ ┌──────────┐ ┌──────────┐│           │
-│        │  │ SQLite   │ │ Vector   │ │ In-Memory││           │
-│        │  │ Store    │ │ Store    │ │ Store    ││           │
-│        │  └──────────┘ └──────────┘ └──────────┘│           │
-│        └──────────────────┬─────────────────────┘           │
-│                           │                                   │
-│                    ┌──────▼──────┐                            │
-│                    │  Embedder   │ (可选，向量搜索)            │
-│                    │  (Provider  │                            │
-│                    │   独立配置) │                            │
-│                    └─────────────┘                            │
-│                                                                │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │  Memory Layer                                          │    │
-│  │  ┌────────────┐ ┌────────────┐ ┌────────────┐       │    │
-│  │  │ Short-term │ │ Long-term  │ │ Summary    │       │    │
-│  │  │ (消息历史) │ │ (持久化)   │ │ (压缩摘要) │       │    │
-│  │  └────────────┘ └────────────┘ └────────────┘       │    │
-│  └──────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────┘
-
-依赖方向:
-  Agent → Memory Manager (获取 Memory 实例)
-  Memory Manager → Memory Store (底层存储，配置切换)
-  Memory Manager → Embedder (向量嵌入，可选)
-  Context Manager → Memory (检索后注入 Context)
-  Session Manager → Memory (短期记忆来源)
-  Memory Store → SQLite / Vector DB / In-Memory (后端实现)
-  Embedder → Provider (嵌入模型调用)
-
-数据流:
-  Session 消息 → Short-term Memory → (Promote) → Long-term Memory
-  Long-term Memory → (Search) → Context Manager → LLM
-  Context 压缩 → Summary Memory → Storage
-```
-
-**依赖关系：**
-- Memory Manager 是核心调度者，管理所有 Agent 的 Memory 实例（懒加载）
-- Memory Store 是可替换后端，通过配置选择 SQLite / 向量数据库 / 内存
-- Embedder 是可选依赖，仅在向量搜索时需要，不可用时自动降级
-- Context Manager 是 Memory 的消费者，检索结果通过 System Message 注入
-- Session Manager 是短期记忆的来源，Session 关闭时触发晋升或清理
-- 三层 Memory（Short-term / Long-term / Summary）共享存储后端，通过 `layer` 字段区分
-
----
-
-*最后更新: 2025-07-17*
+*最后更新: 2026-07-22*

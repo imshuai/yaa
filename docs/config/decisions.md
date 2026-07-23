@@ -16,7 +16,7 @@
 - 层级固定，用户心智模型清晰
 - 环境变量引用是配置文件的值展开层，而非独立来源
 
-**影响：** Loader 按固定顺序依次覆盖，Merger 不支持自定义优先级。
+**影响：** Loader 按固定顺序依次覆盖，不提供可自定义的优先级或独立合并组件。
 
 ### CF-002: 主推 YAML，兼容 TOML 和 JSON
 
@@ -36,9 +36,9 @@
 **理由：**
 - `${}` 是跨语言通用约定（Docker Compose、Spring），用户熟悉
 - 展开时机在校验前，确保展开后的值参与校验
-- 不支持 `${VAR:default}` 默认值语法——默认值通过内置默认值层处理
+- 支持 `${VAR:-default}`；不实现其他 shell 参数展开、嵌套或递归展开
 
-**影响：** EnvVar Resolver 需在 Loader 和 Validator 之间执行。
+**影响：** EnvVar Resolver 在原始 Map 迁移后、`ApplyElementDefaults(raw)` 前执行。
 
 ### CF-004: 敏感信息只走环境变量，不写入配置文件
 
@@ -53,12 +53,12 @@
 
 ### CF-005: 热更新基于文件监听 + 原子替换
 
-**决策：** 配置热更新通过 fsnotify 文件监听触发，解析后通过 atomic.Value 原子替换生效。
+**决策：** 配置热更新通过 fsnotify 文件监听触发，串行完成完整 Load/diff 后通过 `atomic.Value` 原子替换；出现任一需重启字段时整批拒绝。
 
 **理由：**
 - 文件监听是配置热更新的标准方案，无需引入额外服务
 - 原子替换保证读取一致性，不会读到半解析状态
-- 不使用锁，避免热更新时的性能抖动
+- 读取无锁；单个 reload mutex 只串行化低频写入
 
 **影响：** 各模块持有 Effective Config 引用，热更新后需重新读取。
 
@@ -86,7 +86,7 @@
 
 ### CF-008: 配置版本化 + 迁移函数链
 
-**决策：** 配置文件包含 `version` 字段，版本间通过迁移函数链自动升级。
+**决策：** 配置文件包含 `config_version` 字段，版本间通过显式迁移图自动升级，不推测 `nextVersion`。
 
 **理由：**
 - 版本化使配置变更可追踪
@@ -101,7 +101,7 @@
 |------|----------|----------|
 | CF-001 | 四层固定优先级 | 简单性 > 灵活性 |
 | CF-002 | YAML 优先，兼容 TOML/JSON | 可读性 > 单一格式 |
-| CF-003 | `${VAR_NAME}` 语法，无默认值 | 简单性 > 功能丰富 |
+| CF-003 | `${VAR_NAME}` / `${VAR_NAME:-default}` | 简单性 > shell 兼容 |
 | CF-004 | 敏感信息只走环境变量 | 安全 > 便利 |
 | CF-005 | fsnotify + atomic.Value | 无锁 > 一致性锁 |
 | CF-006 | Tag + 自定义函数 | 声明式 + 命令式混合 |
@@ -119,34 +119,38 @@
 │  Loader (YAML/TOML/JSON 自动检测)               │
 │    │                                             │
 │    ▼                                             │
+│  Migration Graph (原始 Map 版本迁移)             │
+│    │                                             │
+│    ▼                                             │
 │  EnvVar Resolver (${VAR} 展开)                   │
 │    │                                             │
 │    ▼                                             │
-│  Merger (默认值+配置文件+环境变量+命令行)         │
+│  Defaulting (Default + ApplyElementDefaults)      │
+│  DecodeInto + CLI Flags                            │
 │    │                                             │
 │    ▼                                             │
-│  Validator (Tag + 自定义函数)                     │
+│  Validator (Tag + 自定义函数)                    │
 │    │                                             │
 │    ▼                                             │
 │  Effective Config (atomic.Value, 全局只读快照)   │
 │    │                                             │
 │    ├──► Watcher (fsnotify, 文件变更重新加载)     │
-│    ├──► Migration Chain (版本升级时迁移)          │
 │    └──► 各运行时模块 (Agent/Provider/Tool...)    │
 │                                                  │
 │  Watcher 触发时: Loader → ... → 原子替换          │
 └────────────────────────────────────────────────┘
 
 依赖方向:
-  Loader → Parsers → EnvVar Resolver → Merger → Validator → Effective Config
+  Loader → Parsers → Migration → EnvVar Resolver → Defaulting
+         → DecodeInto → CLI Flags → Validator → Effective Config
   Watcher → Loader (文件变更时重新加载)
-  Migration Chain → Loader (版本不匹配时迁移后加载)
+  Migration Graph → Loader (版本不匹配时迁移后加载)
   各运行时模块 → Effective Config (只读引用)
 
 关键约束:
   - Effective Config 全局只读，写入仅通过原子替换
-  - Migration Chain 仅在加载时触发，不参与热更新
-  - Validator 仅校验不修改值，默认值由 Merger 注入
+  - 热更新复用同一 Loader，因此同样执行版本检查和迁移
+  - Validator 仅校验不修改值；`Default()`/`Default*Config` 与 `ApplyElementDefaults(raw)` 共同完成唯一默认值阶段
   - 配置系统不依赖任何运行时模块，是纯粹的基础设施层
 ```
 

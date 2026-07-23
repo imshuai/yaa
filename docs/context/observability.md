@@ -1,128 +1,62 @@
 # Context 可观测性
 
 > 文档路径: `docs/context/observability.md`
-> 上级: `docs/context/README.md` §8
+> 上级: [README.md](README.md)
 
 ---
 
-## 8. 可观测性
+## 1. 日志
 
-### 8.1 日志
+每次 Build 最多写一条完成日志；压缩、截断或失败时再写对应事件。不得记录完整 prompt、Memory、Tool result、API key 或摘要正文。
 
-```go
-// Context 相关日志事件
-builder.logger.Info("context built",
-    "session", sessionID,
-    "agent", agentID,
-    "total_tokens", totalTokens,
-    "segment_tokens", segmentTokens, // map[string]int
-    "build_duration", duration,
-    "strategy", strategy,
-)
+| 事件 | 级别 | 必需字段 |
+|------|------|----------|
+| `context.built` | debug | request_id, session_id, agent_id, provider_id, model, strategy, input_tokens, input_budget, original_messages, final_messages, duration_ms |
+| `context.compressed` | info | request_id, before_tokens, after_tokens, compressed_turns, duration_ms |
+| `context.compression_failed` | warn | request_id, reason, fallback, duration_ms |
+| `context.truncated` | info | request_id, before_tokens, after_tokens, dropped_units |
+| `context.overflow` | warn | request_id, input_tokens, input_budget, protected_tokens, strategy |
+| `context.error` | error | request_id, error_type, error |
 
-builder.logger.Info("context compressed",
-    "session", sessionID,
-    "method", "summarize",
-    "before_tokens", beforeTokens,
-    "after_tokens", afterTokens,
-    "ratio", ratio,
-    "duration", duration,
-    "preserved_messages", preserved,
-)
+`session_id`、`agent_id` 只进入结构化日志和 trace，不作为 Prometheus 标签。
 
-builder.logger.Warn("token budget near limit",
-    "session", sessionID,
-    "used_tokens", used,
-    "max_tokens", maxTokens,
-    "utilization", utilization,
-)
-```
+## 2. 指标
 
-### 8.2 指标
+所有 duration 使用秒，名称带 `_seconds`。标签只使用有界枚举或已配置的稳定 ID。
 
 | 指标 | 类型 | 标签 | 说明 |
 |------|------|------|------|
-| `context_build_total` | Counter | agent, strategy | Context 构建次数 |
-| `context_build_duration` | Histogram | agent, strategy | 构建耗时（ms） |
-| `context_total_tokens` | Gauge | agent, session | 当前 Context 总 Token 数 |
-| `context_segment_tokens` | Gauge | agent, session, segment | 各段 Token 占用 |
-| `context_token_utilization` | Gauge | agent, session | Token 利用率（0-1） |
-| `context_compression_total` | Counter | agent, method | 压缩触发次数 |
-| `context_compression_duration` | Histogram | agent, method | 压缩耗时（ms） |
-| `context_compression_ratio` | Histogram | agent, method | 压缩比（after/before） |
-| `context_compression_failed_total` | Counter | agent, method, reason | 压缩失败次数 |
-| `context_overflow_total` | Counter | agent, strategy | 溢出策略触发次数 |
-| `context_budget_exceeded_total` | Counter | agent | 预算超限次数 |
+| `context_build_total` | Counter | provider, model, strategy, result | Build 次数 |
+| `context_build_duration_seconds` | Histogram | provider, model, strategy | Build 耗时 |
+| `context_input_tokens` | Histogram | provider, model | 成功请求输入 Token |
+| `context_input_budget` | Gauge | agent, provider, model | 当前 Effective Config 的输入预算 |
+| `context_utilization_ratio` | Histogram | provider, model | `input_tokens/input_budget` |
+| `context_compression_total` | Counter | provider, model, result | 摘要尝试次数 |
+| `context_compression_duration_seconds` | Histogram | provider, model, result | 摘要耗时 |
+| `context_truncation_total` | Counter | provider, model | 发生截断的 Build 数 |
+| `context_dropped_units_total` | Counter | provider, model | 被整体删除的 unit 数 |
+| `context_overflow_total` | Counter | provider, model, strategy, reason | 无法满足预算次数 |
+| `context_token_estimation_failed_total` | Counter | provider, model | Provider 估算失败次数 |
 
-### 8.3 压缩前后对比
+不得声明 Context cache hit/miss 指标；v1 没有 Context cache。
 
-每次压缩记录前后 Token 对比，用于分析和调优：
+## 3. Trace
 
-```go
-// recordCompression 记录压缩指标。
-func (m *Metrics) recordCompression(sessionID, method string, before, after int, duration time.Duration) {
-    ratio := float64(after) / float64(before)
-
-    m.compressionTotal.WithLabelValues(m.agentID, method).Inc()
-    m.compressionDuration.WithLabelValues(m.agentID, method).Observe(duration.Seconds() * 1000)
-    m.compressionRatio.WithLabelValues(m.agentID, method).Observe(ratio)
-
-    m.logger.Info("compression result",
-        "session", sessionID,
-        "method", method,
-        "before", before,
-        "after", after,
-        "saved", before-after,
-        "ratio", fmt.Sprintf("%.2f%%", ratio*100),
-        "duration", duration,
-    )
-}
+```text
+context.build
+  context.estimate
+  context.compress       # 仅 hybrid 触发时存在
+    provider.chat
+  context.truncate       # 仅需要时存在
+  context.estimate
 ```
 
-**压缩报告示例：**
+Span 属性使用与指标相同的稳定字段，可额外包含 request/session/agent ID。错误 span 记录错误类型，不附加原始消息。
 
-| 会话 | 方法 | 压缩前 | 压缩后 | 节省 | 压缩比 | 耗时 |
-|------|------|--------|--------|------|--------|------|
-| sess-001 | summarize | 118000 | 68000 | 50000 | 57.6% | 2.3s |
-| sess-002 | truncate | 126000 | 72000 | 54000 | 57.1% | 0.01s |
-| sess-003 | summarize | 132000 | 79000 | 53000 | 59.8% | 3.1s |
+## 4. Remote 边界
 
-### 8.4 Remote API 事件
+Context 只写上述日志、指标和 trace；v1 没有 Context Remote 事件或独立 SSE 路由。Context 不注册 `context_status`、`context_history` 或 `context_compress` 内置 Tool。需要管理能力时使用已有 Session Remote API；新增 Tool 必须先在 Tool registry、权限模型和 Remote API 中同时定义。
 
-Context 状态变化通过 Remote API SSE 推送：
+---
 
-| 事件 | 触发时机 | Payload |
-|------|---------|---------|
-| `context.built` | Context 构建完成 | session_id, total_tokens, segments |
-| `context.compressed` | 压缩完成 | session_id, method, before, after, ratio |
-| `context.overflow` | 溢出策略触发 | session_id, strategy, dropped_tokens |
-| `context.error` | Context 发生错误 | session_id, error, type |
-
-**SSE 示例：**
-
-```json
-{
-  "event": "context.compressed",
-  "data": {
-    "session_id": "sess-001",
-    "method": "summarize",
-    "before_tokens": 118000,
-    "after_tokens": 68000,
-    "ratio": 0.576,
-    "duration_ms": 2300,
-    "timestamp": "2026-07-16T15:30:00Z"
-  }
-}
-```
-
-### 8.5 内置 Tool 集成
-
-Context 系统与 Tool 系统的内视工具集成：
-
-| Tool | 说明 |
-|------|------|
-| `context_status` | 查看当前 Context 各段 Token 占用与利用率 |
-| `context_history` | 查看构建历史（最近 N 次构建的指标摘要） |
-| `context_compress` | 手动触发压缩 |
-
-详见 `docs/tool/introspection.md` §6.5.8。
+*最后更新: 2026-07-22*

@@ -1,106 +1,77 @@
 # Plugin 实现检查清单
 
 > 文档路径: `docs/plugin/checklist.md`
-> 上级: `docs/plugin/README.md` §11
+> 上级: [README.md](README.md)
 
 ---
 
-## 11. 实现检查清单
+## 协议与 Manifest
 
-### Plugin 接口
+- [ ] 文档阶段只以 [interface.md](interface.md) 内嵌 proto 为权威；实现时原样落到 `api/plugin/v1/plugin.proto` 并切换唯一 wire authority
+- [ ] 生成 `pkg/pluginrpc/gen`，生成文件不手工修改；CI 校验 proto、生成物和保留镜像一致
+- [ ] RPC major v1 只接受 `protocol_version: "1"`
+- [ ] Manifest 完整字段和严格未知字段校验
+- [ ] `provides[]` 只接受 `tool`，且 name/description/schema 必填
+- [ ] Manifest capabilities 与 Ready capabilities 的 type/name/description/schema 集合一致
+- [ ] `entries[].config` 在启动进程前通过 `config_schema`
+- [ ] `requires_runtime`、dependency version 使用 SemVer parser
 
-- [ ] `Plugin` 接口定义（Name, Version, Init, Shutdown, Type）
-- [ ] `PluginMeta` 结构体定义（Name, Version, Author, Description, Type, Dependencies）
-- [ ] `PluginType` 枚举（Tool, Provider, Skill, Hook, Middleware）
-- [ ] `PluginEntry` 结构体定义（Plugin, Status, Source, Path, LoadedAt, Config）
-- [ ] `PluginStatus` 枚举（Registered, Loaded, Disabled, Error, Uninstalled）
-- [ ] `ToolPlugin` 接口定义（RegisterTools）
-- [ ] `ProviderPlugin` 接口定义（RegisterProvider）
-- [ ] `HookPlugin` 接口定义（RegisterHooks）
-- [ ] 插件符号导出约定（`PluginInstance` 变量）
+## Loader
 
-### Plugin Manager
+- [ ] `plugins.paths` 相对主配置目录解析并去重
+- [ ] `NewLoader(configDir, paths, logger)` 校验依赖并固定 RPC major；`NewManager` 消费其 typed discovery diagnostics
+- [ ] 每个直接子目录只读取一个 `plugin.yaml`
+- [ ] entry 规范化后不得逃逸 Manifest 目录，并验证可执行权限
+- [ ] Unix Socket / Windows loopback TCP endpoint 与启动 nonce
+- [ ] 长期进程使用 `exec.Command`；startup context 取消不会杀死 Ready 进程
+- [ ] nonce 仅经 `YAA_PLUGIN_STARTUP_NONCE` 传入并由 HandshakeResponse constant-time 校验
+- [ ] Handshake request 使用 `runtime_protocol`/`expected_plugin_id`；response 的 `protocol_version`/`plugin_id`/`plugin_version`/`startup_nonce` 全部与冻结 Descriptor 和启动 nonce 一致
+- [ ] Start 依次执行 exec/Dial/Handshake/Init/Ready
+- [ ] 每个 `cmd.Start` 成功路径恰有一个 `cmd.Wait` owner；失败统一 Terminate + endpoint cleanup
+- [ ] 无法解析 ID 的错误只进 diagnostics；已知 ID 的错误建立 error Entry
+- [ ] 重复 ID 全部拒绝，不按路径顺序覆盖
+- [ ] `RPCClient` 私有持有 transport/process/endpoint；外部只用 Health/Stop/InvokeTool 转发和幂等生命周期方法
 
-- [ ] `Manager` 结构体定义（plugins map, configs map, logger, mu）
-- [ ] `LoadAll()` — 扫描插件目录并加载所有 Plugin
-- [ ] `Load()` — 加载单个 Plugin 文件
-- [ ] `Unload()` — 卸载 Plugin（注销注册的资源）
-- [ ] `Enable()` — 启用已禁用的 Plugin
-- [ ] `Disable()` — 禁用已启用的 Plugin
-- [ ] `Get()` — 查找 Plugin
-- [ ] `List()` — 列出所有已注册 Plugin
-- [ ] `ListByType()` — 按类型过滤 Plugin
-- [ ] `Reload()` — 热更新 Plugin
-- [ ] `HealthCheck()` — 插件健康检查
-- [ ] `GetStats()` — 获取 Plugin 运行时统计
+## Manager
 
-### Plugin Loader
+- [ ] 状态唯一为 `discovered|starting|ready|error|stopped`
+- [ ] 显式 `entries[].enabled` 优先于 Manifest `default_enabled`
+- [ ] `auto_start=false` 时只发现/校验，不启动
+- [ ] 缺失/循环/版本不匹配依赖在启动进程前检测
+- [ ] 非 optional dependency 未 Ready 时下游不启动
+- [ ] Proxy 注册事务化，失败回滚；全部成功后才标记 Ready
+- [ ] 单 Plugin 失败进入 non-fatal StartupReport
+- [ ] 初始启动只尝试一次，`restart.*` 只处理 ready 后 unexpected exit
+- [ ] unexpected exit 使 Proxy 返回 unavailable，并有限退避重启
+- [ ] 重启成功原子替换 Proxy client；请求不自动 replay
+- [ ] Entry 只以冻结的 `Descriptor.Manifest` 为 Manifest 来源，不保存可漂移副本
+- [ ] Stop 关闭 lifecycle gate 并取消退避/启动；发布新 client 前在锁内复查 stopping
+- [ ] `mu` 覆盖 Entry 的 Client/Handle/ProxyNames/State/Health/StartedAt/LastError；RPC/Wait/退避在锁外
+- [ ] Health 使用 `health_timeout`，在 `mu` 下更新 snapshot，失败只标 degraded
+- [ ] Runtime Stop 逆序 unavailable/Stop/Wait/Kill+Wait/注销 Proxy/清理 endpoint，继续处理全部 Plugin并聚合错误
+- [ ] `StopAll(ctx)` 超时后 teardown 继续；Runtime 在关闭 Tool Manager/退出前等待 `Done()` 并读取 `WaitStopped()`
 
-- [ ] `.so` 文件扫描逻辑（遍历 pluginsDir）
-- [ ] `plugin.Open()` 加载 Go 共享库
-- [ ] `Lookup("PluginInstance")` 符号查找
-- [ ] 插件元数据提取（Name, Version, Type）
-- [ ] 插件类型校验（Type 是否合法）
-- [ ] 插件名称唯一性检查
-- [ ] 加载失败处理（记录错误，跳过，不中断其他 Plugin）
-- [ ] 临时文件清理（下载安装场景）
+## 配置与边界
 
-### 加载/卸载流程
+- [ ] `startup_timeout` 覆盖 exec 到 Ready
+- [ ] `stop_timeout` 覆盖 Stop 到 Wait
+- [ ] `health_interval` / `health_timeout` 生效
+- [ ] `restart.enabled/max_attempts/backoff` 只用于运行中 unexpected exit
+- [ ] 所有 `plugins.*` 变更返回 restart_required，不热加载
+- [ ] v1 不实现远程 endpoint、动态库、下载/安装或签名信任库
+- [ ] Plugin 不接收 Runtime 指针、Manager、数据库连接或 internal Go object
 
-- [ ] 插件目录存在性检查
-- [ ] 插件文件权限校验
-- [ ] `Init()` 调用（传入 Runtime 上下文）
-- [ ] Tool 类型插件 → 注册 Tool 到 Tool Manager
-- [ ] Provider 类型插件 → 注册 Provider 到 Provider Manager
-- [ ] Hook 类型插件 → 注册 Hook 到对应 Hook 点
-- [ ] Middleware 类型插件 → 注册中间件到处理链
-- [ ] 卸载时资源清理（注销 Tool / Provider / Hook）
-- [ ] `Shutdown()` 调用（优雅停止）
-- [ ] 卸载失败回滚（恢复已注销的资源）
+## 集成与验证
 
-### 依赖解析
+- [ ] Tool Proxy 保留 AgentID/SessionID scope、request ID、deadline、取消和错误码
+- [ ] 错 ID、非法 outcome、`UNSPECIFIED`/未知 enum 原子 invalidate 当前 handle，并由 `RPCClient.Terminate()` 回收
+- [ ] Agent/RBAC/配额在跨进程前执行，Plugin 不能绕过
+- [ ] Secret 不进入日志、错误、Health、指标或 API
+- [ ] 指标名称与 [observability.md](observability.md) 唯一表一致
+- [ ] 当前不宣称 Plugin Remote API、SSE endpoint 或未登记 Tool
+- [ ] 单元测试覆盖 Manifest/config schema/依赖图/能力冲突
+- [ ] 集成测试覆盖启动失败、unexpected exit/restart、Stop timeout 和 Windows loopback
 
-- [ ] `dependencies` 字段解析（插件间依赖）
-- [ ] 依赖缺失时的错误处理
-- [ ] 循环依赖检测
-- [ ] 加载顺序拓扑排序
-- [ ] Go 版本兼容性检查（编译器版本与 Runtime 版本匹配）
-- [ ] 依赖的第三方库版本检查
+---
 
-### 隔离与安全
-
-- [ ] 插件 panic 恢复（recover + 记录日志）
-- [ ] 插件超时控制（Init / Shutdown 超时）
-- [ ] 插件沙箱限制（可选，限制可访问的系统资源）
-- [ ] 插件签名验证（可选，验证 `.so` 文件来源）
-- [ ] 插件白名单/黑名单配置
-- [ ] 插件崩溃自动隔离（连续失败后禁用）
-
-### 配置
-
-- [ ] 全局 Plugin 配置（`plugins.*` in config.yaml）
-- [ ] per_plugin 覆盖（`plugins.per_plugin.<name>.*`）
-- [ ] 插件目录配置（`plugins.dir`）
-- [ ] auto_load 配置处理
-- [ ] 插件级别 Options 透传（`plugins.per_plugin.<name>.options`）
-- [ ] 配置合并逻辑（全局 → per_plugin → 插件内部默认值）
-
-### 集成
-
-- [ ] 与 Tool Manager 集成（Tool 类型插件注册 Tool）
-- [ ] 与 Provider Manager 集成（Provider 类型插件注册 Provider）
-- [ ] 与 Skill Manager 集成（Skill 专属 Tool 的 Go plugin 加载）
-- [ ] 与 Hook 系统集成（Hook 类型插件注册生命周期钩子）
-- [ ] Remote API: `GET /api/v1/plugins` — 列出所有 Plugin
-- [ ] Remote API: `GET /api/v1/plugins/:name` — 获取 Plugin 详情
-- [ ] Remote API: `POST /api/v1/plugins/:name/enable` — 启用 Plugin
-- [ ] Remote API: `POST /api/v1/plugins/:name/disable` — 禁用 Plugin
-- [ ] Remote API: `POST /api/v1/plugins/:name/reload` — 热更新 Plugin
-- [ ] SSE 事件: `plugin.loaded` / `plugin.unloaded`
-- [ ] SSE 事件: `plugin.enabled` / `plugin.disabled`
-- [ ] SSE 事件: `plugin.reloaded` / `plugin.error`
-- [ ] 指标: `plugin_total` (Gauge)
-- [ ] 指标: `plugin_load_duration` (Histogram)
-- [ ] 指标: `plugin_error_total` (Counter)
-- [ ] 内置 Tool: `plugin_list` / `plugin_enable` / `plugin_disable`
-- [ ] fsnotify 文件监听（可选，热更新）
+*最后更新: 2025-07-17*

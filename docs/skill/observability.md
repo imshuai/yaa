@@ -1,151 +1,50 @@
-# Skill 可观测性（补充）
+# Skill 可观测性
 
-> 文档路径: `docs/skill/observability.md`
-> 上级: `docs/skill/README.md` §8
-
----
-
-本文档补充 Skill 可观测性的实现细节。基础日志、指标和事件定义见 [errors.md](errors.md) §8。
+> 上级: [Skill 系统设计](README.md)
 
 ---
 
-## 8.5 Skill 追踪
+## 1. 日志
 
-### 8.5.1 调用链追踪
+使用项目统一的 `slog` 兼容 logger。允许记录 Skill name、status、version、依赖数量、AgentID、duration 和稳定 error class；禁止记录 Prompt、options value、绝对路径、资源正文或 Secret。
 
-当 Agent 使用 Skill 时，整个调用链应可追踪：
+| 事件 | level | 必需字段 |
+|------|-------|----------|
+| `skill.load.completed` | info | loaded, disabled, duration_ms |
+| `skill.load.failed` | error | package_name?, error_class, duration_ms |
+| `skill.resolve.completed` | debug | agent_id, count |
+| `skill.resolve.failed` | error | agent_id, error_class |
 
-```text
-Trace: session-abc123, turn-5
-  │
-  ├─ span: skill.trigger
-  │   ├─ skill: "web-scraper"
-  │   ├─ agent: "web-agent"
-  │   ├─ duration: 2ms
-  │   │
-  │   ├─ span: skill.load_body
-  │   │   └─ tokens: 3200
-  │   │
-  │   ├─ span: skill.ensure_tools
-  │   │   └─ tools: ["http", "file_write", "shell"]
-  │   │
-  │   └─ span: skill.inject_prompt
-  │       └─ active_skills: 1
-  │
-  ├─ span: tool.execute (http)
-  │   └─ ...
-  │
-  ├─ span: tool.execute (shell)
-  │   └─ ...
-  │
-  └─ span: skill.complete
-      └─ total_duration: 45s
-```
+一次 `Load` 最多产生一条 completed 或 failed 总结；逐包 debug 日志默认关闭。底层 cause 可以作为结构化 error 写入受控服务端日志，但不进入 Remote response。
 
-### 8.5.2 Skill 使用统计
+## 2. 指标
 
-Skill Manager 维护运行时统计：
+| 指标 | 类型 | labels | 说明 |
+|------|------|--------|------|
+| `yaa_skill_current` | Gauge | `status` | loaded/disabled 数量 |
+| `yaa_skill_load_total` | Counter | `result` | Manager Load 结果 |
+| `yaa_skill_load_duration_seconds` | Histogram | — | 启动加载耗时 |
+| `yaa_skill_resolve_total` | Counter | `result` | ResolveForAgent 次数 |
+| `yaa_skill_resolved_count` | Histogram | — | 每次投影 Skill 数量 |
 
-```go
-// SkillStats 是 Skill 的运行时统计。
-type SkillStats struct {
-    TriggerCount    int           // 触发次数
-    LastTriggered   time.Time     // 最后触发时间
-    TotalDuration   time.Duration // 总执行时长
-    AvgDuration     time.Duration // 平均执行时长
-    ErrorCount      int           // 错误次数
-    SuccessRate     float64       // 成功率
-    ActiveAgents    int           // 当前使用的 Agent 数
-}
+Skill name、AgentID、路径、错误文本和 option key 不作为 label。需要定位单个 Agent/Skill 时使用日志或两个只读 Remote GET。
 
-// GetStats 获取 Skill 统计信息。
-func (m *Manager) GetStats(name string) (*SkillStats, error)
+## 3. Health 与 Remote
 
-// GetAllStats 获取所有 Skill 的统计。
-func (m *Manager) GetAllStats() map[string]*SkillStats
-```
+Skill health 只有：
 
-### 8.5.3 Context 占用监控
+- `ready`：Manager 已 all-or-nothing 构造完成；
+- `not_ready`：尚未加载或 Load 失败。
 
-```go
-// ContextUsage 报告 Skill 在 Context 中的占用情况。
-type ContextUsage struct {
-    SkillName       string
-    MetadataTokens  int   // Level 1 占用
-    BodyTokens      int   // Level 2 占用
-    ResourceTokens  int   // Level 3 占用（按需加载的参考文档等）
-    TotalTokens     int   // 合计
-    ContextPercent  float64 // 占 Context 窗口的百分比
-}
-```
+Health check 只读取状态，不重新扫描文件。v1 不把 Skill 状态发布到 event bus，不定义 Skill SSE、ConversationFrame 或管理事件；Remote 只提供 `GET /api/v1/skills` 和 `GET /api/v1/skills/:name`。
 
-当 Skill 占用超过阈值时发出告警：
+## 4. 最小测试
 
-```yaml
-skills:
-  observability:
-    context_usage_warn: 20    # 单个 Skill 占 Context 20% 时告警
-    total_usage_warn: 50      # 所有 Skill 合计占 50% 时告警
-```
+1. 日志和指标中没有 Prompt、options value、绝对路径或 Secret。
+2. 成功/失败 Load 各只增加一个对应 counter。
+3. metric labels 不包含 Skill/Agent ID。
+4. 文件在运行期变化不产生 reload 日志或事件。
 
 ---
 
-## 8.6 健康检查
-
-```go
-// HealthCheck 检查 Skill 系统健康状态。
-func (m *Manager) HealthCheck() SkillHealthReport {
-    report := SkillHealthReport{
-        TotalSkills:    len(m.skills),
-        Loaded:         0,
-        Disabled:       0,
-        Error:          0,
-        Details:        make([]SkillHealth, 0),
-    }
-
-    for name, entry := range m.skills {
-        health := SkillHealth{
-            Name:    name,
-            Status:  entry.Status,
-            Version: entry.Skill.Version,
-        }
-
-        switch entry.Status {
-        case SkillStatusLoaded:
-            report.Loaded++
-            // 检查依赖
-            if err := m.EnsureTools(name); err != nil {
-                health.Warnings = append(health.Warnings,
-                    fmt.Sprintf("tool dependency issue: %v", err))
-            }
-        case SkillStatusDisabled:
-            report.Disabled++
-        case SkillStatusError:
-            report.Error++
-        }
-
-        report.Details = append(report.Details, health)
-    }
-
-    return report
-}
-```
-
-**健康检查结果示例：**
-
-```json
-{
-  "total_skills": 5,
-  "loaded": 3,
-  "disabled": 1,
-  "error": 1,
-  "details": [
-    {"name": "web-scraper", "status": "loaded", "version": "1.2.0"},
-    {"name": "data-analyzer", "status": "loaded", "version": "0.8.0"},
-    {"name": "pdf-tools", "status": "loaded", "version": "1.0.0"},
-    {"name": "legacy-connector", "status": "disabled", "version": "0.3.0"},
-    {"name": "broken-skill", "status": "error", "version": "",
-     "warnings": ["SKILL.md parse error: invalid frontmatter"]}
-  ]
-}
-```
+*最后更新: 2026-07-22*

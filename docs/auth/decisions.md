@@ -26,11 +26,11 @@
 - **理由**：角色抽象减少配置复杂度，Token 绑定角色，角色定义权限，易于批量管理
 - **影响**：权限粒度由角色定义决定，不支持 Token 级别的细粒度覆盖（未来可扩展）
 
-### AD-004: 中间件模式集成 Remote API
+### AD-004: Remote route wrapper 集成 AuthN/AuthZ
 
-- **决策**：Auth 作为 HTTP 中间件运行，而非侵入 Handler
-- **理由**：中间件模式与 HTTP 框架解耦，认证逻辑可独立测试，业务 Handler 无需感知认证细节
-- **影响**：每个请求经过完整中间件链，有微小性能开销（可忽略）
+- **决策**：Remote API 在注册每条 RouteSpec 时使用唯一 wrapper，依次处理 public bypass、认证和授权；Auth 包只提供接口与 RBAC 实现
+- **理由**：路由 metadata、public path 和 REST envelope 都由 Remote API 拥有，避免全局 Auth/RBAC middleware 与 handler 重复执行
+- **影响**：业务 Handler 不重复鉴权；37 条路由必须用注册测试覆盖 metadata
 
 ### AD-005: 公开端点白名单而非黑名单
 
@@ -46,7 +46,7 @@
 ┌──────────────────────────────────────────────┐
 │              Remote API Server               │
 │                                              │
-│   Request → Auth MW → RBAC MW → Handler     │
+│   Request → Route wrapper → Handler         │
 │                │            │                │
 │                ▼            ▼                │
 │          ┌──────────┐  ┌──────────┐          │
@@ -70,8 +70,7 @@
 |------|------|------|
 | Authenticator | 验证 Token，返回 Identity | Config（token 定义） |
 | Authorizer | 检查 Identity 是否有权限执行操作 | Config（roles 定义） |
-| Auth Middleware | 提取 Token，调用 Authenticator | Authenticator |
-| RBAC Middleware | 调用 Authorizer 做权限检查 | Authorizer |
+| Remote route wrapper | public bypass、Bearer 提取、AuthN/AuthZ、错误 envelope | Authenticator、Authorizer、RouteSpec |
 | Config | 提供 auth 配置 | YAML / 环境变量 |
 
 ---

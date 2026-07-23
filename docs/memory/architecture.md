@@ -1,345 +1,233 @@
-# 三层记忆架构
+# Memory 架构
 
-> 文档路径: `docs/memory/architecture.md`
-> 上游: `docs/architecture.md` §3.6, `docs/memory/README.md`
-> 下游: `docs/memory/storage.md`, `docs/memory/lifecycle.md`, `docs/memory/integration.md`
+> 上级: [Memory 系统设计](README.md)
+> 相关: [存储](storage.md)、[生命周期](lifecycle.md)、[集成](integration.md)
 
 ---
 
-## 1. 架构总览
+## 1. v1 边界
 
-Yaa! 的 Memory 系统采用**三层架构**，借鉴认知科学中人类记忆的分阶模型，并做了工程化适配。三层各自独立，拥有不同的存储策略、生命周期和检索方式，又通过统一接口协同工作。
+Memory v1 只保存 Agent 的长期记忆。Session 保存完整对话历史；Context 只接收 Agent 已经检索并格式化好的 Memory 输入。Memory 不复制 Session 消息、不生成摘要，也不在 Session Close/Delete 时自动写入或删除内容。
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│                      Memory System                          │
-│                                                             │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │            Layer 1: Short-term (短期记忆)               │  │
-│  │  当前 Session 的消息历史，内存中，随会话结束而淘汰或晋升   │  │
-│  └──────────────────────────┬────────────────────────────┘  │
-│                             │ 自动晋升 (Promote)             │
-│                             ▼                                │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │            Layer 2: Long-term (长期记忆)                │  │
-│  │  跨 Session 持久化，SQLite / 向量数据库，支持语义检索    │  │
-│  └──────────────────────────┬────────────────────────────┘  │
-│                             │ 压缩摘要 (Summarize)           │
-│                             ▼                                │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │            Layer 3: Summary (摘要记忆)                  │  │
-│  │  Session 的压缩摘要，Storage 持久化，用于上下文恢复      │  │
-│  └───────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+Remote API / Agent
+        |
+        v
++---------------- Memory Manager ----------------+
+| validate scope and policy                       |
+| Put/Get/Search/Delete/Clear/Promote/Reindex     |
+| TTL cleanup, capacity eviction, events, health |
++-------------------+-----------------------------+
+                    |
+          +---------+----------+
+          v                    v
+  ContentStore             Embedder
+  source of truth              |
+  sqlite | memory              v
+                         VectorIndex
+                         derived cache
 ```
 
-### 1.1 三层对比
+内容存储提交成功后，Memory item 就已经成功写入。Embedding 和向量索引都是可删除、可重建的派生数据，不能成为读取单条 item 的真实来源。
 
-| 维度 | Short-term | Long-term | Summary |
-|------|------------|-----------|---------|
-| **类比** | 工作记忆 | 长期记忆 | 情节摘要 |
-| **生命周期** | 单 Session | 跨 Session 永久 | 跨 Session 永久 |
-| **存储方式** | 内存 / Storage | SQLite + 向量索引 | Storage (KV) |
-| **容量** | 受 Token 窗口约束 | 无上限（按需检索） | 极小（压缩文本） |
-| **检索方式** | 直接加载 | 向量语义搜索 / 关键词 | 按 Session ID 加载 |
-| **生成时机** | 每条消息实时 | 主动写入 / 自动晋升 | Context 压缩时 |
-| **注入方式** | 直接进入 Context | 检索后注入 Context | 替换历史消息 |
-| **操作主体** | Context Manager | Memory System | Context Manager |
+## 2. 进程内组件
 
----
-
-## 2. Layer 1: Short-term Memory（短期记忆）
-
-### 2.1 职责
-
-短期记忆保存当前 Session 的消息历史，是 LLM "即时上下文" 的来源。它在内存中维护，随 Session 创建而生成，随 Session 关闭而淘汰或晋升。
-
-### 2.2 接口定义
+Runtime 创建一个共享 `Manager`。Manager 只持有根基础设施；每个 Agent turn、Remote request 或 cleanup tick 在入口捕获一个 Config snapshot，解析出 `config.MemoryPolicy` 后显式传给该次 Memory 操作。Manager 不在操作中重新读取配置，因此同一 turn 不会混用两代 policy。
 
 ```go
-// ShortTermMemory 管理当前 Session 的短期记忆。
-type ShortTermMemory struct {
-    sessionID string
-    items     []*MemoryItem   // 有序消息列表
-    maxItems  int             // 最大保留条数（滑动窗口）
-    mu        sync.RWMutex
+type Manager struct {
+    store        ContentStore
+    embedder     Embedder // vector 未启用时为 nil
+    indexFactory VectorIndexFactory
+    indexes      map[string]*agentIndexState
+    indexMu      sync.RWMutex
+    mutationGate sync.RWMutex
+    agentLocks   keyedMutex
+    clock        Clock
+    workerCancel context.CancelFunc
+    workerDone   chan struct{}
+    lifecycleMu  sync.Mutex
+    closing      bool
+    inFlight     sync.WaitGroup
+    closeOnce    sync.Once
+    closeDone    chan struct{}
+    closeErr     error
 }
 
-// Add 追加一条短期记忆（消息）。
-func (s *ShortTermMemory) Add(key string, content string, metadata map[string]any) error
+type agentIndexState struct {
+    mu     sync.RWMutex
+    index  VectorIndex
+    status IndexStatus
+}
 
-// Search 在短期记忆中按关键词检索。
-func (s *ShortTermMemory) Search(query string, limit int) ([]*MemoryItem, error)
-
-// Recent 返回最近 N 条记忆（用于构建 Context）。
-func (s *ShortTermMemory) Recent(n int) []*MemoryItem
-
-// Promote 将指定记忆晋升为长期记忆。
-func (s *ShortTermMemory) Promote(key string, longTerm Memory) error
+type VectorIndexFactory func() VectorIndex
 ```
 
-### 2.3 存储方式
-
-| 场景 | 存储 | 说明 |
-|------|------|------|
-| 默认 | 内存（`[]MemoryItem`） | 快速访问，无持久化开销 |
-| Session 持久化 | Storage (SQLite KV) | Session 恢复时从 Storage 加载 |
-
-### 2.4 适用场景
-
-- 多轮对话中的上下文保持
-- 当前 Session 内的消息回溯
-- Tool 调用结果的临时缓存
-- Context 压缩前的原始消息池
-
----
-
-## 3. Layer 2: Long-term Memory（长期记忆）
-
-### 3.1 职责
-
-长期记忆是跨 Session 的持久化记忆，支持语义检索。Agent 可以主动写入，也可以由短期记忆自动晋升而来。它是 Agent 具备"记忆连续性"的核心。
-
-### 3.2 接口定义
+除纯内存 `IndexStatus` 外，每个公开操作在访问 Store/Index 前调用 `beginOp`，并 `defer m.inFlight.Done()`。`lifecycleMu` 使“检查 closing + Add”成为一个临界区；Close 先在同一锁内设置 closing，再启动 Wait，因此不存在 `WaitGroup.Add` 与 `Wait` 竞态：
 
 ```go
-// LongTermMemory 管理跨 Session 的持久化记忆。
-type LongTermMemory struct {
-    agentID  string
-    store    MemoryStore       // 底层存储（SQLite / 向量数据库）
-    embedder Embedder          // 向量嵌入器（可选）
-    config   LongTermConfig
-    mu       sync.RWMutex
-}
-
-// Add 写入长期记忆，自动生成向量嵌入。
-func (l *LongTermMemory) Add(key string, content string, metadata map[string]any) error {
-    item := &MemoryItem{
-        Key:       key,
-        Content:   content,
-        Metadata:  metadata,
-        Layer:     LayerLongTerm,
-        CreatedAt: time.Now(),
-        UpdatedAt: time.Now(),
+func (m *Manager) beginOp() error {
+    m.lifecycleMu.Lock()
+    defer m.lifecycleMu.Unlock()
+    if m.closing {
+        return ErrMemoryClosed
     }
-    // 如果 Embedder 可用，生成向量嵌入
-    if l.embedder != nil {
-        emb, err := l.embedder.Embed(content)
-        if err != nil {
-            return fmt.Errorf("embed failed: %w", err)
-        }
-        item.Metadata["embedding"] = emb
-    }
-    return l.store.Put(item)
-}
-
-// Search 语义检索长期记忆，向量搜索不可用时回退到关键词搜索。
-func (l *LongTermMemory) Search(query string, limit int) ([]*MemoryItem, error) {
-    if l.embedder != nil {
-        queryEmb, err := l.embedder.Embed(query)
-        if err == nil {
-            results, err := l.store.VectorSearch(queryEmb, limit)
-            if err == nil && len(results) > 0 {
-                return results, nil
-            }
-            // 向量搜索失败，降级到关键词搜索
-        }
-    }
-    return l.store.KeywordSearch(query, limit)
+    m.inFlight.Add(1)
+    return nil
 }
 ```
 
-### 3.3 存储方式
+启动时为每个启用 vector 的 Agent 创建 `agentIndexState`；初始状态为 `IndexDegraded`，直到完整 Reindex 成功。vector 未启用的 Agent 不需要 index state，`IndexStatus` 固定返回 `IndexReady`。`indexFactory` 必须每次返回新的非 nil 空索引，不得复用当前索引或跨 Agent 共享；完整 Reindex 成功后才把新 pointer 和 `IndexReady` 一起发布。任何 embedding、Upsert、Delete、Search 或 Reindex 失败都把该 Agent 标记为 `IndexDegraded`；普通操作成功不会清除历史 degraded，只有完整 Reindex 能恢复 ready。
 
-| 后端 | 说明 | 适用场景 |
-|------|------|----------|
-| SQLite + 向量扩展 | 纯 Go，零 CGO，支持向量索引 | 默认方案，单机部署 |
-| 外部向量数据库 | Milvus / Qdrant / pgvector | 大规模记忆，高并发检索 |
-| 内存回退 | 纯内存 Map | 测试 / 向量不可用时降级 |
+Manager 对同一 Agent 的内容变更使用 keyed mutex 串行化，以保证容量检查、Put、Delete、Clear、Promote 和 Reindex 的组合语义。唯一锁顺序是 `mutationGate -> Agent keyed lock -> index state lock`；所有普通 mutation 和 Reindex 持 `mutationGate.RLock`，全局 `DeleteExpired` 持 `mutationGate.Lock` 且不再获取 Agent keyed lock，因此 cleanup 不会与其他 mutation 交错。不同 Agent 的普通 mutation 可以并行；Get 依赖 ContentStore 的并发保证，Search 还依赖并发安全的 VectorIndex。
 
-### 3.4 适用场景
+## 3. ContentStore
 
-- 用户偏好与画像（"用户喜欢简洁回答"）
-- 跨 Session 的事实记忆（"用户的项目叫 Yaa!"）
-- 知识库片段注入（RAG 场景）
-- 长期任务状态跟踪
-
----
-
-## 4. Layer 3: Summary Memory（摘要记忆）
-
-### 4.1 职责
-
-摘要记忆是 Session 的压缩摘要，由 Context Manager 在上下文超出 Token 限制时自动生成。它用极小的 Token 开销保留历史会话的关键信息，用于上下文恢复。
-
-### 4.2 接口定义
+`ContentStore` 是 Memory 内部接口，不等同于根 `storage.Storage` KV 接口。它需要理解复合主键、过期时间和确定性查询。
 
 ```go
-// SummaryMemory 管理 Session 的压缩摘要。
-type SummaryMemory struct {
-    sessionID string
-    store     MemoryStore
-    config    SummaryConfig
-    mu        sync.RWMutex
+type ContentStore interface {
+    CommitPut(ctx context.Context, item MemoryItem, victims []ItemRef, now time.Time) (CommitPutResult, error)
+    Get(ctx context.Context, scope Scope, key string) (MemoryItem, error)
+    Search(ctx context.Context, req SearchRequest, now time.Time) ([]MemoryItem, error)
+    List(ctx context.Context, scope Scope, now time.Time) ([]MemoryItem, error)
+    Delete(ctx context.Context, scope Scope, key string) (MemoryItem, error)
+    Clear(ctx context.Context, scope Scope) ([]MemoryItem, error)
+    DeleteExpired(ctx context.Context, before time.Time, limit int) ([]MemoryItem, error)
+    Count(ctx context.Context, agentID string, now time.Time) (int, error)
+    Ping(ctx context.Context) error
+    Close() error
 }
 
-// Generate 对指定消息列表生成摘要，并存储。
-func (s *SummaryMemory) Generate(messages []*MemoryItem) (*MemoryItem, error) {
-    // 调用 LLM 对消息列表进行摘要压缩
-    summaryText, err := s.config.Summarizer.Summarize(messages)
-    if err != nil {
-        return nil, fmt.Errorf("summarize failed: %w", err)
-    }
-    item := &MemoryItem{
-        Key:       fmt.Sprintf("summary:%s:%d", s.sessionID, time.Now().Unix()),
-        Content:   summaryText,
-        Layer:     LayerSummary,
-        Metadata:  map[string]any{
-            "session_id":  s.sessionID,
-            "msg_count":   len(messages),
-            "generated_at": time.Now(),
-        },
-        CreatedAt: time.Now(),
-        UpdatedAt: time.Now(),
-    }
-    if err := s.store.Put(item); err != nil {
-        return nil, err
-    }
-    return item, nil
+type CommitPutResult struct {
+    Stored  MemoryItem
+    Created bool
+    Evicted []MemoryItem
 }
-
-// LoadLatest 加载当前 Session 最近一次的摘要。
-func (s *SummaryMemory) LoadLatest() (*MemoryItem, error)
 ```
 
-### 4.3 存储方式
+契约：
 
-| 场景 | 存储 | 说明 |
-|------|------|------|
-| 默认 | Storage (SQLite KV) | 按 `session_id` 索引，持久化 |
-| 级联摘要 | Storage + 前序摘要引用 | 长对话中多次压缩，逐级概括 |
+- `CommitPut` 在一个事务内校验 victims、删除 victims 并按完整主键 upsert；任一步失败都回滚全部内容。
+- `CommitPut` 使用调用方传入的单次 `now` 设置 `CreatedAt`/`UpdatedAt` 和 Version；Store 不自行取时钟。
+- `Get` 返回物理记录，包括已经过期但尚未清理的记录；Manager 负责将其映射为 `ErrMemoryNotFound`。
+- `Search`、`List` 和 `Count` 必须排除 `ExpiresAt <= now` 的记录。
+- `Search` 只执行关键词检索和 metadata 精确过滤；结果按 `UpdatedAt DESC, SessionID ASC, Key ASC` 排序。
+- `SearchRequest.IncludeGlobal` 为 true 时，非空 SessionID 与空 SessionID 的全局 items 做并集；false 只查指定来源，空 SessionID 仍表示全 Agent 范围。Reindex 通过 `List` 使用同样的空 SessionID 全范围语义；除显式 policy 外，它的唯一选择器是 `agentID`。
+- `Delete` 未命中返回 `ErrMemoryNotFound`；`Clear` 未命中返回空切片。
+- 返回的 item、metadata 和 slice 不得引用实现内部的可变内存。
 
-### 4.4 适用场景
+`List` 最多返回一个 Agent 的当前 item。`max_items` 默认 10000，因此 v1 不增加 cursor 接口；容量上限发生实测问题后再引入分页。
 
-- 长对话的上下文压缩（避免 Token 爆炸）
-- Session 恢复时的快速上下文重建
-- 跨 Session 的会话回顾（"上次我们聊到了…"）
-
----
-
-## 5. 三层协作流程
-
-```text
-用户消息进入
-    │
-    ▼
-┌─────────────────┐
-│  Short-term     │ ← 每条消息实时写入
-│  (短期记忆)      │
-└────────┬────────┘
-         │
-         │ Context 超出 Token 限制？
-         ├─────────────────── 否 ──→ 直接构建 Context → 调用 LLM
-         │
-         │ 是
-         ▼
-┌─────────────────┐
-│  Summary        │ ← 压缩旧消息为摘要
-│  (摘要记忆)      │
-└────────┬────────┘
-         │ 摘要替换旧消息，释放 Token 空间
-         ▼
-    构建 Context → 调用 LLM
-         │
-         │ LLM 返回结果，判断是否值得长期保存
-         ▼
-┌─────────────────┐
-│  Long-term      │ ← 主动写入 / 自动晋升
-│  (长期记忆)      │
-└─────────────────┘
-         │
-         │ 下次新 Session 开始时
-         ▼
-    检索 Long-term → 注入相关记忆到 Context
-```
-
-### 5.1 晋升机制
-
-短期记忆不会永久存在。当满足以下条件时，短期记忆会被自动晋升为长期记忆：
-
-| 触发条件 | 说明 |
-|----------|------|
-| 用户显式标记 | "记住这个" / metadata 中 `persist=true` |
-| 重要性评分超阈值 | LLM 评估消息重要性 ≥ 0.7 |
-| Session 关闭策略 | `on_close: promote_important` 配置项 |
+## 4. Embedder 和 VectorIndex
 
 ```go
-// 自动晋升示例
-func (s *ShortTermMemory) autoPromote(longTerm Memory) {
-    for _, item := range s.items {
-        if score, ok := item.Metadata["importance"].(float64); ok && score >= 0.7 {
-            _ = s.Promote(item.Key, longTerm)
-        }
-    }
+type Embedder interface {
+    Embed(ctx context.Context, inputs []string) ([][]float32, error)
+    Dimension() int
 }
-```
 
----
-
-## 6. 统一接口与分层实现
-
-三层记忆均实现 `Memory` 接口，但各自有专属方法。Memory Manager 通过组合模式统一管理：
-
-```go
-// AgentMemory 组合三层记忆，对上层提供统一视图。
-type AgentMemory struct {
+type ItemRef struct {
     AgentID   string
-    ShortTerm *ShortTermMemory
-    LongTerm  *LongTermMemory
-    Summary   *SummaryMemory
+    SessionID string
+    Layer     Layer
+    Key       string
+    Version   uint64
 }
 
-// Search 统一检索：先查短期，再查长期，最后查摘要。
-func (a *AgentMemory) Search(query string, limit int) ([]*MemoryItem, error) {
-    var results []*MemoryItem
+type VectorHit struct {
+    Ref   ItemRef
+    Score float64
+}
 
-    // 1. 短期记忆（精确匹配，速度快）
-    if st, _ := a.ShortTerm.Search(query, limit); len(st) > 0 {
-        results = append(results, st...)
-    }
+type VectorSearchRequest struct {
+    AgentID       string
+    Layer         Layer
+    SessionID     string
+    IncludeGlobal bool
+    Query         []float32
+    Threshold     float64
+}
 
-    // 2. 长期记忆（语义检索，相关性高）
-    if len(results) < limit {
-        remaining := limit - len(results)
-        if lt, _ := a.LongTerm.Search(query, remaining); len(lt) > 0 {
-            results = append(results, lt...)
-        }
-    }
-
-    // 3. 摘要记忆（补充上下文）
-    if len(results) < limit {
-        remaining := limit - len(results)
-        if sm, _ := a.Summary.Search(query, remaining); len(sm) > 0 {
-            results = append(results, sm...)
-        }
-    }
-
-    return results, nil
+type VectorIndex interface {
+    Upsert(ctx context.Context, ref ItemRef, vector []float32) error
+    Delete(ctx context.Context, ref ItemRef) error
+    Search(ctx context.Context, req VectorSearchRequest) ([]VectorHit, error)
 }
 ```
 
+`VectorIndex` 的 `Upsert`、`Delete` 和 `Search` 必须并发安全；v1 exact 实现用内部 `sync.RWMutex` 保护向量 slice。Search 必须先按 `AgentID + Layer + (SessionID 或 SessionID 与空值并集)` 过滤，再应用 threshold 和排序；不会让其他 Session 的高分结果占用候选。v1 exact index 返回全部符合 scope/threshold 的有序候选，不在索引层截断 limit，Manager 回查 ContentStore 的 Version/TTL/metadata 后再截最终 limit，因此允许的结果不会因后置过滤而下溢。`VectorIndexFactory` 每次返回一个空的 exact index；它是 Reindex 的临时索引构造器，不能复用当前 index。每个 Agent 的 `agentIndexState.index` 在短暂 `state.mu` 临界区交换；Search 先复制 pointer 后再调用，因而不会读到半张索引。
+
+v1 只有一个 `VectorIndex` 实现：进程内精确余弦检索。它使用 Go slice 保存向量，按 score 降序，再按 `(SessionID, Key)` 升序打破并列。索引不持久化；启用向量的 Runtime 在 Ready 前对每个 Agent 用初始 policy 执行全量 `Reindex(policy, agentID)`。这个实现的上限由 `max_items` 控制，暂不引入额外索引依赖。
+
+`VectorIndex` 不暴露会先破坏旧状态的 `Reset`；Reindex 在同一 Agent write lock 内完成 List -> Embed -> 临时 exact index -> pointer swap，期间 Put/Delete/Clear/Promote 被阻塞，Search 可继续读取旧 pointer。任一失败保留旧 pointer、标记该 Agent `degraded`，并返回同时可由 `errors.Is` 判断的 `ErrMemoryReindexFailed` 与底层分类错误。
+
+每个向量携带 item Version。Search 从 ContentStore 重新读取命中的 item，并丢弃不存在、过期或 Version 不匹配的 hit，因此旧索引不会返回陈旧内容。
+
+## 5. 核心数据流
+
+### 5.1 Put
+
+```text
+validate item and effective policy
+  -> acquire Agent write lock
+  -> normalize TTL and check whether key is new
+  -> make capacity room when needed
+  -> ContentStore.CommitPut(item, victims, now) (single commit point)
+  -> emit added/updated and each evicted event
+  -> vector enabled? embed and index Upsert
+  -> index failure: mark degraded, emit memory.degraded, keep Put successful
+```
+
+任何 CommitPut 错误都在 single commit point 前向调用方返回；victim、target、index 和事件都不应出现部分提交。事件发布失败不回滚已提交内容。
+
+### 5.2 Search
+
+```text
+validate scope/query/limit
+  -> vector enabled and query non-empty?
+       yes: embed query -> index Search -> verify hits in ContentStore
+       no:  ContentStore.Search
+  -> vector path failed or index degraded, and fallback_to_keyword=true?
+       yes: ContentStore.Search
+       no:  return stable vector/embed/index-degraded error
+  -> return at most limit deep-copied results
+```
+
+向量结果按 score 排序。关键词结果的 `Score` 固定为 0，并使用 ContentStore 的确定性顺序。两个路径都应用相同的 scope、过期和 metadata 过滤。
+
+### 5.3 Delete、Clear 和过期清理
+
+ContentStore 删除是 commit point。之后的 index Delete 失败只会让索引进入 degraded；Search 的 Version/存在性校验仍会阻止已删除内容泄漏。`Reindex` 通过新建 exact index 并交换 pointer 清理全部陈旧引用。
+
+## 6. 启动、健康和关闭
+
+启动顺序：
+
+```text
+load and validate Config
+  -> open ContentStore and run schema migration
+  -> build effective Agent policies
+  -> create optional Embedder and per-Agent VectorIndex state from indexFactory
+  -> Reindex every vector-enabled Agent (each call covers all sources)
+  -> start one expiration worker
+  -> Runtime Ready
+```
+
+若 ContentStore 无法打开或 schema 不兼容，Runtime Not Ready。初始 Reindex 失败时，`fallback_to_keyword=true` 的 Agent 可以 degraded Ready；否则 Runtime Not Ready。Reindex 失败永远保留旧 index；所有启用 vector 的 Agent 完整 Reindex 成功后才把各自状态设为 ready。
+
+`Close(ctx)` 是 Manager 唯一关闭入口且幂等。构造器把 `workerDone` 初始化为非 nil channel；若启动在 worker 建立前失败，rollback 先关闭它。第一次调用的 `closeOnce.Do` 在 `lifecycleMu` 下设置 closing 并取消 expiration worker，然后启动一个后台 closer：先等待 `workerDone`，再 `inFlight.Wait()`，最后只调用一次 `ContentStore.Close`、保存 `closeErr` 并关闭 `closeDone`。设置 closing 后 `beginOp` 不再 Add，而 Wait 只在释放同一锁后开始。每次 `Close` 都 select `closeDone` 与自己的 `ctx.Done()`；ctx 到期返回 `context.Cause(ctx)`，后台关闭继续，后续调用可等待同一个最终结果。进程内索引无需持久化。关闭后的新 I/O 操作返回 `ErrMemoryClosed`；`IndexStatus` 仍可读取最终快照。Runtime 不由 Agent 关闭共享 Memory。
+
+## 7. 不变量
+
+1. 唯一内容主键始终是 `(AgentID, Layer, SessionID, Key)`。
+2. v1 只接受 `LayerLongTerm`。
+3. 对外可见内容一定来自 ContentStore，而不是 vector hit 本身。
+4. 已过期内容不会被 Get/Search/List 返回。
+5. 同一 Agent 的未过期 item 数不高于其有效 `max_items`；每次 Put 都按最终可见数量收敛，且 CommitPut 原子包含 victims。
+6. Session 生命周期不触发 Memory 写入、晋升或删除。
+7. 日志、指标和事件不包含 Content、embedding 或凭据。
+
 ---
 
-## 7. 设计约束
-
-| 约束 | 说明 |
-|------|------|
-| **零 CGO** | 向量计算使用纯 Go 库，保证 Windows 7 兼容 |
-| **优雅降级** | 向量搜索不可用时回退到关键词搜索 |
-| **Agent 隔离** | 三层记忆均以 `agentID` 做命名空间隔离 |
-| **Token 预算** | 记忆注入 Context 时有 Token 预算限制，不挤占对话空间 |
-| **并发安全** | 所有层均使用 `sync.RWMutex` 保护读写操作 |
-
----
-
-*最后更新: 2025-07-17*
+*最后更新: 2026-07-22*

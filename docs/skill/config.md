@@ -1,179 +1,76 @@
-# Skill 配置参考
+# Skill 配置契约
 
-> 文档路径: `docs/skill/config.md`
-> 上级: `docs/skill/README.md` §6
+> 上级: [Skill 系统设计](README.md)
+> 根字段 owner: [Config reference](../config/reference.md)
 
 ---
 
-## 6. 配置参考
+## 1. 类型
 
-### 6.1 全局配置
+`SkillsConfig`/`SkillItemConfig` 与 `AgentConfig`/`AgentSkillConfig` 只在 [Config reference 的 Skill 节点](../config/reference.md#7-skills-节点)和 [Agent 节点](../config/reference.md#3-agents-节点)定义。本文件不维护重复 Go struct；这里只规定 Skill Manager 如何解释这些 canonical 字段。
+
+`skills.dir` 默认 `"./skills"`，相对主配置文件目录解析。`per_skill` 和 `skills_config` 默认空 map。一个 `per_skill.<name>` entry 出现但省略 `enabled` 时由 defaulting 阶段补为 true；strict decode 后不依赖 Go bool 零值猜测 presence。
+
+## 2. 示例
 
 ```yaml
-# config.yaml
-
 skills:
-  # ── 基础配置 ──
-  dir: "./skills"                     # Skill 安装目录
-  auto_load: true                     # 启动时自动加载所有 Skill
-  auto_update: false                  # 自动更新已安装 Skill
-  update_check_interval: 24h          # 更新检查间隔
-
-  # ── 加载控制 ──
-  max_active: 3                       # 同时激活的最大 Skill 数
-  max_body_tokens: 8000               # 同时加载的 Skill Body 总 Token 上限
-  overflow_strategy: "lru"            # 超出策略: lru | reject
-
-  # ── 嵌套控制 ──
-  max_nesting_depth: 3                # Skill 嵌套最大深度
-  allow_circular: false               # 是否允许循环依赖（不推荐）
-
-  # ── 热更新 ──
-  hot_reload: true                    # 启用热更新
-  watch_files: false                  # 文件变更自动 reload（fsnotify）
-
-  # ── Registry 配置 ──
-  registry:
-    url: "https://registry.yaa.dev"   # Registry 地址
-    token: ""                         # 认证 token
-    cache_dir: "/tmp/yaa-skill-cache" # 下载缓存目录
-
-  # ── 单个 Skill 覆盖 ──
+  dir: "./skills"
   per_skill:
     web-scraper:
       enabled: true
-      timeout: 120s
-      auto_update: true
-      update_channel: "stable"
       options:
-        max_pages: 100                # 覆盖 frontmatter 中的 options
-        user_agent: "Yaa!/1.0"
+        max_pages: 50
+    internal-admin:
+      enabled: false
 
-    data-analyzer:
-      enabled: false                  # 禁用
-```
-
-### 6.2 Agent 级别配置
-
-```yaml
 agents:
-  - id: "web-agent"
-    name: "Web Agent"
-    # ── Skill 权限 ──
-    skills: ["web-scraper", "data-analyzer"]
-    # 或细粒度控制:
-    # skills:
-    #   allow: ["web-scraper", "data-analyzer"]
-    #   deny: ["data-pipeline"]
-
-    # ── Skill 级别覆盖 ──
+  - id: web-agent
+    provider: openai
+    model: gpt-4o
+    tools: [http, file_write]
+    skills: [web-scraper]
     skills_config:
       web-scraper:
-        timeout: 60s
         options:
-          max_pages: 50               # Agent 级别覆盖全局配置
-
-  - id: "full-agent"
-    skills: []                         # 可用所有已加载 Skill
+          max_pages: 20
 ```
 
-### 6.3 Skill 级别配置
+`agents[].skills` 是精确 allowlist；空数组表示不注入任何 Skill。它不是 deny/allow union，也不接受 object 形式。`skills_config` 的每个 key 必须同时出现在该 Agent 的 `skills` 中。
 
-Skill 自身的配置通过三种方式合并（优先级递增）：
+## 3. Options 合并
+
+对每个 Agent/Skill，按以下优先级做顶层 shallow merge，后者覆盖同名 key：
 
 ```text
-1. SKILL.md frontmatter 的 options 字段
-   ↓ 被覆盖
-2. config.yaml 的 skills.per_skill.<name>.options
-   ↓ 被覆盖
-3. Agent 配置的 skills_config.<name>.options
+SKILL.md frontmatter options
+  <- skills.per_skill.<name>.options
+  <- agents[].skills_config.<name>.options
 ```
 
-**合并示例：**
+不递归 merge object，不拼接 array，不把 `null` 解释为删除；`null` 是普通 JSON value。合并完成后深拷贝并冻结，标准 JSON 编码不得超过 64 KiB。
 
-```yaml
-# SKILL.md frontmatter
-options:
-  max_pages: 50          # 默认值
-  user_agent: "Yaa!/1.0"
-  timeout: 30
+Options 只能包含 JSON-compatible scalar、array 和 string-keyed object，不接受 NaN/Infinity、YAML timestamp/tag/alias、函数或循环引用。它们会进入 Provider system prompt，因此不得保存凭据。Validator 递归规范化 key（Unicode case-fold，`-` 转 `_`），并拒绝以下 exact key：
 
-# config.yaml (全局)
-skills:
-  per_skill:
-    web-scraper:
-      options:
-        max_pages: 100   # 覆盖默认值
-        retry: 3         # 新增
-
-# Agent 配置
-agents:
-  - skills_config:
-      web-scraper:
-        options:
-          max_pages: 30   # 再次覆盖
-          timeout: 60     # 覆盖
-
-# 最终合并结果:
-# max_pages: 30           ← Agent 级
-# user_agent: "Yaa!/1.0"  ← frontmatter
-# timeout: 60             ← Agent 级
-# retry: 3                ← 全局级
+```text
+api_key, password, secret, token, access_token, refresh_token,
+authorization, cookie, set_cookie, private_key, client_secret
 ```
 
-### 6.4 Skill 配置项汇总
+凭据必须放在 Provider、Tool、MCP 或 Plugin 的专用 Secret 字段中，不能借 Skill options 绕过脱敏边界。
 
-| 配置项 | 级别 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `enabled` | 全局/Agent | true | 是否启用 |
-| `timeout` | 全局/Agent | 300s | Skill 执行超时 |
-| `max_retry` | 全局/Agent | 0 | 重试次数 |
-| `auto_load` | frontmatter | true | 启动时自动加载 |
-| `auto_update` | 全局 | false | 自动更新 |
-| `update_channel` | 全局 | stable | 更新通道 |
-| `options.*` | 多级 | - | Skill 特有参数 |
+## 4. 校验与重启
 
-### 6.5 配置合并实现
+Config 基础校验负责类型、未知字段、路径和 option 编码；Skill Manager 加载后执行第二阶段 binding：
 
-```go
-// mergeConfig 合并多级配置。
-func mergeConfig(skill *Skill, global SkillConfig, agent map[string]any) SkillConfig {
-    cfg := SkillConfig{
-        Enabled:  true,
-        Timeout:  300 * time.Second,
-        MaxRetry: 0,
-        Options:  make(map[string]any),
-    }
+1. `per_skill` 和 `skills_config` name 必须对应已加载目录；
+2. Agent allowlist 不得引用 disabled Skill；
+3. 递归 Skill 依赖必须也在 Agent allowlist；
+4. Tool 依赖必须已注册、enabled 且被 Agent 允许；
+5. 合并后的 option 大小和敏感 key 检查通过。
 
-    // 1. frontmatter options
-    for k, v := range skill.Options {
-        cfg.Options[k] = v
-    }
+`skills.dir`、`per_skill`、`agents[].skills` 和 `agents[].skills_config` 全部 restart-required。ReloadManager 发现这些变化时整批不发布 candidate，返回 `ReloadResult{RestartRequired:true}`。
 
-    // 2. 全局 per_skill 覆盖
-    if global.Enabled != nil {
-        cfg.Enabled = *global.Enabled
-    }
-    if global.Timeout != 0 {
-        cfg.Timeout = global.Timeout
-    }
-    for k, v := range global.Options {
-        cfg.Options[k] = v
-    }
+---
 
-    // 3. Agent 级别覆盖
-    if agentEnabled, ok := agent["enabled"]; ok {
-        cfg.Enabled = agentEnabled.(bool)
-    }
-    if agentTimeout, ok := agent["timeout"]; ok {
-        cfg.Timeout = parseDuration(agentTimeout)
-    }
-    if agentOpts, ok := agent["options"]; ok {
-        for k, v := range agentOpts.(map[string]any) {
-            cfg.Options[k] = v
-        }
-    }
-
-    return cfg
-}
-```
+*最后更新: 2026-07-22*

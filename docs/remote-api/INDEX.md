@@ -1,245 +1,214 @@
 # Yaa! Remote API 设计
 
-> 本文件是 Remote API 文档的目录索引，描述整体设计原则、接口总览和统一规范。
-> 各模块的详细端点定义见同目录下的独立文件。
+> 本文件是 `/api/v1` 路由、REST envelope 与权限元数据的唯一总表。各模块文件只补充 DTO 和行为。
 
 ---
 
-## 1. 设计原则
+## 1. v1 边界
 
-| 原则 | 说明 |
-|------|------|
-| RESTful | 资源导向，语义清晰的 URL 设计 |
-| 统一响应 | 所有端点返回统一格式的 JSON 响应 |
-| 版本化 | URL 路径版本化 `/api/v1/...`，保证向后兼容 |
-| 三协议 | HTTP REST（请求-响应）+ WebSocket（双向实时）+ SSE（单向流式） |
-| 无状态优先 | 尽量无状态，状态由 Session 层管理 |
-| 幂等 | GET/PUT/DELETE 天然幂等，POST 通过可选 `Idempotency-Key` 头支持 |
+- HTTP REST 用于查询和有界 mutation；SSE/WS 用于流式事件。
+- Agent、Provider、Tool、Skill 和 MCP Server 定义来自当前 Config。v1 不提供另一套动态配置 CRUD 或 Token 签发存储。
+- 所有 Remote Tool 名称都是 [canonical Tool name](../tool/provider.md)：`ToolInfo`、Agent/Skill Tool 列表、MCP detail、Session history、`tool_call` 和 `tool_result.name` 都不暴露 Provider-safe alias，REST/SSE/WS 也没有 alias 字段。
+- Session 和 Memory 有明确的 Manager/持久化契约，因此保留 mutation API。
+- 不承诺通用 `Idempotency-Key`。具体操作是否幂等以端点文档为准。
+- REST 使用统一 envelope；SSE/WS frame 不套 REST envelope。
 
----
+## 2. 文档与端点数
 
-## 2. 文档结构
+| 文件 | 模块 | 端点数 |
+|------|------|--------|
+| [system.md](system.md) | 系统 | 3 |
+| [agent.md](agent.md) | Agent 配置视图与运行态 | 5 |
+| [session.md](session.md) | Session | 10 |
+| [conversation.md](conversation.md) | 对话 | 3 |
+| [tool.md](tool.md) | Tool 元数据 | 2 |
+| [skill.md](skill.md) | Skill 元数据 | 2 |
+| [provider.md](provider.md) | Provider 元数据 | 3 |
+| [memory.md](memory.md) | Memory | 7 |
+| [mcp.md](mcp.md) | MCP 连接状态 | 2 |
+| [auth.md](auth.md) | Bearer/RBAC 协议 | 0 |
+| **合计** | **10 模块** | **37** |
 
-| 文件 | 模块 | 端点数 | 说明 |
-|------|------|--------|------|
-| [system.md](./system.md) | 系统 | 3 | 健康检查、版本、配置 |
-| [agent.md](./agent.md) | Agent | 9 | CRUD + 启停 + 模型切换 |
-| [session.md](./session.md) | Session | 8 | 会话 CRUD + 消息历史 + 上下文压缩 |
-| [conversation.md](./conversation.md) | 对话 | 3 | 非流式发送、SSE 事件流、WebSocket |
-| [tool.md](./tool.md) | Tool | 3 | 列表、详情、直接调用 |
-| [skill.md](./skill.md) | Skill | 3 | 列表、详情、手动触发 |
-| [provider.md](./provider.md) | Provider | 6 | CRUD + 模型查询 |
-| [memory.md](./memory.md) | Memory | 4 | 查询、写入、删除、清空 |
-| [mcp.md](./mcp.md) | MCP | 6 | 服务器管理 + MCP Tool 调用 |
-| [auth.md](./auth.md) | Auth/Token | 3 | 令牌创建、列表、撤销 |
-| **合计** | **10 模块** | **48** | |
-
----
-
-## 3. 接口总览
+## 3. 路由总表
 
 ### 3.1 系统
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/v1/health` | 健康检查 |
-| GET | `/api/v1/version` | 版本信息 |
-| GET | `/api/v1/config` | 获取运行时配置（脱敏） |
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| GET | `/api/v1/health` | public by default; otherwise `read:system` | 健康与 readiness |
+| GET | `/api/v1/version` | public by default; otherwise `read:system` | 构建版本 |
+| GET | `/api/v1/config` | `read:config` | 当前脱敏 Config |
 
 ### 3.2 Agent
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/v1/agents` | 创建 Agent |
-| GET | `/api/v1/agents` | 列出所有 Agent |
-| GET | `/api/v1/agents/:id` | 获取 Agent 详情 |
-| PUT | `/api/v1/agents/:id` | 更新 Agent 配置 |
-| DELETE | `/api/v1/agents/:id` | 删除 Agent |
-| POST | `/api/v1/agents/:id/start` | 启动 Agent |
-| POST | `/api/v1/agents/:id/pause` | 暂停 Agent |
-| POST | `/api/v1/agents/:id/stop` | 停止 Agent |
-| PATCH | `/api/v1/agents/:id/model` | 切换 Agent 模型 |
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| GET | `/api/v1/agents` | `read:agents` | 列出配置中的 Agent |
+| GET | `/api/v1/agents/:id` | `read:agents` | 获取 Agent 配置视图与状态 |
+| POST | `/api/v1/agents/:id/start` | `write:agents` | 启动 |
+| POST | `/api/v1/agents/:id/pause` | `write:agents` | 暂停 |
+| POST | `/api/v1/agents/:id/stop` | `write:agents` | 停止 |
 
 ### 3.3 Session
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/v1/agents/:id/sessions` | 为指定 Agent 创建 Session |
-| GET | `/api/v1/agents/:id/sessions` | 列出指定 Agent 的 Session |
-| GET | `/api/v1/sessions/:id` | 获取 Session 详情 |
-| DELETE | `/api/v1/sessions/:id` | 关闭/删除 Session |
-| POST | `/api/v1/sessions/:id/clear` | 清空 Session 消息历史 |
-| GET | `/api/v1/sessions/:id/messages` | 获取 Session 消息历史 |
-| DELETE | `/api/v1/sessions/:id/messages/:msgid` | 删除指定消息 |
-| POST | `/api/v1/sessions/:id/context/compress` | 手动触发上下文压缩 |
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| POST | `/api/v1/agents/:id/sessions` | `write:sessions` | 创建 Session |
+| GET | `/api/v1/agents/:id/sessions` | `read:sessions` | 列出 Agent 的 Session |
+| GET | `/api/v1/sessions/:id` | `read:sessions` | 获取 Session |
+| POST | `/api/v1/sessions/:id/pause` | `write:sessions` | 暂停 |
+| POST | `/api/v1/sessions/:id/resume` | `write:sessions` | 恢复 |
+| POST | `/api/v1/sessions/:id/close` | `write:sessions` | 关闭并保留历史 |
+| DELETE | `/api/v1/sessions/:id` | `delete:sessions` | 物理删除 |
+| POST | `/api/v1/sessions/:id/clear` | `write:sessions` | 清空消息 |
+| GET | `/api/v1/sessions/:id/messages` | `read:sessions` | 查询消息 |
+| DELETE | `/api/v1/sessions/:id/messages/:msgid` | `delete:sessions` | 原子删除消息或 Tool unit |
 
 ### 3.4 对话
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/v1/sessions/:id/messages` | 发送消息（非流式） |
-| GET | `/api/v1/sessions/:id/events` | 事件流（SSE） |
-| WS | `/api/v1/sessions/:id/stream` | 流式对话（WebSocket） |
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| POST | `/api/v1/sessions/:id/messages` | `write:sessions` | 非流式 Agent turn |
+| GET | `/api/v1/sessions/:id/events` | `read:sessions` | SSE 事件订阅 |
+| GET | `/api/v1/sessions/:id/stream` | `write:sessions` | WebSocket upgrade；双向流式 Agent turn |
 
-### 3.5 Tool
+### 3.5 Tool、Skill 与 Provider
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/v1/tools` | 列出所有已注册 Tool |
-| GET | `/api/v1/tools/:name` | 获取 Tool 详情（Schema、描述） |
-| POST | `/api/v1/tools/:name/execute` | 直接调用 Tool（调试用） |
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| GET | `/api/v1/tools` | `read:tools` | 列出已注册 Tool |
+| GET | `/api/v1/tools/:name` | `read:tools` | 获取 Tool Schema |
+| GET | `/api/v1/skills` | `read:skills` | 列出已加载 Skill |
+| GET | `/api/v1/skills/:name` | `read:skills` | 获取 Skill 定义 |
+| GET | `/api/v1/providers` | `read:providers` | 列出已注册 Provider |
+| GET | `/api/v1/providers/:id` | `read:providers` | 获取脱敏 Provider 配置 |
+| GET | `/api/v1/providers/:id/models` | `read:providers` | 获取 canonical `ModelInfo` |
 
-### 3.6 Skill
+Tool 只能在经过 Agent 工具白名单检查的 turn 中执行；Skill 只能通过 Agent 的 Prompt/Tool loop 生效。v1 不暴露绕过 Agent principal 的直接执行端点。
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/v1/skills` | 列出所有已加载 Skill |
-| GET | `/api/v1/skills/:name` | 获取 Skill 详情 |
-| POST | `/api/v1/skills/:name/invoke` | 手动触发 Skill |
+### 3.6 Memory
 
-### 3.7 Provider
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| GET | `/api/v1/agents/:id/memory` | `read:memory` | 有界查询 |
+| GET | `/api/v1/agents/:id/memory/:key` | `read:memory` | 读取完整 scope 的 item |
+| POST | `/api/v1/agents/:id/memory` | `write:memory` | Put |
+| DELETE | `/api/v1/agents/:id/memory/:key` | `delete:memory` | 删除 item |
+| DELETE | `/api/v1/agents/:id/memory` | `delete:memory` | 清空 scope |
+| POST | `/api/v1/agents/:id/memory/promote` | `write:memory` | 提升为 Agent 全局 item |
+| POST | `/api/v1/agents/:id/memory/reindex` | `write:memory` | 重建派生向量索引 |
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/v1/providers` | 列出已注册 Provider |
-| GET | `/api/v1/providers/:id` | 获取 Provider 详情 |
-| GET | `/api/v1/providers/:id/models` | 列出 Provider 支持的模型 |
-| POST | `/api/v1/providers` | 注册新 Provider（运行时动态添加） |
-| PUT | `/api/v1/providers/:id` | 更新 Provider 配置 |
-| DELETE | `/api/v1/providers/:id` | 移除 Provider |
+### 3.7 MCP
 
-### 3.8 Memory
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| GET | `/api/v1/mcp/servers` | `read:mcp` | 列出配置的上游连接及状态 |
+| GET | `/api/v1/mcp/servers/:name` | `read:mcp` | 获取连接详情与 Tool 名称 |
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/v1/agents/:id/memory` | 查询 Agent 记忆（支持搜索） |
-| POST | `/api/v1/agents/:id/memory` | 写入/更新记忆 |
-| DELETE | `/api/v1/agents/:id/memory/:key` | 删除指定记忆 |
-| DELETE | `/api/v1/agents/:id/memory` | 清空 Agent 所有记忆 |
+MCP Tool 已映射到 Tool Manager，由 Agent turn 调用。增删配置或重连通过配置 reload/restart 完成，不在 Remote API 中复制配置所有权。
 
-### 3.9 MCP
+## 4. REST envelope
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/v1/mcp/servers` | 列出已注册 MCP Server |
-| GET | `/api/v1/mcp/servers/:name` | 获取 MCP Server 详情 |
-| POST | `/api/v1/mcp/servers` | 注册 MCP Server |
-| PUT | `/api/v1/mcp/servers/:name` | 更新 MCP Server 配置 |
-| DELETE | `/api/v1/mcp/servers/:name` | 移除 MCP Server |
-| POST | `/api/v1/mcp/servers/:name/tools/:tool` | 调用 MCP Server 暴露的 Tool |
-
-### 3.10 Auth / Token
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/v1/tokens` | 列出所有 Token（管理员） |
-| POST | `/api/v1/tokens` | 创建新 Token |
-| DELETE | `/api/v1/tokens/:name` | 撤销 Token |
-
----
-
-## 4. 统一响应格式
-
-### 4.1 成功响应
+成功：
 
 ```json
 {
   "code": 0,
   "message": "ok",
-  "data": { },
-  "request_id": "req_xxx"
+  "data": {},
+  "request_id": "req_01J..."
 }
 ```
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `code` | int | 0 表示成功，非 0 表示错误 |
-| `message` | string | 人类可读的状态描述 |
-| `data` | any | 响应数据，类型取决于具体端点 |
-| `request_id` | string | 本次请求的唯一标识，用于链路追踪 |
-
-### 4.2 错误响应
+错误：
 
 ```json
 {
   "code": 40401,
-  "message": "agent not found",
+  "message": "resource not found",
   "data": null,
-  "request_id": "req_xxx"
+  "request_id": "req_01J..."
 }
 ```
 
-> `code` 采用 HTTP 状态码 + 两位子码的组合，如 `40401` = HTTP 404 + 子码 01（资源不存在）。
+`code=0` 表示成功，与 HTTP 成功状态独立；创建可以返回 HTTP 201。错误 code 使用 HTTP 状态加两位子码。`message` 不包含底层路径、凭据或上游响应正文。Remote API Server 只使用下面这一份错误 writer；Auth 包和业务 handler 不再定义第二套 envelope：
 
-### 4.3 分页响应
+```go
+type Envelope struct {
+    Code      int    `json:"code"`
+    Message   string `json:"message"`
+    Data      any    `json:"data"`
+    RequestID string `json:"request_id"`
+}
 
-列表类端点统一使用分页结构：
+func (s *Server) writeError(w http.ResponseWriter, r *http.Request, status, code int, message string) {
+    requestID := requestIDFromContext(r.Context()) // request-ID middleware 保证非空
+    w.Header().Set("Content-Type", "application/json; charset=utf-8")
+    w.Header().Set("X-Request-ID", requestID)
+    w.WriteHeader(status)
+    if err := json.NewEncoder(w).Encode(Envelope{
+        Code: code, Message: message, Data: nil, RequestID: requestID,
+    }); err != nil {
+        s.logger.Warn("api error response write failed", "request_id", requestID, "error", err)
+    }
+}
+```
+
+只有 Agent、Session 和 Session Message 列表使用 `page`/`page_size`：
 
 ```json
 {
-  "code": 0,
-  "message": "ok",
-  "data": {
-    "items": [ ],
-    "total": 100,
-    "page": 1,
-    "page_size": 20
-  },
-  "request_id": "req_xxx"
+  "items": [],
+  "total": 0,
+  "page": 1,
+  "page_size": 20
 }
 ```
 
-| 字段 | 类型 | 说明 |
+默认 `page=1`、`page_size=20`，最大值由对应端点声明。Tool、Skill、Provider、Model 和 MCP 列表规模受 Config 限制，一次返回 `items`；Memory Search 使用 `limit<=100`，不承诺 total 或 cursor。
+
+## 5. 认证与路由权限
+
+非 public 请求使用：
+
+```text
+Authorization: Bearer <static-token-or-jwt>
+```
+
+静态 Token 来自 `runtime.auth.tokens`；JWT 由外部系统签发，Runtime 只验证。v1 没有登录、签发、刷新或撤销端点。完整协议见 [auth.md](auth.md)。
+
+Router 注册每个端点时必须同时绑定上表的 `(action, resource)`；Remote API 的唯一 route wrapper 使用已匹配的 metadata 完成 AuthN/AuthZ。不得从 URL 第一段或 HTTP 方法猜测权限，否则嵌套的 Memory/Session 路由会被错误归类。
+
+Health 与 version 的 `RouteSpec` 始终分别绑定 `Action="read", Resource="system"`；默认 `public_paths` 命中时 wrapper 才 bypass。管理员从 public paths 删除它们后，同一 metadata 立即用于授权。
+
+## 6. 超时与连接
+
+- 普通控制类 REST handler 使用 `runtime.api.http.write_timeout`。
+- HTTP Server 本身不设置会截断全部连接的全局 `WriteTimeout`；middleware 用 `http.NewResponseController` 为普通 REST 设置响应 deadline。
+- 对话 POST、SSE 和 WS 清除该响应 deadline，改用 request context、Provider/Tool timeout 与 Session turn 取消。
+- SSE 每 15 秒发送 comment heartbeat；WS 使用 ping/pong。连接断开不回滚已经提交的 Session snapshot。
+
+## 7. 错误码
+
+| code | HTTP | 说明 |
 |------|------|------|
-| `items` | array | 当前页的数据项 |
-| `total` | int | 总记录数 |
-| `page` | int | 当前页码（从 1 开始） |
-| `page_size` | int | 每页条数 |
+| `40001` | 400 | 参数或字段无效 |
+| `40002` | 400 | JSON/协议 frame 解析失败 |
+| `40101` | 401 | 缺少或无效凭据 |
+| `40102` | 401 | JWT 签名、算法、issuer、audience、subject、roles、exp 或 nbf 任一校验失败 |
+| `40301` | 403 | RBAC 拒绝 |
+| `40401` | 404 | 资源不存在 |
+| `40901` | 409 | 当前状态不允许操作 |
+| `42201` | 422 | 可解析但违反领域不变量 |
+| `42901` | 429 | 容量或速率上限 |
+| `50001` | 500 | 未分类内部错误 |
+| `50201` | 502 | MCP 上游连接、鉴权或协议失败 |
+| `50202` | 502 | Provider 上游失败 |
+| `50301` | 503 | Runtime 未 Ready 或关键存储不可用 |
+| `50401` | 504 | 请求 deadline exceeded |
 
-分页参数通过 query string 传递：`?page=1&page_size=20`。
-
----
-
-## 5. 认证
-
-所有 API 请求需在 Header 中携带 Token：
-
-```
-Authorization: Bearer <token>
-```
-
-未携带或不合法的 Token 返回 `401 Unauthorized`。
-
-Token 通过 `/api/v1/tokens` 端点创建和管理（见 [auth.md](./auth.md)）。
+Provider 的上游 401/403/429 不直接透传；统一映射为 `50202`/HTTP 502，并将可重试分类只写入服务端日志。客户端取消后通常不再写响应。
 
 ---
 
-## 6. 错误码
-
-| 错误码 | HTTP 状态 | 说明 |
-|--------|-----------|------|
-| 0 | 200 | 成功 |
-| 40001 | 400 | 请求参数无效 |
-| 40002 | 400 | 请求体解析失败 |
-| 40003 | 409 | 资源已存在（名称冲突） |
-| 40101 | 401 | 未认证（缺少或无效 Token） |
-| 40102 | 401 | Token 已过期 |
-| 40301 | 403 | 无权限（Scope 不足） |
-| 40401 | 404 | 资源不存在 |
-| 40901 | 409 | 资源状态冲突（如 Agent 运行中不可删除） |
-| 42201 | 422 | 请求语义错误（如 Provider 仍被引用时不可删除） |
-| 42901 | 429 | 请求频率超限 |
-| 50001 | 500 | 内部错误 |
-| 50002 | 500 | Provider 调用失败 |
-| 50003 | 500 | Tool 执行失败 |
-| 50004 | 502 | MCP Server 连接失败 |
-| 50301 | 503 | 服务不可用（Runtime 未就绪） |
-
----
-
-## 7. 更新日志
-
-| 日期 | 变更 |
-|------|------|
-| 2025-07-15 | 初版：48 端点，10 模块，含统一响应、认证、错误码 |
-| 2025-07-15 | 文档拆分为按模块独立文件，INDEX.md 作为目录索引 |
+*最后更新: 2026-07-22*

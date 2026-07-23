@@ -1,320 +1,287 @@
 # MCP Server
 
-> 将 Yaa! 的能力（Tool / Skill）通过 MCP 协议暴露给外部 MCP Client，使 Yaa! 作为一个标准 MCP Server 对外提供服务。
+> 文档路径: `docs/mcp/server.md`
+> 上级: [`README.md`](README.md)
+> 协议版本: `2025-03-26`、legacy `2024-11-05`
 
-## 1. 概述
+---
 
-Yaa! Runtime 既可以作为 MCP Client 调用外部 MCP Server，也可以 **作为 MCP Server** 将自身的 Tool 和 Skill 暴露给其他 MCP Client（如 Claude Desktop、Cursor、其他 Agent 框架等）。
+## 1. 责任边界
 
-### 核心职责
-
-| 职责 | 说明 |
-|------|------|
-| Tool 暴露 | 将 Yaa! 内部注册的 Tool 转换为 MCP Tool 格式 |
-| Skill 暴露 | 将 Yaa! Skill 包装为 MCP Tool 暴露 |
-| 请求路由 | 接收 MCP Client 的 `tools/call` 请求，转发到 Yaa! Runtime 执行 |
-| 列表响应 | 响应 `tools/list` 请求，返回当前可用的 Tool 列表 |
-| 协议适配 | 在 MCP 协议与 Yaa! 内部接口之间做格式转换 |
-
-## 2. 架构位置
-
-```
-┌──────────────────────────────────────────────────┐
-│              MCP Client (外部)                   │
-│         Claude Desktop / Cursor / ...            │
-└──────────────────┬───────────────────────────────┘
-                   │ MCP Protocol (stdio / SSE / WS)
-                   ▼
-┌──────────────────────────────────────────────────┐
-│              Yaa! MCP Server                      │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────┐ │
-│  │ Tool Adapter │  │ Skill Adapter│  │ Router  │ │
-│  └──────┬───────┘  └──────┬───────┘  └───┬────┘ │
-│         │                 │              │       │
-│         ▼                 ▼              │       │
-└─────────┼─────────────────┼──────────────┼──────┘
-          │                 │              │
-          ▼                 ▼              ▼
-┌──────────────────────────────────────────────────┐
-│              Yaa! Runtime                         │
-│   Tool Registry  │  Skill Manager  │  Executor    │
-└──────────────────────────────────────────────────┘
-```
-
-## 3. 协议实现
-
-### 3.1 支持的传输方式
-
-| 传输方式 | 场景 | 说明 |
-|----------|------|------|
-| stdio | 本地集成 | Claude Desktop 等本地 Client 的默认方式 |
-| SSE | 远程访问 | HTTP Server-Sent Events，单向流 |
-| WebSocket | 远程双向 | 全双工通信，适合实时交互 |
-
-### 3.2 支持的 MCP 方法
-
-| MCP 方法 | Yaa! 内部映射 | 说明 |
-|-----------|---------------|------|
-| `initialize` | 握手协商 | 返回 Server 能力声明 |
-| `tools/list` | `ToolRegistry.List()` | 返回所有已注册 Tool |
-| `tools/call` | `Executor.Execute()` | 执行指定 Tool |
-| `resources/list` | — | 预留，暂不实现 |
-| `prompts/list` | — | 预留，暂不实现 |
-
-## 4. Tool 暴露机制
-
-### 4.1 Yaa! Tool → MCP Tool 映射
-
-Yaa! 内部的 Tool 定义与 MCP Tool 格式存在字段映射关系：
-
-| Yaa! Tool 字段 | MCP Tool 字段 | 说明 |
-|-----------------|---------------|------|
-| `name` | `name` | Tool 名称 |
-| `description` | `description` | Tool 描述 |
-| `input_schema` | `inputSchema` | JSON Schema 输入参数 |
-| `output_schema` | `outputSchema` | JSON Schema 输出（MCP 扩展） |
-| `metadata` | `annotations` | 额外元数据 |
-
-### 4.2 Skill 作为 MCP Tool
-
-Yaa! Skill 可以被包装为 MCP Tool 暴露：
-
-```
-Skill (SKILL.md + scripts)
-    │
-    ▼  SkillAdapter.Wrap()
-MCP Tool {
-    name: "skill.{skill_name}"
-    description: skill.description
-    inputSchema: skill.trigger_schema
-}
-```
-
-Skill 被调用时，MCP Server 通过 `Executor` 启动 Skill 工作流，将执行结果转换为 MCP 响应格式。
-
-## 5. 流程图
-
-### 5.1 Tool 列表响应流程
-
-```
-MCP Client                Yaa! MCP Server              Yaa! Runtime
-    │                          │                           │
-    │── tools/list ───────────▶│                           │
-    │                          │── ToolRegistry.List() ───▶│
-    │                          │◀── tools []Tool ──────────│
-    │                          │                           │
-    │                          │  格式转换: Yaa! Tool →    │
-    │                          │  MCP Tool JSON            │
-    │                          │                           │
-    │◀── tools/list result ────│                           │
-    │    { tools: [...] }      │                           │
-```
-
-### 5.2 Tool 执行转发流程
-
-```
-MCP Client                Yaa! MCP Server              Yaa! Executor
-    │                          │                           │
-    │── tools/call ───────────▶│                           │
-    │    { name, arguments }   │                           │
-    │                          │                           │
-    │                          │  解析 name + arguments     │
-    │                          │── Execute(name, args) ───▶│
-    │                          │                           │
-    │                          │                           │  执行 Tool/Skill
-    │                          │                           │  生成结果
-    │                          │◀── result, error ─────────│
-    │                          │                           │
-    │                          │  转换为 MCP CallResult    │
-    │                          │                           │
-    │◀── tools/call result ────│                           │
-    │    { content, isError }  │                           │
-```
-
-## 6. Go 代码示例
-
-### 6.1 MCP Server 结构定义
+Yaa! MCP Server 把明确允许的 Yaa! Tool 暴露给外部 MCP Client。它使用 `ServerTransport` 的 `Serve` 接口，不复用 Client 的拨号/`Recv` 实现。
 
 ```go
-package mcp
-
-import (
-    "context"
-    "encoding/json"
-    "fmt"
-
-    "github.com/imshuai/yaa/internal/tool"
-    "github.com/imshuai/yaa/internal/skill"
-    "github.com/imshuai/yaa/internal/executor"
-)
-
-// MCPServer 将 Yaa! 能力通过 MCP 协议暴露
 type MCPServer struct {
-    toolRegistry *tool.Registry
-    skillMgr     *skill.Manager
-    executor     *executor.Executor
-    transport    Transport
+    tools     *tool.Manager
+    agentID   string
+    exposed   map[string]bool
+    catalog   []MCPTool // prepared 时冻结，按 canonical name 排序
+    digest    [16]byte  // catalog canonical JSON 的 SHA-256 前 16 bytes
+    transport ServerTransport
 }
 
-// MCPTool 表示 MCP 协议中的 Tool 定义
-type MCPTool struct {
-    Name        string          `json:"name"`
-    Description string          `json:"description"`
-    InputSchema json.RawMessage `json:"inputSchema"`
-}
-
-// MCPToolListResponse tools/list 的响应
-type MCPToolListResponse struct {
-    Tools []MCPTool `json:"tools"`
-}
-
-// MCPCallToolRequest tools/call 的请求
-type MCPCallToolRequest struct {
-    Name      string          `json:"name"`
-    Arguments json.RawMessage `json:"arguments"`
-}
-
-// MCPCallToolResult tools/call 的响应
-type MCPCallToolResult struct {
-    Content []MCPContent `json:"content"`
-    IsError bool         `json:"isError,omitempty"`
-}
-
-// MCPContent 表示 Tool 执行返回的内容块
-type MCPContent struct {
-    Type string `json:"type"` // "text" | "image" | "resource"
-    Text string `json:"text,omitempty"`
-}
+func NewMCPServer(tools *tool.Manager, cfg config.MCPExposeConfig) (*MCPServer, error)
+func (s *MCPServer) Serve(ctx context.Context) error
+func (s *MCPServer) Close() error
 ```
 
-### 6.2 Tool 列表响应实现
+## 2. 初始化
+
+Server 按 transport 使用唯一版本：Streamable HTTP 为 `2025-03-26`，legacy SSE 为 `2024-11-05`；stdio 接受这两个版本并优先选择 Client 请求的受支持版本。请求版本不满足 transport 约束时仍返回正常 `InitializeResult`，其中携带该 transport 的版本；不接受该版本的 Client 负责关闭连接。版本差异本身不是 JSON-RPC error。正常响应的 capabilities 只包含实际实现的 `tools`。
 
 ```go
-// ListTools 响应 MCP tools/list 请求，返回所有已注册的 Tool
-func (s *MCPServer) ListTools(ctx context.Context) (*MCPToolListResponse, error) {
-    // 1. 从 Runtime 获取所有已注册 Tool
-    yaaTools := s.toolRegistry.List()
-
-    mcpTools := make([]MCPTool, 0, len(yaaTools))
-    for _, t := range yaaTools {
-        mcpTools = append(mcpTools, MCPTool{
-            Name:        t.Name,
-            Description: t.Description,
-            InputSchema: t.InputSchema,
-        })
-    }
-
-    // 2. 将 Skill 也包装为 MCP Tool
-    skills := s.skillMgr.List()
-    for _, sk := range skills {
-        mcpTools = append(mcpTools, MCPTool{
-            Name:        fmt.Sprintf("skill.%s", sk.Name),
-            Description: sk.Description,
-            InputSchema: sk.TriggerSchema,
-        })
-    }
-
-    return &MCPToolListResponse{Tools: mcpTools}, nil
-}
-```
-
-### 6.3 Tool 执行转发实现
-
-```go
-// CallTool 响应 MCP tools/call 请求，转发到 Yaa! Executor 执行
-func (s *MCPServer) CallTool(ctx context.Context, req MCPCallToolRequest) (*MCPCallToolResult, error) {
-    // 1. 执行 Tool（适用于普通 Tool 和 Skill 包装的 Tool）
-    result, err := s.executor.Execute(ctx, req.Name, req.Arguments)
+func (s *MCPServer) handle(
+    ctx context.Context,
+    session *ServerSession,
+    msg *Message,
+) (*Message, error) {
+    kind, err := validateEnvelope(msg)
     if err != nil {
-        // 执行失败，返回 isError = true
-        return &MCPCallToolResult{
-            Content: []MCPContent{
-                {Type: "text", Text: fmt.Sprintf("Tool execution failed: %v", err)},
-            },
-            IsError: true,
-        }, nil
+        return rpcError(msg.ID, -32600, "Invalid Request"), nil
+    }
+    if kind == KindResponse {
+        return nil, ErrMCPProtocolError // Server 不发起 request，不接受孤立 response。
+    }
+    if kind == KindNotification {
+        if msg.Method != "notifications/initialized" {
+            return nil, nil // 未声明的 notification 忽略且永不响应。
+        }
+        if err := session.MarkInitialized(); err != nil {
+            return nil, ErrMCPProtocolError
+        }
+        return nil, nil
     }
 
-    // 2. 将 Yaa! 执行结果转换为 MCP Content 格式
-    content := []MCPContent{
-        {Type: "text", Text: result.Output},
+    if msg.Method == "notifications/initialized" {
+        return rpcError(msg.ID, -32600, "Invalid Request"), nil
+    }
+    if msg.Method == "initialize" {
+        var params InitializeParams
+        if err := decodeParams(msg.Params, &params); err != nil {
+            return rpcError(msg.ID, -32602, "Invalid params"), nil
+        }
+        version := serverVersion(session.Transport, params.ProtocolVersion)
+        if err := session.Negotiate(version); err != nil {
+            return rpcError(msg.ID, -32600, "Invalid Request"), nil
+        }
+        return rpcResult(msg.ID, InitializeResult{
+            ProtocolVersion: version,
+            Capabilities: map[string]any{"tools": map[string]any{"listChanged": false}},
+            ServerInfo: Implementation{Name: "yaa", Version: runtimeVersion},
+        }), nil
+    }
+    if msg.Method == "ping" {
+        if !session.CanPing() {
+            return rpcError(msg.ID, -32002, "Server not initialized"), nil
+        }
+        return rpcResult(msg.ID, struct{}{}), nil
+    }
+    if !session.Ready() && (msg.Method == "tools/list" || msg.Method == "tools/call") {
+        return rpcError(msg.ID, -32002, "Server not initialized"), nil
     }
 
-    // 3. 如果结果包含图片，追加 image content
-    if result.ImageBase64 != "" {
-        content = append(content, MCPContent{
-            Type: "image",
-            Text: result.ImageBase64, // 实际为 base64 编码
-        })
-    }
-
-    return &MCPCallToolResult{Content: content}, nil
-}
-```
-
-### 6.4 启动 MCP Server
-
-```go
-// Start 启动 MCP Server，监听指定传输方式
-func (s *MCPServer) Start(ctx context.Context, transportType string) error {
-    switch transportType {
-    case "stdio":
-        s.transport = NewStdioTransport()
-    case "sse":
-        s.transport = NewSSETransport(":8080")
-    case "websocket":
-        s.transport = NewWebSocketTransport(":8080")
-    default:
-        return fmt.Errorf("unsupported transport: %s", transportType)
-    }
-
-    // 注册消息处理器
-    s.transport.Handle("tools/list", func(ctx context.Context, raw json.RawMessage) (any, error) {
-        return s.ListTools(ctx)
-    })
-    s.transport.Handle("tools/call", func(ctx context.Context, raw json.RawMessage) (any, error) {
-        var req MCPCallToolRequest
-        if err := json.Unmarshal(raw, &req); err != nil {
+    switch msg.Method {
+    case "tools/list":
+        result, rpcErr := s.listTools(msg.Params)
+        if rpcErr != nil {
+            return rpcError(msg.ID, rpcErr.Code, rpcErr.Message), nil
+        }
+        return rpcResult(msg.ID, result), nil
+    case "tools/call":
+        var params CallToolParams
+        if err := decodeParams(msg.Params, &params); err != nil {
+            return rpcError(msg.ID, -32602, "Invalid params"), nil
+        }
+        result, err := s.CallTool(ctx, params)
+        var rpcErr *RPCError
+        if errors.As(err, &rpcErr) {
+            return rpcError(msg.ID, rpcErr.Code, rpcErr.Message), nil
+        }
+        if err != nil {
             return nil, err
         }
-        return s.CallTool(ctx, req)
-    })
-
-    return s.transport.Serve(ctx)
+        return rpcResult(msg.ID, result), nil
+    default:
+        return rpcError(msg.ID, -32601, "Method not found"), nil
+    }
 }
 ```
 
-## 7. 配置
-
-在 Yaa! 配置文件中启用 MCP Server：
+`decodeParams` 使用 `json.Decoder.DisallowUnknownFields`、`UseNumber` 和 EOF 检查，并要求 params 是 object。`rpcResult`/`rpcError` 原样复制合法 request ID；error message 只使用上面固定文本，不拼接内部 error。所有 per-connection 初始化状态都来自 transport 创建的 `ServerSession`，不能放在 `MCPServer` 全局字段中。
 
 ```json
 {
-  "mcp": {
-    "server": {
-      "enabled": true,
-      "transport": "stdio",
-      "expose_tools": true,
-      "expose_skills": true,
-      "tool_prefix": "",
-      "exclude": ["internal.*"]
-    }
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "protocolVersion": "2025-03-26",
+    "capabilities": {"tools": {"listChanged": false}},
+    "serverInfo": {"name": "yaa", "version": "0.1.0"}
   }
 }
 ```
 
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `enabled` | bool | `false` | 是否启用 MCP Server |
-| `transport` | string | `"stdio"` | 传输方式 |
-| `expose_tools` | bool | `true` | 是否暴露 Tool |
-| `expose_skills` | bool | `true` | 是否暴露 Skill |
-| `tool_prefix` | string | `""` | Tool 名称前缀 |
-| `exclude` | []string | `[]` | 排除的 Tool 名称模式 |
+## 3. tools/list
 
-## 8. 安全与权限
+支持 opaque cursor 分页。服务端不能在没有 cursor 契约的情况下截断列表：
 
-- **Tool 过滤**：通过 `exclude` 配置排除内部 Tool，避免敏感操作暴露
-- **权限继承**：MCP Server 执行 Tool 时继承 Yaa! Runtime 的权限上下文
-- **调用审计**：所有来自 MCP Client 的 `tools/call` 请求记录到审计日志
-- **并发控制**：MCP Server 复用 Yaa! Executor 的并发限制和超时机制
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "tools": [
+      {
+        "name": "shell",
+        "description": "Execute an allow-listed command",
+        "inputSchema": {"type": "object", "properties": {}}
+      }
+    ]
+  }
+}
+```
+
+`NewMCPServer` 从 `exposed_tools` 构造一次不可变 catalog，按 canonical name 字节升序排列并对规范化后的 name/description/schema JSON 计算 digest；运行期不重新查询 Tool Manager。固定 page size 为 100。省略 params 或传 `{}` 都表示 offset 0；其他字段使用严格解码。
+
+非空 cursor 是固定 21 bytes 的 `base64.RawURLEncoding`：`version(1) || digest(16) || offset(uint32 big-endian)`。解码后必须按同一编码重编码得到原字符串，version 必须为 1、digest 必须匹配当前 catalog，offset 必须是此前可能返回的页边界且小于 catalog 长度；否则返回 `-32602`。只有仍有下一页时才返回 `nextCursor`。空 catalog 和末页都明确编码 `"tools":[]` 或非空 array，不能输出 null；该规则使同一 catalog 的分页顺序稳定且 cursor 不依赖进程地址或 map 顺序。
+
+```go
+func (s *MCPServer) listTools(raw json.RawMessage) (ListToolsResult, *RPCError) {
+    cursor, err := decodeListCursor(raw, s.digest, len(s.catalog))
+    if err != nil {
+        return ListToolsResult{}, rpcInvalidParams("invalid cursor")
+    }
+    end := cursor.Offset + 100
+    if end > len(s.catalog) {
+        end = len(s.catalog)
+    }
+    out := ListToolsResult{Tools: cloneTools(s.catalog[cursor.Offset:end])}
+    if end < len(s.catalog) {
+        out.NextCursor = encodeListCursor(s.digest, end)
+    }
+    return out, nil
+}
+```
+
+`decodeListCursor` 接受省略 params、`{}` 或空 cursor；params 中未知字段、`null`、非 object、cursor 非 string、非规范 base64、offset 溢出或非页边界都返回错误。`cloneTools`、`catalogDigest` 是本模块内的无状态小 helper，不读取 Tool Manager；因此一页处理期间不会因其他状态变化而改变 catalog。
+
+## 4. tools/call
+
+```go
+func (s *MCPServer) CallTool(ctx context.Context, req CallToolRequest) (*CallToolResult, error) {
+    if !s.exposed[req.Name] {
+        return nil, rpcInvalidParams("unknown tool") // -32602
+    }
+    result, err := s.tools.Execute(ctx, tool.ExecutionScope{
+        AgentID: s.agentID,
+        // MCP Server 请求不是 Yaa! Session turn。
+        SessionID: "",
+    }, req.Name, req.Arguments)
+    if err != nil {
+        if ctx.Err() != nil {
+            return nil, context.Cause(ctx)
+        }
+        if errors.Is(err, tool.ErrInvalidParams) || errors.Is(err, tool.ErrToolNotFound) {
+            return nil, rpcInvalidParams("invalid tool arguments")
+        }
+        // 其余硬错误使用 Tool 模块唯一的安全投影，不暴露原始 error。
+        return toMCPResult(tool.ErrorResult(err)), nil
+    }
+    return toMCPResult(result), nil
+}
+```
+
+未知 method（包括所有 `resources/*`、`prompts/*` request）使用 `-32601`；未知 Tool、参数类型错误和非法 cursor 使用 `-32602`；下游软错误及其他已分类硬错误使用 `result.isError=true`。caller 取消/超时返回 `context.Cause(ctx)` 给 transport，transport 不再尝试写业务 response。
+
+## 5. ping
+
+`ping` 返回空 JSON-RPC result，不触发 Tool Manager 操作。健康检查由 Runtime Manager 统计 transport/进程状态完成。
+
+## 6. Transport 启动
+
+```go
+func NewMCPServer(tools *tool.Manager, cfg config.MCPExposeConfig) (*MCPServer, error) {
+    if tools == nil || cfg.AgentID == "" {
+        return nil, fmt.Errorf("%w: mcp.server.agent_id is required", ErrMCPConfig)
+    }
+    allowed := make(map[string]bool)
+    for _, info := range tools.ListForAgent(cfg.AgentID) {
+        allowed[info.Name] = true
+    }
+    exposed := make(map[string]bool, len(cfg.ExposedTools))
+    catalog := make([]MCPTool, 0, len(cfg.ExposedTools))
+    for _, name := range cfg.ExposedTools {
+        if exposed[name] {
+            return nil, fmt.Errorf("%w: duplicate mcp.server.exposed_tools entry %q", ErrMCPConfig, name)
+        }
+        exposed[name] = true
+        if !allowed[name] {
+            return nil, fmt.Errorf("%w: exposed tool %q is not enabled or not allowed for agent %q", ErrMCPConfig, name, cfg.AgentID)
+        }
+        instance, err := tools.Get(name)
+        if err != nil {
+            return nil, fmt.Errorf("%w: exposed tool %q: %v", ErrMCPConfig, name, err)
+        }
+        catalog = append(catalog, MCPTool{
+            Name: instance.Name(), Description: instance.Description(),
+            InputSchema: append(json.RawMessage(nil), instance.Parameters()...),
+        })
+    }
+    sort.Slice(catalog, func(i, j int) bool { return catalog[i].Name < catalog[j].Name })
+    s := &MCPServer{
+        tools: tools, agentID: cfg.AgentID, exposed: exposed,
+        catalog: catalog, digest: catalogDigest(catalog),
+    }
+    switch cfg.Transport {
+    case "stdio":
+        s.transport = NewStdioServer()
+    case "sse", "streamable_http":
+        listener, err := net.Listen("tcp", cfg.Addr)
+        if err != nil {
+            return nil, fmt.Errorf("%w: listen %s: %v", ErrMCPConfig, cfg.Addr, err)
+        }
+        if cfg.Transport == "sse" {
+            s.transport = NewSSEServer(listener, cfg.Path, cfg.MessagesPath)
+        } else {
+            s.transport = NewStreamableHTTPServer(listener, cfg.Path, cfg.OriginAllowlist)
+        }
+    default:
+        return nil, fmt.Errorf("%w: mcp.server.transport=%q", ErrMCPConfig, cfg.Transport)
+    }
+    return s, nil
+}
+
+func (s *MCPServer) Serve(ctx context.Context) error {
+    return s.transport.Serve(ctx, s.handle)
+}
+
+func (s *MCPServer) Close() error {
+    if s.transport == nil {
+        return nil
+    }
+    return s.transport.Close()
+}
+```
+
+`NewMCPServer` 在绑定网络 listener 前复制 `agent_id` 和 `exposed_tools`，显式拒绝重复 Tool 名称，并校验每个 Tool 当前 enabled 且通过该 Agent allowlist。这样即使调用方绕过根 Config Validator，构造期也不会生成重复 catalog；根校验与构造防御使用同一唯一性契约。构造成功只表示 prepared，不得自行启动 goroutine。`Serve` 是阻塞调用；MCP Manager 仅在 `Config.Activate(binding)` 成功后于受控 goroutine 中运行它，并在 `Stop` 时取消 context、调用 `Close`、等待 goroutine 退出。stdio 不创建 listener。
+
+Server transport 的构造器和 wire 细节见 [transport.md](transport.md)。MCP Server 不监听 WebSocket；需要 WebSocket 的客户端连接 Yaa! Remote API。
+
+## 7. 暴露配置
+
+```yaml
+mcp:
+  server:
+    enabled: true
+    agent_id: "default"
+    transport: streamable_http
+    addr: "127.0.0.1:9090"
+    path: "/mcp"
+    exposed_tools: ["shell", "file_read"]
+```
+
+根 Config Validator 负责 `exposed_tools` 的非空与唯一性；`Config.Activate(binding)` 在 Serve 前校验 `agent_id` 和每个 Tool 引用；`NewMCPServer` 构造时仍独立拒绝重复项，并确认每个 Tool 当前 enabled、存在且通过该 Agent allowlist。三层使用同一唯一性与权限契约，但构造防御不能替代根校验或 binding。`tools/call` 始终把这个固定 principal 传入 Tool Manager，再次执行权限、超时和审计检查。网络 transport 默认只绑定 loopback，并按 [`transport.md`](transport.md) 校验 Origin。
+
+---
+
+*最后更新: 2025-07-17*

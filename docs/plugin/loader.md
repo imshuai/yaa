@@ -1,311 +1,237 @@
-# Plugin Loader 详解
+# Plugin Loader
 
-## 概述
+> 文档路径: `docs/plugin/loader.md`
+> 上级: [README.md](README.md)
 
-Plugin Loader 是 Yaa! 插件系统的核心组件，负责在运行时动态加载、验证和管理外部插件。它基于 Go 的 `plugin` 包实现原生插件加载，同时提供签名验证、版本兼容检查和加载失败处理等安全机制。
+---
 
-## 目录结构
+## 1. 职责
 
-```
-plugin/
-├── loader.go          # 插件加载器
-├── manager.go         # 插件管理器
-├── signature.go       # 签名验证
-├── version.go         # 版本兼容检查
-└── types.go           # 插件接口定义
-```
+Loader 发现 Manifest、校验文件和配置、分配本地 IPC、启动进程并完成一次 RPC 启动序列。它不解析依赖图、不注册 Proxy、不执行重试，也不加载 Go symbol；这些分别由 Manager 和 Runtime 模块负责。
 
-## Go plugin 加载机制
+```text
+Discover
+  → read plugin.yaml
+  → validate canonical Manifest
+  → resolve entry inside plugin directory
 
-Go 标准库 `plugin` 包提供了动态加载 `.so`（Linux/macOS）和 `.dll`（Windows，需第三方库）共享库的能力。
-
-### 编译插件
-
-插件需要编译为共享库格式，使用 `-buildmode=plugin` 标志：
-
-```bash
-# Linux / macOS
-go build -buildmode=plugin -o myplugin.so ./myplugin
-
-# Windows（需借助第三方方案，如 golang.org/x/sys/windows）
-# Yaa! 推荐使用 Go 1.23+ 的 plugin Windows 支持
-go build -buildmode=plugin -o myplugin.dll ./myplugin
+Start
+  → validate entry config against config_schema
+  → allocate Unix Socket / loopback TCP
+  → exec local process
+  → Dial
+  → Handshake
+  → Init(config)
+  → Ready(capabilities)
 ```
 
-### 插件入口约定
+## 2. 路径与发现
 
-每个插件必须导出一个符合 `PluginFactory` 签名的函数：
+`plugins.paths` 的相对路径以主配置文件目录为基准。每个直接子目录最多读取一个 `plugin.yaml`。Loader 对搜索目录、Manifest 目录和 entry 分别执行 `filepath.Abs`、`filepath.EvalSymlinks` 与 `os.Lstat`，要求 entry 是普通文件（Unix 还要求任一 execute bit）；随后以解析后的真实 Manifest 目录为 base 重新计算 `filepath.Rel`。只有 `rel == ".."`、`strings.HasPrefix(rel, ".."+string(filepath.Separator))` 或 `filepath.IsAbs(rel)` 才是逃逸；文件名 `..helper` 不是逃逸。这样目录内 symlink 也不能指向目录外可执行文件。
 
 ```go
-// 插件代码（编译为 .so/.dll 的模块）
-package main
-
-import "github.com/imshuai/yaa/plugin"
-
-// Plugin 必须导出的工厂函数
-var Plugin = func() plugin.Plugin {
-    return &MyPlugin{}
+type PluginDescriptor struct {
+    ManifestPath string
+    EntryPath    string
+    Manifest     Manifest
 }
 
-type MyPlugin struct{}
-
-func (p *MyPlugin) Init(ctx plugin.Context) error {
-    return nil
+type DiscoveryDiagnostic struct {
+    PluginID   string            // 无法恢复 ID 时为空
+    Descriptor *PluginDescriptor // 已解析出 ID 时保留部分 Descriptor
+    Err        error             // 始终非 nil
 }
 
-func (p *MyPlugin) Name() string {
-    return "my-plugin"
-}
+func (d DiscoveryDiagnostic) Error() string { return d.Err.Error() }
+func (d DiscoveryDiagnostic) Unwrap() error { return d.Err }
 
-func (p *MyPlugin) Version() string {
-    return "1.0.0"
-}
-
-func (p *MyPlugin) Shutdown() error {
-    return nil
-}
-```
-
-## Loader 核心实现
-
-```go
-package plugin
-
-import (
-    "fmt"
-    "os"
-    "plugin"
-    "runtime"
-)
-
-// PluginFactory 插件工厂函数签名
-type PluginFactory func() Plugin
-
-// Loader 插件加载器
 type Loader struct {
-    signatureVerifier *SignatureVerifier
-    versionChecker   *VersionChecker
+    paths           []string
+    protocolVersion string // "1"
+    logger          *slog.Logger
 }
 
-// NewLoader 创建插件加载器
-func NewLoader(sv *SignatureVerifier, vc *VersionChecker) *Loader {
-    return &Loader{
-        signatureVerifier: sv,
-        versionChecker:    vc,
-    }
+func NewLoader(configDir string, paths []string, logger *slog.Logger) (*Loader, error)
+
+// pluginRPC 是 pkg/pluginrpc 对生成 gRPC client 的最小生命周期适配器。
+// Loader/Manager 不直接依赖 grpc.ClientConn；Close 由 RPCClient 统一拥有。
+type pluginRPC interface {
+    Handshake(ctx context.Context, protocolVersion, expectedPluginID string) (HandshakeResponse, error)
+    Init(ctx context.Context, cfg map[string]any) error
+    Ready(ctx context.Context) (ReadyResponse, error)
+    Health(ctx context.Context) (HealthResponse, error)
+    Stop(ctx context.Context) error
+    InvokeTool(ctx context.Context, req ToolRequest) (ToolResponse, error)
+    Close() error
 }
 
-// Load 从指定路径加载插件
-func (l *Loader) Load(path string) (Plugin, error) {
-    // 1. 检查文件是否存在
-    if _, err := os.Stat(path); err != nil {
-        return nil, fmt.Errorf("plugin file not found: %s, %w", path, err)
-    }
+// RPCClient 同时拥有 RPC transport、已启动进程和 endpoint cleanup。
+// cmd.Start 成功后由它启动唯一 Wait goroutine；其他模块不得调用 Cmd.Wait。
+type RPCClient struct {
+    rpc          pluginRPC
+    cmd          *exec.Cmd
+    Exited       <-chan struct{}
+    Capabilities []CapabilityDescriptor
+    cleanup      func()
 
-    // 2. 签名验证
-    if l.signatureVerifier != nil {
-        if err := l.signatureVerifier.Verify(path); err != nil {
-            return nil, fmt.Errorf("signature verification failed: %w", err)
+    waitErr      error
+    closeOnce    sync.Once
+    closeErr     error
+    cleanupOnce  sync.Once
+}
+
+func (c *RPCClient) WaitErr() error {
+    <-c.Exited
+    return c.waitErr
+}
+
+func (c *RPCClient) CloseTransport() error {
+    c.closeOnce.Do(func() {
+        if c.rpc != nil {
+            c.closeErr = c.rpc.Close()
+        }
+    })
+    return c.closeErr
+}
+
+func (c *RPCClient) Health(ctx context.Context) (HealthResponse, error) {
+    return c.rpc.Health(ctx)
+}
+
+func (c *RPCClient) Stop(ctx context.Context) error {
+    return c.rpc.Stop(ctx)
+}
+
+func (c *RPCClient) InvokeTool(ctx context.Context, req ToolRequest) (ToolResponse, error) {
+    return c.rpc.InvokeTool(ctx, req)
+}
+
+func (c *RPCClient) CleanupEndpoint() {
+    c.cleanupOnce.Do(func() {
+        if c.cleanup != nil {
+            c.cleanup()
+        }
+    })
+}
+
+func (c *RPCClient) KillAndWait() error {
+    var killErr error
+    if c.cmd != nil && c.cmd.Process != nil {
+        if err := c.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+            killErr = err
         }
     }
-
-    // 3. 打开共享库
-    so, err := plugin.Open(path)
-    if err != nil {
-        return nil, fmt.Errorf("failed to open plugin: %w", err)
-    }
-
-    // 4. 查找 Plugin 工厂符号
-    sym, err := so.Lookup("Plugin")
-    if err != nil {
-        return nil, fmt.Errorf("Plugin symbol not found: %w", err)
-    }
-
-    factory, ok := sym.(PluginFactory)
-    if !ok {
-        return nil, fmt.Errorf("Plugin symbol is not a valid PluginFactory")
-    }
-
-    // 5. 实例化插件
-    p := factory()
-
-    // 6. 版本兼容检查
-    if l.versionChecker != nil {
-        if err := l.versionChecker.Check(p.Version()); err != nil {
-            return nil, fmt.Errorf("version incompatible: %w", err)
-        }
-    }
-
-    return p, nil
+    <-c.Exited
+    return killErr
 }
+
+func (c *RPCClient) Terminate() error {
+    transportErr := c.CloseTransport()
+    killErr := c.KillAndWait()
+    c.CleanupEndpoint()
+    return errors.Join(transportErr, killErr)
+}
+
+func (l *Loader) Discover() (descriptors []PluginDescriptor, diagnostics []DiscoveryDiagnostic)
+func (l *Loader) Start(ctx context.Context, d PluginDescriptor, cfg map[string]any) (*RPCClient, error)
 ```
 
-## 签名验证
+`NewLoader` 以主配置目录解析、去重 `plugins.paths` 并固定 RPC major；nil logger、空配置目录或无法规范化的搜索路径直接返回错误。`Discover` 只返回完整且 ID 唯一的 Descriptor。无法解析出 ID 的 Manifest 错误使用空 `PluginID` diagnostic，不产生 Entry；已经解析出 ID 后发现 entry、版本或 config 错误时，diagnostic 同时携带 ID 和部分 Descriptor，Manager 为该 ID 建立 `error` Entry。重复 ID 的所有 Descriptor 都从成功结果移除，并各自产生同 ID diagnostic，不能由路径顺序决定胜者。
 
-为防止恶意插件加载，Yaa! 支持对插件文件进行数字签名验证。
+## 3. 启动
 
 ```go
-package plugin
-
-import (
-    "crypto/ed25519"
-    "crypto/sha256"
-    "io"
-    "os"
-)
-
-// SignatureVerifier 签名验证器
-type SignatureVerifier struct {
-    publicKey ed25519.PublicKey
-    enabled   bool
-}
-
-// Verify 验证插件文件签名
-func (sv *SignatureVerifier) Verify(path string) error {
-    if !sv.enabled {
-        return nil // 签名验证未启用，跳过
+func (l *Loader) Start(ctx context.Context, d PluginDescriptor, cfg map[string]any) (*RPCClient, error) {
+    if err := validateDescriptor(d, l.protocolVersion); err != nil {
+        return nil, err
+    }
+    if err := validateJSONSchema(d.Manifest.ConfigSchema, cfg); err != nil {
+        return nil, fmt.Errorf("%w: %v", ErrPluginConfigInvalid, err)
     }
 
-    // 读取插件文件
-    file, err := os.Open(path)
+    endpoint, cleanup, err := allocateLocalEndpoint(d.Manifest.ID)
     if err != nil {
-        return err
+        return nil, fmt.Errorf("allocate plugin endpoint: %w", err)
     }
-    defer file.Close()
-
-    // 计算哈希
-    hasher := sha256.New()
-    if _, err := io.Copy(hasher, file); err != nil {
-        return err
-    }
-    hash := hasher.Sum(nil)
-
-    // 读取签名文件（.sig）
-    sigPath := path + ".sig"
-    sig, err := os.ReadFile(sigPath)
+    nonce, err := newStartupNonce(32) // crypto/rand + base64.RawURLEncoding
     if err != nil {
-        return fmt.Errorf("signature file not found: %w", err)
+        cleanup()
+        return nil, fmt.Errorf("generate plugin nonce: %w", err)
+    }
+    if ctx.Err() != nil {
+        cleanup()
+        return nil, context.Cause(ctx)
     }
 
-    // 验证签名
-    if !ed25519.Verify(sv.publicKey, hash, sig) {
-        return fmt.Errorf("invalid plugin signature")
+    // startup ctx 只约束启动协议；长期进程不能绑定 CommandContext。
+    cmd := exec.Command(d.EntryPath, "--yaa-plugin-endpoint", endpoint)
+    cmd.Dir = filepath.Dir(d.EntryPath)
+    cmd.Env = append(filteredPluginEnv(), "YAA_PLUGIN_STARTUP_NONCE="+nonce)
+    if err := cmd.Start(); err != nil {
+        cleanup()
+        return nil, fmt.Errorf("%w: %v", ErrPluginProcessStart, err)
     }
 
-    return nil
+    exited := make(chan struct{})
+    client := &RPCClient{cmd: cmd, Exited: exited, cleanup: cleanup}
+    go func() {
+        client.waitErr = cmd.Wait() // cmd.Start 成功后唯一的 Wait owner。
+        close(exited)
+    }()
+
+    rpc, err := DialPlugin(ctx, endpoint)
+    if err != nil {
+        _ = client.Terminate()
+        return nil, fmt.Errorf("%w: %v", ErrPluginConnectionTimeout, err)
+    }
+    client.rpc = rpc
+
+    fail := func(err error) (*RPCClient, error) {
+        _ = client.Terminate()
+        return nil, err
+    }
+    hello, err := rpc.Handshake(ctx, "1", d.Manifest.ID)
+    if err != nil {
+        return fail(err)
+    }
+    if hello.PluginID != d.Manifest.ID || hello.PluginVersion != d.Manifest.Version ||
+        hello.ProtocolVersion != "1" ||
+        subtle.ConstantTimeCompare([]byte(hello.StartupNonce), []byte(nonce)) != 1 {
+        return fail(ErrPluginProtocolIncompatible)
+    }
+    if err := rpc.Init(ctx, cfg); err != nil {
+        return fail(fmt.Errorf("%w: %v", ErrPluginInitFailed, err))
+    }
+    ready, err := rpc.Ready(ctx)
+    if err != nil {
+        return fail(fmt.Errorf("%w: %v", ErrPluginInitFailed, err))
+    }
+    if err := matchCapabilities(d.Manifest.Provides, ready.Capabilities); err != nil {
+        return fail(err)
+    }
+    client.Capabilities = ready.Capabilities
+    return client, nil
 }
 ```
 
-## 版本兼容检查
+调用方用 `plugins.startup_timeout` 创建 ctx；该 ctx 只覆盖 exec、Dial、Handshake、Init 和 Ready，返回成功后 cancel 不得终止进程。`cmd.Start` 成功后立即创建 `RPCClient` 并启动唯一 `cmd.Wait` goroutine；因此 Dial/Handshake/Init/Ready 任一失败都只调用 `Terminate()`，不得自行 Kill/Wait。`Terminate` 先幂等关闭 transport，再 Kill（已退出视为成功）、等待 `Exited`，最后 cleanup endpoint。成功路径只启动一个 Wait goroutine，并在写入 `waitErr` 后关闭只读 `Exited <-chan struct{}`；多个 waiter 可等待 channel close，再调用 `WaitErr()` 读取同一结果，Manager 不得再次调用 Wait。底层 `pluginRPC`、`cmd` 和 cleanup 都是私有字段；Loader 只在 Client 尚未发布的构造阶段借用刚注入的 `pluginRPC` 完成 Handshake/Init/Ready，发布后 Manager 和 Proxy 只能使用 `RPCClient` 的转发及幂等生命周期方法，不能绕过 `CloseTransport`。
 
-Yaa! 使用语义化版本（Semantic Versioning）进行兼容性检查。
+## 4. 平台
 
-```go
-package plugin
+| 平台 | endpoint |
+|------|----------|
+| Linux/macOS | 临时目录中的 Unix Socket，目录/文件仅当前用户可访问 |
+| Windows 7 | 随机 loopback TCP 端口；32-byte startup nonce 只经子进程环境传入并在 HandshakeResponse 回显验证 |
 
-import (
-    "fmt"
-    "strings"
-)
+每次启动和重启都生成新 nonce，Unix 也执行同一验证；nonce 不进入参数、配置、错误或日志。MVP 只允许 Runtime 自己启动的本机进程。远程 TCP、TLS、签名信任库和下载/安装协议不在 v1 范围；需要时先新增配置和威胁模型。
 
-// VersionChecker 版本兼容检查器
-type VersionChecker struct {
-    minVersion string // 最低支持版本
-    maxVersion string // 最高支持版本（可选）
-}
+## 5. 版本校验
 
-// Check 检查插件版本是否兼容
-func (vc *VersionChecker) Check(pluginVersion string) error {
-    cmp := compareVersions(pluginVersion, vc.minVersion)
-    if cmp < 0 {
-        return fmt.Errorf("plugin version %s is lower than required %s",
-            pluginVersion, vc.minVersion)
-    }
+- `protocol_version` 必须精确等于 RPC major `"1"`。
+- `version` 与 `requires_runtime` 使用 SemVer parser，不用字符串比较。
+- Dependency range 在 Manager 拓扑排序前校验。
+- Manifest 和 Ready capabilities 必须集合相等，type/name/description/schema 不得漂移。
 
-    if vc.maxVersion != "" {
-        cmp = compareVersions(pluginVersion, vc.maxVersion)
-        if cmp > 0 {
-            return fmt.Errorf("plugin version %s is higher than maximum %s",
-                pluginVersion, vc.maxVersion)
-        }
-    }
+---
 
-    return nil
-}
-
-// compareVersions 比较两个语义化版本号
-func compareVersions(a, b string) int {
-    pa := strings.Split(a, ".")
-    pb := strings.Split(b, ".")
-    for i := 0; i < 3; i++ {
-        va := atoiSafe(pa[i])
-        vb := atoiSafe(pb[i])
-        if va < vb {
-            return -1
-        } else if va > vb {
-            return 1
-        }
-    }
-    return 0
-}
-```
-
-## 加载失败处理
-
-| 错误类型 | 错误原因 | 处理策略 |
-|---------|---------|---------|
-| `FileNotFound` | 插件文件路径不存在 | 返回错误，记录日志，跳过加载 |
-| `SignatureInvalid` | 签名验证失败 | 拒绝加载，记录安全告警 |
-| `OpenFailed` | `plugin.Open` 失败 | 检查 Go 版本兼容性，提示重新编译 |
-| `SymbolNotFound` | 未找到 `Plugin` 导出符号 | 提示插件代码不符合规范 |
-| `TypeMismatch` | 工厂函数类型不匹配 | 提示插件接口版本不一致 |
-| `VersionIncompatible` | 插件版本不在兼容范围 | 提示升级或降级插件 |
-| `InitFailed` | 插件 `Init()` 返回错误 | 记录错误，标记为加载失败 |
-
-### 错误处理示例
-
-```go
-func (l *Loader) LoadWithRetry(path string, maxRetries int) (Plugin, error) {
-    var lastErr error
-    for i := 0; i < maxRetries; i++ {
-        p, err := l.Load(path)
-        if err == nil {
-            if initErr := p.Init(ctx); initErr != nil {
-                lastErr = fmt.Errorf("plugin init failed: %w", initErr)
-                continue
-            }
-            return p, nil
-        }
-        lastErr = err
-
-        // 不可恢复的错误，直接返回
-        if isFatalError(err) {
-            return nil, err
-        }
-        time.Sleep(time.Duration(i+1) * time.Second)
-    }
-    return nil, fmt.Errorf("load failed after %d retries: %w", maxRetries, lastErr)
-}
-
-func isFatalError(err error) bool {
-    switch {
-    case strings.Contains(err.Error(), "signature"):
-        return true
-    case strings.Contains(err.Error(), "version"):
-        return true
-    default:
-        return false
-    }
-}
-```
-
-## 平台兼容性说明
-
-| 平台 | 共享库格式 | 支持状态 | 备注 |
-|------|-----------|---------|------|
-| Linux | `.so` | ✅ 原生支持 | Go `plugin` 标准包 |
-| macOS | `.so` | ✅ 原生支持 | Go `plugin` 标准包 |
-| Windows | `.dll` | ⚠️ 实验性 | 需 Go 1.23+ 或第三方方案 |
-| FreeBSD | `.so` | ✅ 原生支持 | Go `plugin` 标准包 |
-
-> **注意**：Go plugin 要求宿主程序与插件使用相同的 Go 版本和依赖版本编译，否则会触发 `plugin was built with a different version of package` 错误。Yaa! 建议在 CI/CD 流程中统一编译插件。
+*最后更新: 2025-07-17*

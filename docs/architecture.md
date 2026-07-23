@@ -57,12 +57,12 @@
 │                           │                                  │
 │  ┌────────────────────────┴───────────────────────────────┐  │
 │  │                   Planner Layer                         │  │
-│  │  Task 分解 / 执行计划 / 步骤编排                           │  │
+│  │  单 turn 计划生成 / DAG 校验 / 步骤执行                     │  │
 │  └────────────────────────┬───────────────────────────────┘  │
 │                           │                                  │
 │  ┌──────────┬──────────┬───┴────┬──────────┬───────────────┐  │
 │  │  Tool    │  Skill   │ Memory │   MCP    │   Plugin     │  │
-│  │ Registry │ Registry │ System │  Client  │   Manager    │  │
+│  │ Manager  │ Manager  │ System │  Client  │   Manager    │  │
 │  │          │          │        │  Server  │              │  │
 │  └──────────┴──────────┴────────┴──────────┴───────────────┘  │
 │                           │                                  │
@@ -73,7 +73,7 @@
 │                                                              │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
 │  │   Config      │  │   Storage    │  │     Auth         │   │
-│  │  (YAML/TOML)  │  │ (SQLite/BBolt)│  │  (Token/Policy) │   │
+│  │  (YAML/TOML)  │  │(SQLite/Memory)│  │  (Token/Policy) │   │
 │  └──────────────┘  └──────────────┘  └──────────────────┘   │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -94,14 +94,18 @@ Runtime 是整个系统的根容器，负责：
 
 ```go
 type Runtime struct {
-    Config    *config.Config
+    Config    *config.ReloadManager
     Agents    *agent.Manager
     Sessions  *session.Manager
+    Context   *ctxwindow.Manager
     Tools     *tool.Manager
     Skills    *skill.Manager
     Providers *provider.Manager
-    Memory    memory.Memory
+    Memory    *memory.Manager
+    AuthN     auth.Authenticator
+    AuthZ     auth.Authorizer
     MCP       *mcp.Manager
+    Plugins   *plugin.Manager
     Storage   storage.Storage
     API       *api.Server
 }
@@ -110,64 +114,63 @@ type Runtime struct {
 **初始化顺序：**
 
 ```text
-Config → Storage → Provider → Memory → Tool → Skill → MCP →
-Session → Context → Planner → Agent → Auth → API → Runtime Ready
+Config.Load（一次）→ ReloadManager bootstrap → Storage → Provider → Memory →
+Tool builtins → Plugin → MCP.Prepare（上游 Proxy + 本地 listener，不 Serve）→ Skill →
+Config.Activate(binding) → MCP.Activate（本地 Serve）→ Session Restore →
+Context → Agent（含每 Agent Planner）→ Auth → API →
+Config Watcher → Runtime Ready
 ```
+
+bootstrap 到 `Config.Activate` 始终使用同一个不可变 snapshot；不得再次读取配置文件。Activate 前不启动 MCP Serve、watcher、Config Tool、Remote listener 或 Agent turn。任一步失败，Runtime 立即标记 Not Ready，并按已成功启动组件的逆序执行 rollback；所有进程 Kill 后必须 Wait，所有 goroutine 必须有 cancel + WaitGroup，关闭错误用 `errors.Join` 聚合后返回最早的启动错误。Runtime readiness 是关键组件状态的动态 AND，并在 health/request gate 每次读取，其中必须包含 `MCP.Ready()`；本地 MCP Serve 运行期异常因此立即进入 Not Ready，无需另建一套缓存状态。
+
+正常关闭顺序固定为：先原子标记 Not Ready，停止 watcher 和 API 接入，再调用 `Agent.Quiesce()` 只拒绝新 turn；`Session.Shutdown(ctx)` 在统一 deadline 内 drain，超时才取消运行 turn并等待 runner 退出，随后 `Agent.Shutdown(ctx)` 收拢异常残留。之后按依赖逆序关闭 MCP、Plugin、Tool、Memory、Provider 和根 Storage。`MCP.Stop(ctx)` 或 `Plugin.StopAll(ctx)` 即使因 caller deadline 先返回，Runtime 仍必须等待对应 `Done()`；MCP 再用 `Stop(context.Background())`、Plugin 用 `WaitStopped()` 取得最终 teardown 结果后，才能关闭 Tool Manager。后台清理不得越过 owner 顺序。无生命周期资源的 Auth、Context、Skill 和 Planner snapshot 只解除引用。每个 owner 只关闭自己的资源一次。入口使用 `signal.NotifyContext(..., os.Interrupt)`；Windows 7 不依赖 `SIGTERM`。
 
 ---
 
 ### 3.2 Agent
 
-Agent 是系统核心抽象，代表一个具备能力的智能体实例。
-
-```go
-type Agent struct {
-    ID          string
-    Name        string
-    ProviderID  string          // 绑定的 LLM Provider
-    SystemPrompt string
-    Tools       []string        // 可用 Tool 列表
-    Skills      []string        // 可用 Skill 列表
-    Memory      memory.Memory   // 记忆系统
-    Session     *session.Session // 当前会话
-}
-```
-
-**Agent 生命周期：**
+Agent 是系统核心抽象和唯一 turn 编排 owner。权威类型、Manager API、Provider/Tool loop、流式 accumulator、Planner 绑定和取消契约见 [Agent 执行契约](agent.md)。Agent 由 `agents[]` 配置创建，`AgentConfig.id` 是唯一 ID；v1 不通过 Remote API新增、修改或删除配置。Manager 只维护运行态：
 
 ```text
-Created → Configured → Running → Paused → Stopped → Destroyed
+stopped ── start ──> running ── pause ──> paused
+   ^                    |                    |
+   └────── stop ────────┴────── stop ───────┘
 ```
 
-一个 Runtime 可以管理多个 Agent 实例，每个 Agent 可以：
+一个 Runtime 可以管理多个 Agent 实例，每个 Agent：
 - 绑定不同的 Provider
 - 拥有不同的 Tool / Skill 集合
-- 维护独立的 Session 和 Memory
-- 拥有不同的 System Prompt 和权限
+- 以 AgentID 隔离自己的 Session 和 Memory scope；Manager/基础设施由 Runtime 共享
+- 拥有不同的 System Prompt、权限和可选 Planner/Executor
+- 只通过 `session.Manager.RunTurn` 执行完整 turn；Remote 和其他模块不能复制执行循环
 
 ---
 
 ### 3.3 Session
 
-Session 管理一次完整的交互上下文。
+Session 管理一次完整的交互上下文；权威字段、状态机、snapshot 和错误见 [Session 文档](session/README.md)。
 
 ```go
 type Session struct {
-    ID        string
-    AgentID   string
-    Messages  []Message        // 消息历史
-    State     SessionState     // Created / Active / Paused / Closed
-    CreatedAt time.Time
-    UpdatedAt time.Time
-    Metadata  map[string]any   // 自定义元数据
+    ID             string
+    AgentID        string
+    State          session.State
+    CreatedAt      time.Time
+    UpdatedAt      time.Time
+    LastActivityAt time.Time
+    Messages       []session.SessionMessage
+    Metadata       map[string]any
+    Policy         config.SessionPolicy
+    SchemaVersion  int
 }
 ```
 
 **特性：**
 - 一个 Agent 可以有多个并发 Session
 - Session 之间状态隔离
-- Session 可持久化，重启后恢复
-- 支持通过 Remote API 创建、查询、恢复、关闭 Session
+- `persist=true` 时通过根 `storage.Storage` 同步保存 `session:<id>` snapshot；恢复前 Runtime 不 Ready
+- 同一 Session 的完整 turn 进入 FIFO gate；不同 Session 并行
+- Close 保留历史，DELETE 才是物理删除；Remote API 语义见 [Session API](remote-api/session.md)
 
 ---
 
@@ -176,67 +179,23 @@ type Session struct {
 Context 负责管理传给 LLM 的上下文窗口。
 
 **核心职责：**
-- 收集 System Prompt + Session 消息 + Memory 摘要 + Tool 结果
-- 根据目标 Provider 的 Token 限制进行截断或压缩
-- 支持多种策略：滑动窗口、摘要压缩、重要性排序
+- 接收 Agent 已组装的完整 `provider.ChatRequest`
+- 根据目标 Model 的硬窗口和 Effective Context Config 估算输入
+- 按 `hybrid`、`truncate` 或 `reject` 处理旧完整 unit
 
-```go
-type ContextManager interface {
-    Build(session *session.Session, opts ...ContextOption) (*Context, error)
-    Compress(ctx *Context) (*Context, error)
-    Truncate(ctx *Context, maxTokens int) (*Context, error)
-}
-```
+Runtime 与 Agent 直接持有 `*ctxwindow.Manager`。v1 只有一个实现，不额外声明单实现接口；`BuildInput`、`BuildOutput` 和错误契约见 [Context Manager](context/manager.md)。
 
 ---
 
 ### 3.5 Planner
 
-Planner 负责将复杂任务分解为可执行步骤。
-
-```go
-type Planner interface {
-    Plan(ctx context.Context, task string, agent *agent.Agent) (*Plan, error)
-}
-
-type Plan struct {
-    Steps []Step
-}
-
-type Step struct {
-    ID       string
-    Action   string          // tool call / skill call / llm call
-    Input    map[string]any
-    Depends  []string        // 依赖的前置步骤
-    Status   StepStatus      // Pending / Running / Done / Failed / Skipped
-}
-```
-
-**默认实现：** 简单的 LLM 驱动规划器，通过 Prompt 让模型输出执行计划。
+Planner 是可选的单 turn 前置步骤：把复杂输入生成临时 Plan，由 Executor 在当前 Session FIFO turn 内执行。Plan 不写入 Session snapshot、不跨重启恢复，也没有独立 Remote API。权威类型、DAG 校验和失败语义见 [Planner 文档](planner/README.md)。
 
 ---
 
 ### 3.6 Memory
 
-Memory 系统管理 Agent 的记忆。
-
-```go
-type Memory interface {
-    Add(key string, content string, metadata map[string]any) error
-    Get(key string) (*MemoryItem, error)
-    Search(query string, limit int) ([]*MemoryItem, error)
-    Delete(key string) error
-    Clear() error
-}
-```
-
-**分层设计：**
-
-| 层级 | 说明 | 存储方式 |
-|------|------|----------|
-| Short-term | 当前 Session 的消息历史 | 内存 / Storage |
-| Long-term | 跨 Session 的持久记忆 | SQLite / 向量数据库 |
-| Summary | Session 的摘要记忆 | Storage |
+Memory 是 Runtime 共享 Manager 上按 AgentID 隔离的 long-term ContentStore；权威模型、`PutResult`、检索排序、TTL 和 degraded 语义见 [Memory 文档](memory/README.md)。Session 自己拥有完整消息历史，Session Close/Delete 不触发 Memory 写入或删除。Agent 在 Context Build 前先检索并格式化 Memory；只有显式 Put/Promote 会提交内容。
 
 ---
 
@@ -248,17 +207,17 @@ Tool 是 Agent 可以调用的原子能力。
 type Tool interface {
     Name() string
     Description() string
-    Parameters() ToolSchema      // JSON Schema
-    Execute(ctx context.Context, params map[string]any) (ToolResult, error)
+    Parameters() json.RawMessage // JSON Schema object
+    Execute(ctx context.Context, scope ExecutionScope, params map[string]any) (ToolResult, error)
 }
 ```
 
 **特性：**
 - 统一接口，基于 JSON Schema 描述参数
-- 自动注册与发现（文件系统扫描 / 配置声明）
+- builtin、Plugin Proxy 和 MCP Proxy 按固定启动顺序注册
 - 支持权限控制（哪些 Agent 可用哪些 Tool）
 - 内置 Tool：Shell、HTTP、File
-- 可通过插件或配置扩展
+- 可通过 Plugin RPC 或 MCP 扩展
 
 ---
 
@@ -280,7 +239,7 @@ type Skill struct {
 - 以文件形式组织（类似 PicoClaw 的 Skill）
 - 包含 SKILL.md 描述文件 + 可选脚本/资源
 - Runtime 启动时自动扫描加载
-- Skill 可以嵌套调用
+- Skill 依赖只在启动时展开为确定顺序的 Prompt，不产生运行时嵌套调用
 
 ---
 
@@ -296,9 +255,11 @@ Yaa! 原生支持 MCP (Model Context Protocol)。
 | MCP Server | 将 Yaa! 的能力通过 MCP 协议暴露给其他 MCP Client |
 
 **支持的传输：**
-- stdio
-- SSE
-- WebSocket
+- `stdio`
+- `streamable_http`（MCP 2025-03-26）
+- `sse`（仅兼容 MCP 2024-11-05 legacy Server）
+
+WebSocket 只属于 Yaa! Remote API，不是 MCP transport。
 
 ---
 
@@ -312,6 +273,7 @@ type Provider interface {
     Type() string
     Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error)
     StreamChat(ctx context.Context, req *ChatRequest) (<-chan ChatChunk, error)
+    EstimateInputTokens(ctx context.Context, req *ChatRequest) (int, error)
     Models() []ModelInfo
     Close() error
 }
@@ -320,7 +282,7 @@ type Provider interface {
 **特性：**
 - 统一请求/响应类型，屏蔽各厂商差异
 - 支持流式输出
-- 支持自动重试与故障转移
+- 在首次响应前对明确可重试错误执行有限重试；v1 不做多区域或多 Provider failover
 - 通过配置注册，无需修改代码
 - Provider Manager 统一管理，支持按名称路由
 
@@ -328,62 +290,17 @@ type Provider interface {
 
 ### 3.11 Remote API
 
-Remote API 是外部客户端与 Runtime 交互的唯一通道。
+Remote API 是外部进程与 Runtime 交互的统一通道；嵌入式 Go 调用可以直接使用 Runtime/Manager API。
 
 **默认协议：**
 
 | 协议 | 用途 |
 |------|------|
-| HTTP REST | 请求-响应模式（创建 Agent、查询状态、管理配置） |
+| HTTP REST | 请求-响应模式（查询配置、管理 Session/Memory 和运行态） |
 | WebSocket | 双向实时通信（对话、流式输出、事件推送） |
 | SSE | 单向流式推送（流式输出、日志、状态变更） |
 
-**核心端点设计：**
-
-```text
-# Agent 管理
-POST   /api/v1/agents                    # 创建 Agent
-GET    /api/v1/agents                    # 列出 Agent
-GET    /api/v1/agents/:id                 # 获取 Agent 详情
-PUT    /api/v1/agents/:id                 # 更新 Agent 配置
-DELETE /api/v1/agents/:id                # 删除 Agent
-
-# Session 管理
-POST   /api/v1/agents/:id/sessions       # 创建 Session
-GET    /api/v1/agents/:id/sessions       # 列出 Session
-GET    /api/v1/sessions/:id               # 获取 Session 详情
-DELETE /api/v1/sessions/:id               # 关闭 Session
-
-# 对话
-POST   /api/v1/sessions/:id/messages     # 发送消息（非流式）
-WS     /api/v1/sessions/:id/stream       # 流式对话（WebSocket）
-GET    /api/v1/sessions/:id/events        # 事件流（SSE）
-
-# Tool
-GET    /api/v1/tools                     # 列出可用 Tool
-POST   /api/v1/tools/:name/execute        # 直接调用 Tool
-
-# Skill
-GET    /api/v1/skills                    # 列出可用 Skill
-
-# Provider
-GET    /api/v1/providers                  # 列出已注册 Provider
-GET    /api/v1/providers/:id/models       # 列出可用模型
-
-# Memory
-GET    /api/v1/agents/:id/memory          # 查询记忆
-POST   /api/v1/agents/:id/memory          # 写入记忆
-DELETE /api/v1/agents/:id/memory/:key     # 删除记忆
-
-# MCP
-GET    /api/v1/mcp/servers                # 列出 MCP Server
-POST   /api/v1/mcp/servers                # 注册 MCP Server
-
-# 系统
-GET    /api/v1/health                     # 健康检查
-GET    /api/v1/version                    # 版本信息
-GET    /api/v1/config                     # 获取运行时配置
-```
+`remote-api/INDEX.md` 是路由、权限和 envelope 的唯一清单。v1 的 Agent、Provider、Tool、Skill 与 MCP 配置均来自 Config；Remote API 对它们只提供读取和 Agent 运行态操作，不提供第二套动态配置存储。
 
 **未来扩展协议：**
 - gRPC
@@ -405,7 +322,7 @@ runtime:
     path: ./data/yaa.db
   api:
     http:
-      addr: ":8080"
+      addr: "127.0.0.1:8080"
     ws:
       enabled: true
     sse:
@@ -414,7 +331,8 @@ runtime:
     enabled: true
     tokens:
       - name: "default"
-        token: "yaat-xxxxx"
+        token: "${YAA_AUTH_TOKEN}"
+        roles: ["admin"]
 
 agents:
   - id: "default"
@@ -432,7 +350,7 @@ providers:
     type: "openai"
     api_key: "${OPENAI_API_KEY}"
     base_url: "https://api.openai.com/v1"
-  
+
   - id: "ollama"
     type: "ollama"
     base_url: "http://localhost:11434"
@@ -443,21 +361,28 @@ mcp:
       command: "npx"
       args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
       transport: "stdio"
+  server:
+    enabled: false
+    agent_id: "default"
 
 tools:
   builtin:
     shell:
       enabled: true
       timeout: 30s
+      options:
+        allowed_commands: []
     http:
       enabled: true
+      options:
+        max_response_bytes: 1048576
 ```
 
 **特性：**
 - 配置文件 + 环境变量 + 命令行参数，优先级递增
 - 支持配置热更新（文件监听）
 - 敏感信息支持环境变量引用 `${VAR_NAME}`
-- 配置校验与默认值合并
+- 配置校验与默认值注入
 
 ---
 
@@ -470,13 +395,13 @@ type Storage interface {
     Delete(key string) error
     Has(key string) (bool, error)
     Keys(prefix string) ([]string, error)
+    Close() error
 }
 ```
 
 **默认实现：** SQLite（零依赖，单文件，跨平台）
 
 **可选实现：**
-- BoltDB (bbolt)
 - 内存存储（测试用）
 
 ---
@@ -498,7 +423,19 @@ type Authorizer interface {
 **特性：**
 - Token 认证（静态 Token / JWT）
 - 基于角色的权限控制（RBAC）
-- 可配置不需要认证的端点（如 `/health`）
+- 可配置不需要认证的端点（如 `/api/v1/health`）
+
+---
+
+### 3.15 Plugin
+
+Plugin 是进程外 Tool 扩展机制。Runtime 在启动阶段读取 Manifest、启动独立插件进程，并通过版本化 RPC 协议注册稳定 Tool Proxy。Skill 仍由 SKILL.md 目录加载，可依赖 Plugin 提供的 Tool；Hook、Provider 和 Memory 不通过 v1 Plugin RPC 扩展。唯一 concrete API 分别见 [Plugin Loader](plugin/loader.md#2-路径与发现) 与 [Plugin Manager](plugin/manager.md#1-职责与状态)，本层不再声明一份会漂移的伪接口。
+
+**约束：**
+- 不使用 Go `plugin` 包，不把第三方代码加载进 Runtime 进程
+- 本版本只在 Runtime 启动阶段加载插件，不支持运行时热插拔
+- Unix 使用 Unix Socket；Windows 7 使用回环 TCP + 启动 nonce；v1 不支持远程 Plugin endpoint
+- Plugin RPC 与面向客户端的 Remote API 相互独立
 
 ---
 
@@ -514,41 +451,45 @@ Client
   ▼
 Remote API Server
   │
-  │  Auth → 路由 → Handler
-  │
-  ▼
-Session Manager
-  │
-  │  加载 Session → 追加用户消息
-  │
-  ▼
-Context Manager
-  │
-  │  构建 Context：System Prompt + 历史消息 + Memory + Tool 结果
-  │  → 截断/压缩至 Token 限制内
+  │  Auth → 路由 → Handler → Agent.Manager.HandleTurn
   │
   ▼
 Agent
   │
-  │  选择 Provider → 发送 Chat 请求
+  │  校验 Agent/Session 归属 → Session.Manager.RunTurn
+  │
+  ▼
+Session RunTurn FIFO callback
+  │
+  │  turn.AppendUser（同步 snapshot）→ 选择 Provider/Model
+  │  → 检索 Memory → 冻结 canonical Tool snapshot 与 turn-local alias 投影
+  │  → 深拷贝并投影 Provider wire ChatRequest → 解析 Effective Context Config
+  │
+  ▼
+Context Manager
+  │
+  │  估算完整请求 → hybrid/truncate/reject
+  │  → 确认 input tokens 不超过输入预算
   │
   ▼
 Provider Layer
   │
   │  转换为厂商格式 → 调用 API → 转换为统一格式
-  │  → 流式返回 ChatChunk
+  │  → 原样返回含 Provider alias 的 ChatResponse / ChatChunk
   │
   ▼
-Agent (Tool Loop)
+Agent (Tool Loop，仍在同一 RunTurn callback)
   │
   │  如果 LLM 返回 Tool Call：
-  │  → 执行 Tool → 将结果加入 Context → 再次调用 LLM
+  │  → 完整聚合并按冻结映射一次性反查为 canonical name
+  │  → 全批校验成功后并行执行 Tool → turn.Append 原子提交完整 Tool unit
+  │  → 重新 Build → 再次调用 LLM
   │  循环直到 LLM 返回最终文本
   │
   ▼
-Session Manager
+session.Turn
   │
-  │  追加助手消息 → 持久化 Session
+  │  turn.Append final assistant → 持久化 Session
   │
   ▼
 Remote API Server
@@ -561,7 +502,10 @@ Client
 ### 4.2 Tool 执行流程
 
 ```text
-LLM 返回 Tool Call
+LLM 返回完整 Provider Tool Call
+  │
+  ▼
+Agent 按 turn-local 映射全批反查 canonical name
   │
   ▼
 Tool Executor
@@ -569,32 +513,32 @@ Tool Executor
   │  1. 权限检查（Agent 是否有权调用该 Tool）
   │  2. 参数校验（JSON Schema）
   │  3. 执行 Tool
-  │  4. 返回结果
+  │  4. 按 tools.max_result_tokens 限制结果
   │
   ▼
-Context Manager
+Agent 持有的 session.Turn
   │
-  │  将 Tool 结果加入上下文
+  │  原子追加完整 assistant(tool_calls) + tool results
   │
   ▼
-Agent → 再次调用 LLM
+Agent → turn.Snapshot → Context Manager.Build → 再次调用 LLM
 ```
 
 ### 4.3 Skill 调用流程
 
 ```text
-LLM 决定使用 Skill（通过 Prompt 引导）
+Runtime 启动绑定
   │
   ▼
 Skill Manager
   │
-  │  1. 加载 Skill 定义
-  │  2. 注入 Skill Prompt 到上下文
-  │  3. 确保 Skill 依赖的 Tool 可用
-  │  4. Agent 在 Skill 指导下调用 Tool 完成任务
+  │  加载、校验依赖并冻结每个 Agent 的 ResolvedSkill
   │
   ▼
-Agent 继续对话流程
+每个 turn：Agent 投影全部已绑定 Skill Prompt
+  │
+  ▼
+Context Manager.Build → 正常 Provider/Tool loop
 ```
 
 ---
@@ -634,15 +578,18 @@ Agent 继续对话流程
 | 领域 | 选型 | 理由 |
 |------|------|------|
 | 语言 | Go | 单一可执行文件、跨平台、并发模型、零运行时依赖 |
-| HTTP 框架 | 标准库 net/http 或轻量框架 | 最小依赖，Windows 兼容 |
-| WebSocket | gorilla/websocket 或 nhooyr/websocket | 成熟稳定 |
+| HTTP Server / Router | 标准库 `net/http` + `github.com/gorilla/mux` | Go 1.20 可用，显式 method/path route metadata |
+| WebSocket | `github.com/gorilla/websocket` | 与 `net/http` 集成成熟，支持 Go 1.20 |
 | 存储 | SQLite (modernc.org/sqlite) | 纯 Go 实现，零 CGO，Windows 友好 |
 | 配置 | YAML (gopkg.in/yaml.v3) | 人类友好，生态成熟 |
-| 日志 | slog（标准库） | Go 1.21+ 内置，零依赖 |
-| CLI | 标准库 flag 或 cobra | Runtime 不需要复杂 CLI |
+| 配置解码 | github.com/mitchellh/mapstructure | presence-aware 覆盖、未知字段与 duration hook |
+| JWT | github.com/golang-jwt/jwt/v5 | 固定算法并完整校验标准 Claims，避免手写验签 |
+| 日志 | `slog` 兼容 API | Go 1.20 构建使用固定版本的 `golang.org/x/exp/slog`；未来升级到标准库 `log/slog` |
+| CLI | 标准库 `flag` | Runtime 不需要子命令框架 |
 | 构建 | Makefile + Go cross-compile | 简单直接 |
 
 **关键约束：**
+- Go 工具链固定为 1.20.x；这是支持 Windows 7 的最后一个 Go 主版本
 - 零 CGO 依赖（保证 Windows 7 兼容与交叉编译）
 - 优先使用 Go 标准库
 - 外部依赖需要审慎评估
@@ -663,11 +610,10 @@ Agent 继续对话流程
 - 废弃字段保留但标记 `deprecated`
 - 配置迁移工具在启动时自动处理
 
-### 插件接口
+### 接口兼容
 
-- Tool / Provider / Plugin 接口变更需遵循 Go interface 兼容规则
-- 优先新增方法而非修改现有方法
-- 提供适配层处理不兼容变更
+- 向已有 Go interface 新增方法同样是破坏性变更；可选能力使用独立小接口，既有接口变更需升模块 major 或提供适配层
+- Plugin wire contract 只按 Protobuf 字段兼容规则演进；删除/复用字段或改变语义必须提升 RPC major
 
 ---
 
@@ -764,6 +710,11 @@ Agent 继续对话流程
 
 - **决策**：主推 YAML
 - **理由**：生态成熟、嵌套结构表达力强、用户熟悉度高；同时兼容 TOML/JSON
+
+### ADR-006: Plugin 统一采用进程外 RPC
+
+- **决策**：Plugin 以独立进程运行，通过版本化 gRPC 协议与 Runtime 通信
+- **理由**：隔离崩溃、避免 Go ABI 耦合，并覆盖 Windows 7；不支持运行时热插拔以降低状态复杂度
 
 ---
 
