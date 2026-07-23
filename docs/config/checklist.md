@@ -28,14 +28,13 @@
 
 ## 校验
 
-- [ ] `Validator` 结构体定义（rules, logger）
+- [ ] 无状态 `Validator` 结构体定义
 - [ ] `Validate()` 统一校验入口
 - [ ] 必填字段校验（缺失时 fatal）
 - [ ] 字段类型校验（int / bool / string / duration / url / filepath）
 - [ ] 枚举值校验（如 `log.level` 仅允许 debug/info/warn/error）
 - [ ] 范围校验（如 `min/max`、`port` 1-65535）
-- [ ] 依赖关系校验（如启用 TLS 时 `tls.cert` 和 `tls.key` 必填）
-- [ ] 互斥配置校验（如 `provider` 和 `providers` 不可同时使用）
+- [ ] 依赖关系校验（如非回环监听必须启用认证）
 - [ ] 语义校验（如 `max_agents` > 0、`timeout` > 0）
 - [ ] 校验错误聚合返回（收集所有错误，一次性报告）
 - [ ] 校验错误消息包含字段路径（如 `runtime.api.http.port: invalid value`）

@@ -62,16 +62,16 @@
 
 **影响：** 各模块持有 Effective Config 引用，热更新后需重新读取。
 
-### CF-006: 校验使用结构体 Tag + 自定义校验函数
+### CF-006: 校验使用无状态 Validator + 手写规则
 
-**决策：** 通过结构体 Tag（如 `validate:"required,min=1"`）声明字段约束，复杂规则用自定义函数补充。
+**决策：** 使用无状态 `Validator` 和按子配置拆分的手写 helper 执行基础校验，不在 DTO 上添加 `validate` Tag，也不引入第三方校验依赖。
 
 **理由：**
-- Tag 声明式校验简洁直观，覆盖大部分场景
-- 自定义函数处理跨字段依赖和业务规则
-- 使用成熟库（go-playground/validator）减少自研成本
+- 配置规则包含大量跨字段依赖、引用和两阶段边界，手写规则更直接
+- DTO 只保留序列化 Tag，避免同一约束分散在 Tag 和 helper 中
+- 基础校验只依赖标准库，错误路径、规则名和聚合顺序可精确控制
 
-**影响：** 配置结构体需定义完善 Tag，复杂逻辑集中在 Validator 模块。
+**影响：** 所有基础规则集中在 `internal/config` 的 Validator helper，并返回统一的结构化错误。
 
 ### CF-007: 默认值通过结构体初始化注入，不使用反射
 
@@ -104,7 +104,7 @@
 | CF-003 | `${VAR_NAME}` / `${VAR_NAME:-default}` | 简单性 > shell 兼容 |
 | CF-004 | 敏感信息只走环境变量 | 安全 > 便利 |
 | CF-005 | fsnotify + atomic.Value | 无锁 > 一致性锁 |
-| CF-006 | Tag + 自定义函数 | 声明式 + 命令式混合 |
+| CF-006 | 无状态 Validator + 手写 rules/helpers | 统一结构化错误与跨字段规则 |
 | CF-007 | 字面量初始化默认值 | 性能 + 可读性 > 反射灵活性 |
 | CF-008 | 版本化 + 迁移链 | 自动迁移 > 手动修改 |
 
@@ -129,7 +129,7 @@
 │  DecodeInto + CLI Flags                            │
 │    │                                             │
 │    ▼                                             │
-│  Validator (Tag + 自定义函数)                    │
+│  Validator (手写 rules + helpers)                │
 │    │                                             │
 │    ▼                                             │
 │  Effective Config (atomic.Value, 全局只读快照)   │

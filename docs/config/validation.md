@@ -243,6 +243,8 @@ if err := DecodeInto(raw, cfg); err != nil {
 校验错误使用结构化格式，包含路径、规则、消息，便于定位：
 
 ```go
+var ErrConfigValidationFailed = errors.New("config validation failed")
+
 // ValidationError 描述单个配置校验错误。
 type ValidationError struct {
     Path    string // 配置路径，如 "agents[0].provider"
@@ -266,7 +268,17 @@ func (errs ValidationErrors) Error() string {
     }
     return strings.Join(msgs, "\n")
 }
+
+func (errs ValidationErrors) Unwrap() error {
+    return ErrConfigValidationFailed
+}
+
+func add(errs *ValidationErrors, path, rule, message string) {
+    *errs = append(*errs, &ValidationError{Path: path, Rule: rule, Message: message})
+}
 ```
+
+`Validator.Validate` 返回 `nil` 或非空的 `ValidationErrors` 值；调用方可用 `errors.As` 读取全部结构化错误，并用 `errors.Is(err, ErrConfigValidationFailed)` 识别校验失败。返回前按 `Path`、`Rule`、`Message` 字典序稳定排序，禁止依赖 Map 遍历顺序。错误路径中数组统一使用 `[n]`；Config Tool 的点分隔索引不适用于错误路径。
 
 ### 3.4 校验器实现
 
@@ -277,6 +289,11 @@ type Validator struct{}
 // Validate 返回所有校验错误。返回 nil 表示配置合法。
 func (v *Validator) Validate(cfg *Config) error {
     var errs ValidationErrors
+
+    if cfg == nil {
+        add(&errs, "", "required", "config must not be nil")
+        return errs
+    }
 
     // --- 必填检查 ---
     if cfg.Runtime.Storage.Type == "" {
@@ -337,25 +354,21 @@ func (v *Validator) Validate(cfg *Config) error {
     }
 
     // --- HTTP/Auth 检查 ---
-    loopback := validateListenAddr(&errs, "runtime.api.http.addr", cfg.Runtime.API.HTTP.Addr)
-    validateAuthConfig(&errs, "runtime.auth", cfg.Runtime.Auth, loopback)
+    loopback, listenValid := validateListenAddr(&errs, "runtime.api.http.addr", cfg.Runtime.API.HTTP.Addr)
+    validateAuthConfig(&errs, "runtime.auth", cfg.Runtime.Auth, loopback, listenValid)
 
     // --- 引用检查 ---
     providerIDs := make(map[string]bool)
     for i, p := range cfg.Providers {
         path := fmt.Sprintf("providers[%d]", i)
         if p.ID == "" {
-            errs = append(errs, &ValidationError{
-                Path:    path + ".id",
-                Rule:    "required",
-                Message: "provider id must not be empty",
-            })
-            continue
+            add(&errs, path+".id", "required", "provider id must not be empty")
+        } else {
+            if providerIDs[p.ID] {
+                add(&errs, path+".id", "unique", "provider id must be unique")
+            }
+            providerIDs[p.ID] = true
         }
-        if providerIDs[p.ID] {
-            add(&errs, path+".id", "unique", "provider id must be unique")
-        }
-        providerIDs[p.ID] = true
         validateProviderConfig(&errs, path, p)
     }
 
@@ -364,10 +377,12 @@ func (v *Validator) Validate(cfg *Config) error {
         path := fmt.Sprintf("agents[%d]", i)
         if a.ID == "" {
             add(&errs, path+".id", "required", "agent id must not be empty")
-        } else if agentIDs[a.ID] {
-            add(&errs, path+".id", "unique", "agent id must be unique")
+        } else {
+            if agentIDs[a.ID] {
+                add(&errs, path+".id", "unique", "agent id must be unique")
+            }
+            agentIDs[a.ID] = true
         }
-        agentIDs[a.ID] = true
         if a.Name == "" {
             errs = append(errs, &ValidationError{
                 Path:    path + ".name",
@@ -403,6 +418,11 @@ func (v *Validator) Validate(cfg *Config) error {
     }
 
     if len(errs) > 0 {
+        sort.SliceStable(errs, func(i, j int) bool {
+            if errs[i].Path != errs[j].Path { return errs[i].Path < errs[j].Path }
+            if errs[i].Rule != errs[j].Rule { return errs[i].Rule < errs[j].Rule }
+            return errs[i].Message < errs[j].Message
+        })
         return errs
     }
     return nil
@@ -414,10 +434,13 @@ HTTP/Auth 和 Provider 的基础规则不得只写在表格或构造器里；统
 ```go
 import (
     "crypto/sha256"
+    "errors"
+    "fmt"
     "net"
     "net/url"
     "path"
     "regexp"
+    "sort"
     "strconv"
     "strings"
     "time"
@@ -496,7 +519,7 @@ func validateMCPConfig(errs *ValidationErrors, field string, c MCPConfig) {
     switch c.Server.Transport {
     case "stdio":
     case "sse", "streamable_http":
-        validateListenAddr(errs, field+".server.addr", c.Server.Addr)
+        _, _ = validateListenAddr(errs, field+".server.addr", c.Server.Addr)
         endpoint := c.Server.Path
         endpointField := field + ".server.path"
         if c.Server.Transport == "sse" {
@@ -513,25 +536,28 @@ func validateMCPConfig(errs *ValidationErrors, field string, c MCPConfig) {
     }
 }
 
-func validateListenAddr(errs *ValidationErrors, field, addr string) bool {
+func validateListenAddr(errs *ValidationErrors, field, addr string) (loopback bool, valid bool) {
     host, portText, err := net.SplitHostPort(addr)
     if err != nil {
         add(errs, field, "format", "must be host:port")
-        return false
+        return false, false
     }
     port, err := strconv.Atoi(portText)
     if err != nil || port < 1 || port > 65535 {
         add(errs, field, "range", "port must be in 1..65535")
+        valid = false
+    } else {
+        valid = true
     }
     if strings.EqualFold(host, "localhost") {
-        return true
+        return true, valid
     }
     ip := net.ParseIP(host)
-    return ip != nil && ip.IsLoopback()
+    return ip != nil && ip.IsLoopback(), valid
 }
 
-func validateAuthConfig(errs *ValidationErrors, field string, c AuthConfig, loopback bool) {
-    if !loopback && !c.Enabled {
+func validateAuthConfig(errs *ValidationErrors, field string, c AuthConfig, loopback, listenValid bool) {
+    if listenValid && !loopback && !c.Enabled {
         add(errs, field+".enabled", "dependency",
             "authentication must be enabled for non-loopback listen addresses")
     }

@@ -183,7 +183,7 @@ plugins.entries[*].config
 
 ### 3.4 配置路径
 
-配置路径使用点分隔的字符串表示法，用于 Config Tool 的 `path` 参数和校验错误定位。Remote `GET /api/v1/config` 始终返回完整视图，不接受 path 参数。
+Config Tool 的 `path` 参数使用点分隔字符串，数组索引也作为点分隔段；Remote `GET /api/v1/config` 始终返回完整视图，不接受 path 参数。`ValidationError` 和 Decode error 使用 canonical 错误路径：结构体与动态 Map 用点号，数组索引用 `[n]`，例如 `agents[0].model`。两种语法用途不同，不能混用。
 
 ```text
 runtime.storage.type           → "sqlite"
