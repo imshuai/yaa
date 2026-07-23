@@ -1,6 +1,6 @@
 # Binaries
-yaa
-yaa.exe
+/yaa
+/yaa.exe
 *.exe
 *.dll
 *.so
