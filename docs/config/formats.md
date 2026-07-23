@@ -24,6 +24,11 @@ const (
     FormatTOML Format = "toml"
 )
 
+var (
+    ErrConfigFormatUnsupported = errors.New("config: unsupported format")
+    ErrConfigParseFailed       = errors.New("config: parse failed")
+)
+
 func DetectFormat(path string) (Format, error) {
     switch strings.ToLower(filepath.Ext(path)) {
     case "", ".yaml", ".yml":
@@ -48,21 +53,21 @@ func ParseToMap(data []byte, format Format) (map[string]any, error) {
     switch format {
     case FormatYAML:
         if err := yaml.Unmarshal(data, &out); err != nil {
-            return nil, fmt.Errorf("parse yaml: %w", err)
+            return nil, fmt.Errorf("%w: yaml: %v", ErrConfigParseFailed, err)
         }
     case FormatJSON:
         dec := json.NewDecoder(bytes.NewReader(data))
         dec.UseNumber()
         if err := dec.Decode(&out); err != nil {
-            return nil, fmt.Errorf("parse json: %w", err)
+            return nil, fmt.Errorf("%w: json: %v", ErrConfigParseFailed, err)
         }
         var extra any
         if err := dec.Decode(&extra); err != io.EOF {
-            return nil, errors.New("parse json: multiple top-level values")
+            return nil, fmt.Errorf("%w: json: multiple top-level values", ErrConfigParseFailed)
         }
     case FormatTOML:
         if _, err := toml.Decode(string(data), &out); err != nil {
-            return nil, fmt.Errorf("parse toml: %w", err)
+            return nil, fmt.Errorf("%w: toml: %v", ErrConfigParseFailed, err)
         }
     default:
         return nil, fmt.Errorf("%w: %s", ErrConfigFormatUnsupported, format)
