@@ -280,7 +280,7 @@ mcp:
     exposed_tools: ["shell", "file_read"]
 ```
 
-根 Config Validator 负责 `exposed_tools` 的非空与唯一性；`Config.Activate(binding)` 在 Serve 前校验 `agent_id` 和每个 Tool 引用；`NewMCPServer` 构造时仍独立拒绝重复项，并确认每个 Tool 当前 enabled、存在且通过该 Agent allowlist。三层使用同一唯一性与权限契约，但构造防御不能替代根校验或 binding。`tools/call` 始终把这个固定 principal 传入 Tool Manager，再次执行权限、超时和审计检查。网络 transport 默认只绑定 loopback，并按 [`transport.md`](transport.md) 校验 Origin。
+根 Config Validator 负责 `exposed_tools` 每个条目非空且列表唯一；`Config.Activate(binding)` 在 Serve 前校验 `agent_id` 和每个 Tool 引用；`NewMCPServer` 构造时仍独立拒绝重复项，并确认每个 Tool 当前 enabled、存在且通过该 Agent allowlist。三层使用同一唯一性与权限契约，但构造防御不能替代根校验或 binding。`tools/call` 始终把这个固定 principal 传入 Tool Manager，再次执行权限、超时和审计检查。网络 transport 默认只绑定 loopback，并按 [`transport.md`](transport.md) 校验 Origin。
 
 ---
 

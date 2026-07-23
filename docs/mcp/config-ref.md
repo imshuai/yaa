@@ -90,13 +90,15 @@ MCP Server 配置定义在主配置文件的 `mcp.servers` 数组中，每个 Se
 | `enabled` | `bool` | `false` | 是否启动 Yaa! MCP Server |
 | `agent_id` | `string` | — | enabled 时必填；执行暴露 Tool 时使用的真实 Agent principal |
 | `transport` | `string` | `stdio` | `stdio` / `sse` / `streamable_http` |
-| `addr` | `string` | `127.0.0.1:9090` | 网络 transport 的监听地址；必须显式改为非回环地址 |
+| `addr` | `string` | `127.0.0.1:9090` | 网络 transport 的监听地址；v1 必须是 loopback |
 | `path` | `string` | `/mcp` | Streamable HTTP endpoint |
 | `messages_path` | `string` | `/message` | legacy SSE POST endpoint |
 | `exposed_tools` | `[]string` | `[]` | 允许暴露的完整 Tool 名称；空列表表示不暴露 |
-| `origin_allowlist` | `[]string` | `[]` | Streamable HTTP 精确 Origin 白名单；无 Origin 允许，有 Origin 时必须命中非空列表 |
+| `origin_allowlist` | `[]string` | `[]` | 唯一的精确 HTTP(S) Origin（无 path/query/fragment）；无 Origin 允许，有 Origin 时必须命中非空列表 |
 
-网络 Server 默认只绑定 loopback；绑定非回环地址时必须配合认证和 TLS/反向代理，并执行 Origin 校验。
+网络 Server 在 v1 只允许绑定 loopback 地址。需要对外暴露时，应让 MCP Server 绑定 loopback，再由独立的 TLS/认证反向代理对外提供服务；`runtime.auth` 不会自动保护这条独立 MCP listener。Streamable HTTP 仍执行精确 `Origin` 校验。
+
+`enabled: false` 只跳过启动，不跳过结构、枚举、地址、路径和 Origin allowlist 校验；这样重新启用时不会把坏配置带到运行期。
 
 ```yaml
 mcp:

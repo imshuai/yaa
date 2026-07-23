@@ -95,6 +95,14 @@
 
 **影响：** 每次破坏性配置变更需编写迁移函数并注册到迁移链。
 
+### CF-009: Planner Agent 覆盖使用稀疏 pointer DTO
+
+**决策：** 根 `planner` 使用完整 `PlannerConfig`，`agents[].planner` 使用字段均为 pointer 的 `PlannerOverride`。
+
+**理由：** 完整 DTO 的 Go 零值无法表达“字段未出现”和显式 `0` 的区别；presence-aware 解码要求显式零值进入校验，不能被合并器静默忽略。
+
+**影响：** `ResolvePlannerConfig` 只复制非 nil 字段；基础 Validator 校验合并后的完整 Planner。`model: ""` 可显式回退到 Agent model，`type: "disabled"` 仍是合法值。
+
 ### 决策总览
 
 | 编号 | 决策摘要 | 核心权衡 |
@@ -107,6 +115,7 @@
 | CF-006 | 无状态 Validator + 手写 rules/helpers | 统一结构化错误与跨字段规则 |
 | CF-007 | 字面量初始化默认值 | 性能 + 可读性 > 反射灵活性 |
 | CF-008 | 版本化 + 迁移链 | 自动迁移 > 手动修改 |
+| CF-009 | Planner 稀疏 pointer override | presence 正确性 > DTO 复用 |
 
 ---
 

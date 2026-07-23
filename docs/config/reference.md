@@ -100,7 +100,7 @@ type JWTConfig struct {
 | 字段 | 类型 | 默认值 | 热更新 | 说明 |
 |------|------|--------|:------:|------|
 | `type` | `string` | `"sqlite"` | ❌ | 存储后端类型：`sqlite` / `memory` |
-| `path` | `string` | `"./data/yaa.db"` | ❌ | 存储文件路径 |
+| `path` | `string` | `"./data/yaa.db"` | ❌ | SQLite 时必须非空；memory 后端忽略 |
 
 ### 2.2 runtime.api
 
@@ -130,9 +130,9 @@ type SSEConfig struct {
 | 字段 | 类型 | 默认值 | 热更新 | 说明 |
 |------|------|--------|:------:|------|
 | `http.addr` | `string` | `"127.0.0.1:8080"` | ❌ | HTTP 监听地址；非回环地址必须显式启用认证并配置凭据 |
-| `http.read_timeout` | `duration` | `30s` | ❌ | HTTP 读超时 |
-| `http.write_timeout` | `duration` | `30s` | ❌ | HTTP 写超时 |
-| `http.max_header_bytes` | `int` | `1048576` (1MB) | ❌ | HTTP 最大请求头 |
+| `http.read_timeout` | `duration` | `30s` | ❌ | HTTP 读超时，必须 `>0` |
+| `http.write_timeout` | `duration` | `30s` | ❌ | HTTP 写超时，必须 `>0` |
+| `http.max_header_bytes` | `int` | `1048576` (1MB) | ❌ | HTTP 最大请求头，必须 `>0` |
 | `ws.enabled` | `bool` | `true` | ❌ | 是否启用 WebSocket |
 | `sse.enabled` | `bool` | `true` | ❌ | 是否启用 SSE |
 
@@ -173,7 +173,7 @@ type AgentConfig struct {
     Memory       *MemoryOverride             `yaml:"memory"        json:"memory"`
     Session      *SessionOverride            `yaml:"session"       json:"session"`
     Context      *ContextOverride            `yaml:"context"       json:"context"`
-    Planner      *PlannerConfig              `yaml:"planner"       json:"planner"`
+    Planner      *PlannerOverride            `yaml:"planner"       json:"planner"`
     ToolsConfig  map[string]any              `yaml:"tools_config"  json:"tools_config"`
     SkillsConfig map[string]AgentSkillConfig `yaml:"skills_config" json:"skills_config"`
 }
@@ -182,6 +182,8 @@ type AgentSkillConfig struct {
     Options map[string]any `yaml:"options" json:"options"`
 }
 ```
+
+`PlannerOverride` 的完整字段定义与合并规则见 [Planner 配置参考](../planner/config-ref.md)；它不是 `PlannerConfig` 的零值副本。
 
 | 字段 | 类型 | 默认值 | 热更新 | 说明 |
 |------|------|--------|:------:|------|
@@ -197,7 +199,7 @@ type AgentSkillConfig struct {
 | `memory` | `*MemoryOverride` | `nil` | 见说明 | Agent 级 pointer override；字段、合并和重启边界见 [Memory 配置](../memory/config-ref.md) |
 | `session` | `*SessionOverride` | `nil` | ✅ | Agent 级 Session pointer override；只影响之后新建的 Session |
 | `context` | `*ContextOverride` | `nil` | ✅ | Agent 级 Context pointer override；省略字段继承根配置 |
-| `planner` | `*PlannerConfig` | `nil` | ❌ | Agent 级 Planner 配置覆盖；Planner/Executor 在启动时构造 |
+| `planner` | `*PlannerOverride` | `nil` | ❌ | Agent 级 Planner 稀疏覆盖；显式零值也参与校验，Planner/Executor 在启动时构造 |
 | `tools_config` | `map[string]any` | `{}` | ❌ | Agent 级 Tool 配置覆盖；结构在启动时校验并冻结 |
 | `skills_config` | `map[string]AgentSkillConfig` | `{}` | ❌ | Agent 级 Skill options 覆盖；key 必须同时出现在 `skills` 中 |
 
@@ -247,8 +249,8 @@ type ModelConfig struct {
 | `models[].context_window` | `int` | 无 | ❌ | 模型总 Context 窗口，必须 > 0 |
 | `models[].max_output` | `int` | 无 | ❌ | 模型最大输出 Token，必须 > 0 且小于窗口 |
 | `models[].supports_thinking` | `bool` | `false` | ❌ | 是否支持 Thinking |
-| `models[].thinking_efforts` | `[]string` | `[]` | ❌ | 支持的 effort 档位 |
-| `models[].min_thinking_budget` | `int` | `0` | ❌ | 最小 Thinking budget，0 表示无额外下限 |
+| `models[].thinking_efforts` | `[]string` | `[]` | ❌ | 唯一的 `low` / `medium` / `high` / `max` effort 档位；非空时必须支持 Thinking |
+| `models[].min_thinking_budget` | `int` | `0` | ❌ | `>=0`；非零时必须支持 Thinking，0 表示无额外下限 |
 | `extra` | `map[string]any` | `{}` | ❌ | 唯一允许的 Provider 特有扩展配置 |
 
 **各类型默认 `base_url`：**
@@ -331,11 +333,11 @@ type MCPReconnectConfig struct {
 | `server.enabled` | `bool` | `false` | ❌ | 是否启动 Yaa! MCP Server |
 | `server.agent_id` | `string` | — | ❌ | enabled 时必填；作为 Tool Manager 的真实 Agent principal |
 | `server.transport` | `string` | `stdio` | ❌ | `stdio` / `sse` / `streamable_http` |
-| `server.addr` | `string` | `127.0.0.1:9090` | ❌ | 网络 transport 监听地址 |
+| `server.addr` | `string` | `127.0.0.1:9090` | ❌ | 网络 transport 监听地址；v1 只允许 loopback |
 | `server.path` | `string` | `/mcp` | ❌ | Streamable HTTP endpoint |
 | `server.messages_path` | `string` | `/message` | ❌ | legacy SSE POST endpoint |
 | `server.exposed_tools` | `[]string` | `[]` | ❌ | 允许对外暴露的完整 canonical Tool 名称；不得重复 |
-| `server.origin_allowlist` | `[]string` | `[]` | ❌ | Streamable HTTP 精确 Origin 白名单 |
+| `server.origin_allowlist` | `[]string` | `[]` | ❌ | 唯一的精确 HTTP(S) Origin 白名单，不含 path/query/fragment |
 | `timeout.connect` | `duration` | `10s` | ❌ | 连接超时 |
 | `timeout.init` | `duration` | `15s` | ❌ | initialize 超时 |
 | `timeout.tool` | `duration` | `0` | ❌ | 可选 Tool hard cap；0 只使用 Tool Manager/caller deadline |
@@ -436,8 +438,8 @@ type SkillItemConfig struct {
 
 | 字段 | 类型 | 默认值 | 热更新 | 说明 |
 |------|------|--------|:------:|------|
-| `dir` | `string` | `"./skills"` | ❌ | Skill 文件扫描目录 |
-| `per_skill` | `map[string]SkillItemConfig` | `{}` | — | 按名称对单个 Skill 的配置覆盖 |
+| `dir` | `string` | `"./skills"` | ❌ | 非空 Skill 文件扫描目录 |
+| `per_skill` | `map[string]SkillItemConfig` | `{}` | — | 按非空名称对单个 Skill 的配置覆盖 |
 | `per_skill.<name>.enabled` | `bool` | `true` | ❌ | 是否启用该 Skill；改变已加载集合需要重启 |
 | `per_skill.<name>.options` | `map[string]any` | `{}` | ❌ | 传入 Skill 的自定义配置；v1 在加载时冻结 |
 
@@ -524,7 +526,7 @@ type LogConfig struct {
 |------|------|--------|:------:|------|
 | `level` | `string` | `"info"` | ✅ | 日志级别：`debug` / `info` / `warn` / `error` |
 | `format` | `string` | `"text"` | ❌ | 日志格式：`text` / `json` |
-| `output` | `string` | `"stderr"` | ❌ | 输出目标：`stderr` / `stdout` / 文件路径 |
+| `output` | `string` | `"stderr"` | ❌ | 非空输出目标：`stderr` / `stdout` / 文件路径 |
 
 ---
 

@@ -238,6 +238,19 @@ if err := DecodeInto(raw, cfg); err != nil {
 | **依赖检查** | 启用某能力时相关字段齐全 | 拒绝启动 | `runtime.auth.enabled=true` 时至少配置一种认证方式 |
 | **格式检查** | 字符串格式合法 | 拒绝启动 | `api.http.addr` 符合 `host:port` 格式 |
 
+基础 Validator 覆盖完整 DTO 的静态规则，而不只覆盖示例中的字段：
+
+| 配置区域 | 基础规则 |
+|----------|----------|
+| `runtime` | SQLite path 非空；HTTP addr、正数 read/write timeout、正数 max header bytes；Auth 结构与凭据依赖 |
+| `agents[]` | ID/name/provider/model 必填，ID 唯一，`max_tokens > 0`，temperature 为 nil 或 `0..2`，Tool/Skill allowlist 项非空且唯一 |
+| `providers[]` / `models[]` | Provider 连接、重试和 URL 规则；Model ID 唯一、窗口范围及 Thinking 元数据一致性 |
+| `mcp` / `tools` / `skills` | transport、地址、路径、timeout、并发和静态结构规则；动态引用与 options 延后到 binding 校验 |
+| `memory` / `session` / `context` / `planner` | 根值与每个 Agent 合并后的 effective 值都满足对应模块范围和枚举 |
+| `plugins` / `log` | Plugin 路径/timeout/restart/entry 结构，以及日志 level/format/output |
+
+关闭功能只跳过运行期依赖，不跳过其结构、枚举和范围校验。例如 `memory.enabled=false` 仍校验 storage/vector 范围，`mcp.servers[].auto_start=false` 与 `mcp.server.enabled=false` 仍校验 descriptor；只有“effective Memory 同时启用且 vector 启用”才要求完整 embedding 连接。跨运行时 catalog 的 Provider type、模型、Tool、Skill、Plugin Manifest 和 MCP expose 引用由 §3.5/`validateBindings` 处理，基础 Validator 不猜测动态注册表。
+
 ### 3.3 校验错误格式
 
 校验错误使用结构化格式，包含路径、规则、消息，便于定位：
@@ -295,67 +308,18 @@ func (v *Validator) Validate(cfg *Config) error {
         return errs
     }
 
-    // --- 必填检查 ---
-    if cfg.Runtime.Storage.Type == "" {
-        errs = append(errs, &ValidationError{
-            Path:    "runtime.storage.type",
-            Rule:    "required",
-            Message: "storage type must not be empty",
-        })
-    }
-
-    // --- 类型检查（枚举） ---
-    switch cfg.Runtime.Storage.Type {
-    case "", "sqlite", "memory":
-        // 合法值（空值已在上面检查）
-    default:
-        errs = append(errs, &ValidationError{
-            Path:    "runtime.storage.type",
-            Rule:    "enum",
-            Message: fmt.Sprintf("unsupported storage type %q, must be sqlite/memory",
-                cfg.Runtime.Storage.Type),
-        })
-    }
-
-    // --- Context 自身字段检查 ---
+    // --- 根配置静态检查 ---
+    validateRuntimeConfig(&errs, "runtime", cfg.Runtime)
+    validateMCPConfig(&errs, "mcp", cfg.MCP)
+    validateToolsConfig(&errs, "tools", cfg.Tools)
+    validateSkillsConfig(&errs, "skills", cfg.Skills)
     validateMemoryConfig(&errs, "memory", cfg.Memory)
     validateContextConfig(&errs, "context", cfg.Context)
     validateSessionConfig(&errs, "session", cfg.Session)
-    validateMCPConfig(&errs, "mcp", cfg.MCP)
-
-    // --- 范围检查 ---
-    if cfg.Tools.DefaultTimeout <= 0 || cfg.Tools.DefaultTimeout > cfg.Tools.MaxTimeout {
-        add(&errs, "tools.default_timeout", "range", "must be > 0 and <= max_timeout")
-    }
-    if cfg.Tools.MaxTimeout <= 0 {
-        add(&errs, "tools.max_timeout", "range", "must be > 0")
-    }
-    if cfg.Tools.MaxConcurrent <= 0 {
-        errs = append(errs, &ValidationError{
-            Path:    "tools.max_concurrent",
-            Rule:    "range",
-            Message: "max_concurrent must be > 0",
-        })
-    }
-    if cfg.Tools.MaxConcurrentPerSession <= 0 ||
-        cfg.Tools.MaxConcurrentPerSession > cfg.Tools.MaxConcurrent {
-        add(&errs, "tools.max_concurrent_per_session", "range",
-            "must be > 0 and <= max_concurrent")
-    }
-    if cfg.Tools.DefaultMaxRetry < 0 || cfg.Tools.DefaultMaxRetry > 10 {
-        add(&errs, "tools.default_max_retry", "range", "must be in 0..10")
-    }
-    if cfg.Tools.MaxResultTokens <= 0 {
-        errs = append(errs, &ValidationError{
-            Path:    "tools.max_result_tokens",
-            Rule:    "range",
-            Message: "max_result_tokens must be > 0",
-        })
-    }
-
-    // --- HTTP/Auth 检查 ---
-    loopback, listenValid := validateListenAddr(&errs, "runtime.api.http.addr", cfg.Runtime.API.HTTP.Addr)
-    validateAuthConfig(&errs, "runtime.auth", cfg.Runtime.Auth, loopback, listenValid)
+    validatePlannerConfig(&errs, "planner", cfg.Planner)
+    validatePluginsConfig(&errs, "plugins", cfg.Plugins)
+    validateLogConfig(&errs, "log", cfg.Log)
+    embeddingRequired := cfg.Memory.Enabled && cfg.Memory.Vector.Enabled
 
     // --- 引用检查 ---
     providerIDs := make(map[string]bool)
@@ -402,6 +366,14 @@ func (v *Validator) Validate(cfg *Config) error {
         if a.Model == "" {
             add(&errs, path+".model", "required", "model must not be empty")
         }
+        if a.MaxTokens <= 0 {
+            add(&errs, path+".max_tokens", "range", "must be > 0")
+        }
+        if a.Temperature != nil && (*a.Temperature < 0 || *a.Temperature > 2) {
+            add(&errs, path+".temperature", "range", "must be in 0..2")
+        }
+        validateUniqueNames(&errs, path+".tools", "tool", a.Tools)
+        validateUniqueNames(&errs, path+".skills", "skill", a.Skills)
         effectiveContext := ResolveContextConfig(cfg.Context, a.Context)
         validateContextConfig(&errs, fmt.Sprintf("agents[%d].context", i), effectiveContext)
         effectiveSession := ResolveSessionPolicy(cfg.Session, a.Session, nil)
@@ -412,9 +384,12 @@ func (v *Validator) Validate(cfg *Config) error {
             add(&errs, fmt.Sprintf("agents[%d].memory.enabled", i), "dependency",
                 "cannot enable memory when root memory.enabled is false")
         }
-        if effectiveMemory.Enabled && effectiveMemory.Vector.Enabled {
-            validateMemoryEmbedding(&errs, "memory.embedding", cfg.Memory.Embedding)
-        }
+        embeddingRequired = embeddingRequired || (effectiveMemory.Enabled && effectiveMemory.Vector.Enabled)
+        effectivePlanner := ResolvePlannerConfig(cfg.Planner, a.Planner)
+        validatePlannerConfig(&errs, fmt.Sprintf("agents[%d].planner", i), effectivePlanner)
+    }
+    if embeddingRequired {
+        validateMemoryEmbedding(&errs, "memory.embedding", cfg.Memory.Embedding)
     }
 
     if len(errs) > 0 {
@@ -429,7 +404,7 @@ func (v *Validator) Validate(cfg *Config) error {
 }
 ```
 
-HTTP/Auth 和 Provider 的基础规则不得只写在表格或构造器里；统一 Validator 使用以下 helper：
+这些基础规则不得只写在表格或各模块构造器里；统一 Validator 使用手写 helper。`validateRuntimeConfig` 必须校验 `storage.type=sqlite|memory`、SQLite path 非空、HTTP read/write timeout 与 max header bytes 均为正数，并用 `validateListenAddr` 的 `valid` 返回值阻止伪 Auth 级联错误。`validateToolsConfig` 使用 §3.2 的范围并要求每个 Tool timeout 位于 `0..max_timeout`；`validateSkillsConfig` 至少要求 `dir` 和动态 key 非空。其余 helper 如下：
 
 ```go
 import (
@@ -471,12 +446,14 @@ func validateMCPConfig(errs *ValidationErrors, field string, c MCPConfig) {
     names := make(map[string]bool, len(c.Servers))
     for i, s := range c.Servers {
         p := fmt.Sprintf("%s.servers[%d]", field, i)
-        if !mcpServerNameRE.MatchString(s.Name) {
+        if s.Name == "" {
+            add(errs, p+".name", "required", "server name must not be empty")
+        } else if !mcpServerNameRE.MatchString(s.Name) {
             add(errs, p+".name", "format", "must match ^[a-z0-9][a-z0-9-]{0,63}$")
         } else if names[s.Name] {
             add(errs, p+".name", "unique", "server name must be unique")
         }
-        names[s.Name] = true
+        if s.Name != "" { names[s.Name] = true }
         if s.Timeout < 0 {
             add(errs, p+".timeout", "range", "must be >= 0")
         }
@@ -486,23 +463,24 @@ func validateMCPConfig(errs *ValidationErrors, field string, c MCPConfig) {
             if s.Command == "" {
                 add(errs, p+".command", "required", "must not be empty for stdio")
             }
-            if s.URL != "" || len(s.Headers) != 0 || s.TLS.CAFile != "" {
-                add(errs, p, "dependency", "url, headers, and tls are not valid for stdio")
-            }
+            if s.URL != "" { add(errs, p+".url", "dependency", "is not valid for stdio") }
+            if len(s.Headers) != 0 { add(errs, p+".headers", "dependency", "are not valid for stdio") }
+            if s.TLS.CAFile != "" { add(errs, p+".tls.ca_file", "dependency", "is not valid for stdio") }
         case "sse", "streamable_http":
             u, err := url.ParseRequestURI(s.URL)
             if err != nil || u.Host == "" || u.User != nil ||
                 (u.Scheme != "http" && u.Scheme != "https") {
                 add(errs, p+".url", "format", "must be an absolute http/https URL")
             }
-            if s.Command != "" || len(s.Args) != 0 || len(s.Env) != 0 {
-                add(errs, p, "dependency", "command, args, and env are not valid for network transports")
-            }
+            if s.Command != "" { add(errs, p+".command", "dependency", "is not valid for network transports") }
+            if len(s.Args) != 0 { add(errs, p+".args", "dependency", "are not valid for network transports") }
+            if len(s.Env) != 0 { add(errs, p+".env", "dependency", "is not valid for network transports") }
         default:
             add(errs, p+".transport", "enum", "must be stdio, sse, or streamable_http")
         }
     }
 
+    // enabled/auto_start 只控制启动；所有 descriptor 始终执行上述结构校验。
     if c.Server.Enabled && c.Server.AgentID == "" {
         add(errs, field+".server.agent_id", "required", "must not be empty when server is enabled")
     }
@@ -519,7 +497,11 @@ func validateMCPConfig(errs *ValidationErrors, field string, c MCPConfig) {
     switch c.Server.Transport {
     case "stdio":
     case "sse", "streamable_http":
-        _, _ = validateListenAddr(errs, field+".server.addr", c.Server.Addr)
+        loopback, valid := validateListenAddr(errs, field+".server.addr", c.Server.Addr)
+        if valid && !loopback {
+            add(errs, field+".server.addr", "dependency",
+                "must be loopback; expose through an authenticated TLS reverse proxy")
+        }
         endpoint := c.Server.Path
         endpointField := field + ".server.path"
         if c.Server.Transport == "sse" {
@@ -533,6 +515,24 @@ func validateMCPConfig(errs *ValidationErrors, field string, c MCPConfig) {
         }
     default:
         add(errs, field+".server.transport", "enum", "must be stdio, sse, or streamable_http")
+    }
+    validateOriginAllowlist(errs, field+".server.origin_allowlist", c.Server.OriginAllowlist)
+}
+
+func validateOriginAllowlist(errs *ValidationErrors, field string, origins []string) {
+    seen := make(map[string]bool, len(origins))
+    for i, origin := range origins {
+        p := fmt.Sprintf("%s[%d]", field, i)
+        u, err := url.ParseRequestURI(origin)
+        if err != nil || u.Host == "" || u.User != nil ||
+            (u.Scheme != "http" && u.Scheme != "https") ||
+            u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+            add(errs, p, "format", "must be an exact http/https origin without path, query, or fragment")
+        }
+        if seen[origin] {
+            add(errs, p, "unique", "origin must be unique")
+        }
+        seen[origin] = true
     }
 }
 
@@ -574,10 +574,12 @@ func validateAuthConfig(errs *ValidationErrors, field string, c AuthConfig, loop
     }
     for i, role := range c.Roles {
         p := fmt.Sprintf("%s.roles[%d]", field, i)
-        if role.Name == "" || roles[role.Name] {
-            add(errs, p+".name", "unique", "role name must be non-empty and unique")
+        if role.Name == "" {
+            add(errs, p+".name", "required", "role name must not be empty")
+        } else if roles[role.Name] {
+            add(errs, p+".name", "unique", "role name must be unique")
         }
-        roles[role.Name] = true
+        if role.Name != "" { roles[role.Name] = true }
         for j, perm := range role.Permissions {
             pp := fmt.Sprintf("%s.permissions[%d]", p, j)
             if !validActions[perm.Action] {
@@ -618,10 +620,12 @@ func validateAuthConfig(errs *ValidationErrors, field string, c AuthConfig, loop
         hashes := make(map[[32]byte]bool, len(c.Tokens))
         for i, token := range c.Tokens {
             p := fmt.Sprintf("%s.tokens[%d]", field, i)
-            if token.Name == "" || names[token.Name] {
-                add(errs, p+".name", "unique", "token name must be non-empty and unique")
+            if token.Name == "" {
+                add(errs, p+".name", "required", "token name must not be empty")
+            } else if names[token.Name] {
+                add(errs, p+".name", "unique", "token name must be unique")
             }
-            names[token.Name] = true
+            if token.Name != "" { names[token.Name] = true }
             if token.Token == "" {
                 add(errs, p+".token", "required", "token must not be empty")
             } else {
@@ -644,9 +648,8 @@ func validateAuthConfig(errs *ValidationErrors, field string, c AuthConfig, loop
         if len(c.JWT.Secret) < 32 {
             add(errs, field+".jwt.secret", "range", "HS256 secret must contain at least 32 bytes")
         }
-        if c.JWT.Issuer == "" || c.JWT.Audience == "" {
-            add(errs, field+".jwt", "required", "issuer and audience are required")
-        }
+        if c.JWT.Issuer == "" { add(errs, field+".jwt.issuer", "required", "must not be empty") }
+        if c.JWT.Audience == "" { add(errs, field+".jwt.audience", "required", "must not be empty") }
         if c.JWT.ClockSkew < 0 || c.JWT.ClockSkew > 5*time.Minute {
             add(errs, field+".jwt.clock_skew", "range", "must be in 0..5m")
         }
@@ -668,7 +671,8 @@ func validateProviderConfig(errs *ValidationErrors, field string, p ProviderConf
     }
     if p.BaseURL != "" {
         u, err := url.ParseRequestURI(p.BaseURL)
-        if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+        if err != nil || u.Host == "" || u.User != nil ||
+            (u.Scheme != "http" && u.Scheme != "https") {
             add(errs, field+".base_url", "format", "must be an absolute http/https URL")
         }
     }
@@ -688,18 +692,123 @@ func validateProviderConfig(errs *ValidationErrors, field string, p ProviderConf
     models := make(map[string]bool, len(p.Models))
     for i, model := range p.Models {
         mp := fmt.Sprintf("%s.models[%d]", field, i)
-        if model.ID == "" || models[model.ID] {
-            add(errs, mp+".id", "unique", "model id must be non-empty and unique")
+        if model.ID == "" {
+            add(errs, mp+".id", "required", "model id must not be empty")
+        } else if models[model.ID] {
+            add(errs, mp+".id", "unique", "model id must be unique")
         }
-        models[model.ID] = true
-        if model.ContextWindow <= 0 || model.MaxOutput <= 0 || model.MaxOutput >= model.ContextWindow {
-            add(errs, mp, "range", "require 0 < max_output < context_window")
+        if model.ID != "" { models[model.ID] = true }
+        if model.ContextWindow <= 0 {
+            add(errs, mp+".context_window", "range", "must be > 0")
+        }
+        if model.MaxOutput <= 0 || (model.ContextWindow > 0 && model.MaxOutput >= model.ContextWindow) {
+            add(errs, mp+".max_output", "range", "must be > 0 and < context_window")
+        }
+        if model.MinThinkingBudget < 0 {
+            add(errs, mp+".min_thinking_budget", "range", "must be >= 0")
+        }
+        efforts := make(map[string]bool, len(model.ThinkingEfforts))
+        for j, effort := range model.ThinkingEfforts {
+            ep := fmt.Sprintf("%s.thinking_efforts[%d]", mp, j)
+            if effort != "low" && effort != "medium" && effort != "high" && effort != "max" {
+                add(errs, ep, "enum", "must be low, medium, high, or max")
+            }
+            if efforts[effort] {
+                add(errs, ep, "unique", "thinking effort must be unique")
+            }
+            efforts[effort] = true
+        }
+        if !model.SupportsThinking && (len(model.ThinkingEfforts) != 0 || model.MinThinkingBudget != 0) {
+            add(errs, mp+".supports_thinking", "dependency",
+                "thinking efforts and budget require supports_thinking=true")
         }
     }
 }
 ```
 
+Planner 的 Agent 覆盖先解析为完整 effective 值再校验；覆盖字段使用 `PlannerOverride` 的非 nil 指针，因此 `0` 不会被当成“缺失”：
+
+```go
+func ResolvePlannerConfig(root PlannerConfig, override *PlannerOverride) PlannerConfig {
+    out := root
+    if override == nil { return out }
+    if override.Type != nil { out.Type = *override.Type }
+    if override.Model != nil { out.Model = *override.Model }
+    if override.Temperature != nil { value := *override.Temperature; out.Temperature = &value }
+    if override.MaxTokens != nil { out.MaxTokens = *override.MaxTokens }
+    if override.MaxSteps != nil { out.MaxSteps = *override.MaxSteps }
+    if override.MaxConcurrent != nil { out.MaxConcurrent = *override.MaxConcurrent }
+    if override.Timeout != nil { out.Timeout = *override.Timeout }
+    return out
+}
+
+func validatePlannerConfig(errs *ValidationErrors, path string, c PlannerConfig) {
+    if c.Type != "llm" && c.Type != "disabled" {
+        add(errs, path+".type", "enum", "must be llm or disabled")
+    }
+    if c.Temperature == nil {
+        add(errs, path+".temperature", "required", "must not be nil")
+    } else if *c.Temperature < 0 || *c.Temperature > 2 {
+        add(errs, path+".temperature", "range", "must be in 0..2")
+    }
+    if c.MaxTokens < 1 || c.MaxTokens > 16384 {
+        add(errs, path+".max_tokens", "range", "must be in 1..16384")
+    }
+    if c.MaxSteps < 1 || c.MaxSteps > 64 {
+        add(errs, path+".max_steps", "range", "must be in 1..64")
+    }
+    if c.MaxConcurrent < 1 || c.MaxConcurrent > 16 {
+        add(errs, path+".max_concurrent", "range", "must be in 1..16")
+    }
+    if c.Timeout < time.Second || c.Timeout > 5*time.Minute {
+        add(errs, path+".timeout", "range", "must be in 1s..5m")
+    }
+}
+```
+
 `validateBindings` 在启动期 Provider factory registry、builtin Tool、Plugin Tool Proxy 和 MCP Tool Proxy 都建立后执行，再确认 `ProviderConfig.Type` 已注册，并校验 Agent、MCP expose Agent/Tool、Skill 与 Tool 引用。每个 `agents[i].skills_config.<name>` 必须同时出现在该 Agent 的 `skills` 精确 allowlist 和已加载 Skill catalog 中。它还对 `tools.builtin.<name>.options` 和 `agents[i].tools_config.<name>.options` 调用每个 builtin 的严格 option decoder；未知 key、类型或范围错误必须带完整源路径。Reload candidate 在发布前重跑适用于可热更新字段的同一校验。基础 Validator 不把静态链接并已注册的扩展 type 误判成未知枚举；进程外 Plugin 不提供 Provider type。
+
+Plugin 和 Log 的静态规则也属于基础 Validator：
+
+```go
+func validatePluginsConfig(errs *ValidationErrors, path string, c PluginsConfig) {
+    validateUniqueNames(errs, path+".paths", "plugin path", c.Paths)
+    for i, d := range c.Paths {
+        if d == "" { add(errs, fmt.Sprintf("%s.paths[%d]", path, i), "required", "path must not be empty") }
+    }
+    for _, item := range []struct{name string; value time.Duration}{
+        {"startup_timeout", c.StartupTimeout}, {"stop_timeout", c.StopTimeout},
+        {"health_interval", c.HealthInterval}, {"health_timeout", c.HealthTimeout},
+    } {
+        if item.value <= 0 { add(errs, path+"."+item.name, "range", "must be > 0") }
+    }
+    if c.HealthTimeout > c.HealthInterval {
+        add(errs, path+".health_timeout", "range", "must be <= health_interval")
+    }
+    if c.Restart.MaxAttempts < 0 { add(errs, path+".restart.max_attempts", "range", "must be >= 0") }
+    if c.Restart.Backoff <= 0 || c.Restart.Backoff > time.Minute {
+        add(errs, path+".restart.backoff", "range", "must be in (0,1m]")
+    }
+    ids := make(map[string]bool, len(c.Entries))
+    for i, entry := range c.Entries {
+        p := fmt.Sprintf("%s.entries[%d]", path, i)
+        if entry.ID == "" { add(errs, p+".id", "required", "plugin id must not be empty")
+        } else if ids[entry.ID] { add(errs, p+".id", "unique", "plugin id must be unique") }
+        ids[entry.ID] = true
+    }
+}
+
+func validateLogConfig(errs *ValidationErrors, path string, c LogConfig) {
+    if c.Level != "debug" && c.Level != "info" && c.Level != "warn" && c.Level != "error" {
+        add(errs, path+".level", "enum", "must be debug, info, warn, or error")
+    }
+    if c.Format != "text" && c.Format != "json" {
+        add(errs, path+".format", "enum", "must be text or json")
+    }
+    if c.Output == "" { add(errs, path+".output", "required", "must not be empty") }
+    // stdout/stderr 或文件路径均可；路径存在性和可写性由启动 binding 检查。
+}
+```
 
 Session 的根配置与 resolved policy 使用同一字段规则。Manager-only 字段只在根配置校验：
 
@@ -764,9 +873,6 @@ func validateMemoryConfig(errs *ValidationErrors, path string, c MemoryConfig) {
     if c.Storage.Type == "sqlite" && c.Storage.Path == "" {
         add(errs, path+".storage.path", "required", "must not be empty for sqlite")
     }
-    if c.Enabled && c.Vector.Enabled {
-        validateMemoryEmbedding(errs, path+".embedding", c.Embedding)
-    }
 }
 
 func validateMemoryPolicy(errs *ValidationErrors, path string, p MemoryPolicy) {
@@ -791,26 +897,31 @@ func validateMemoryEmbedding(errs *ValidationErrors, path string, e MemoryEmbedd
     if e.Provider != "openai-compatible" {
         add(errs, path+".provider", "enum", "must be openai-compatible")
     }
-    if e.Model == "" || e.BaseURL == "" {
-        add(errs, path, "required", "model and base_url are required when vector is enabled")
+    if e.Model == "" {
+        add(errs, path+".model", "required", "must not be empty when vector is enabled")
     }
-    if e.Dimension <= 0 || e.Timeout <= 0 {
-        add(errs, path, "range", "dimension and timeout must be > 0")
+    u, err := url.ParseRequestURI(e.BaseURL)
+    if e.BaseURL == "" {
+        add(errs, path+".base_url", "required", "must not be empty when vector is enabled")
+    } else if err != nil || u.Host == "" || u.User != nil ||
+        (u.Scheme != "http" && u.Scheme != "https") {
+        add(errs, path+".base_url", "format", "must be an absolute http/https URL")
     }
+    if e.Dimension <= 0 { add(errs, path+".dimension", "range", "must be > 0") }
+    if e.Timeout <= 0 { add(errs, path+".timeout", "range", "must be > 0") }
 }
 ```
 
-Strict decoder 在这些函数之前拒绝未知字段。Agent `MemoryOverride` 不声明 storage、embedding 或 cleanup 字段，因此尝试覆盖这些路径会直接返回带完整路径的 unknown-field 错误。
+Strict decoder 在这些函数之前拒绝未知字段。Agent `MemoryOverride` 不声明 storage、embedding 或 cleanup 字段，因此尝试覆盖这些路径会直接返回带完整路径的 unknown-field 错误。根和 Agent effective policy 无论 `enabled` 值都校验自身范围；只有至少一个 effective policy 同时满足 `enabled=true` 且 `vector.enabled=true` 时，顶层 Validator 才调用一次 `validateMemoryEmbedding("memory.embedding", ...)`，避免重复错误，也避免关闭 Memory 时强制填写未使用的连接字段。
 
 `validateContextConfig` 至少执行以下规则；非法值全部拒绝，不回退到默认值：
 
 ```go
 func validateContextConfig(errs *ValidationErrors, path string, c ContextConfig) {
-    if c.MaxTokens < 0 || c.ReservedTokens < 0 {
-        add(errs, path, "range", "max_tokens and reserved_tokens must be >= 0")
-    }
+    if c.MaxTokens < 0 { add(errs, path+".max_tokens", "range", "must be >= 0") }
+    if c.ReservedTokens < 0 { add(errs, path+".reserved_tokens", "range", "must be >= 0") }
     if c.MaxTokens > 0 && c.ReservedTokens >= c.MaxTokens {
-        add(errs, path, "range", "reserved_tokens must be less than max_tokens when max_tokens is set")
+        add(errs, path+".reserved_tokens", "range", "must be less than max_tokens when max_tokens is set")
     }
     if c.Strategy != "hybrid" && c.Strategy != "truncate" && c.Strategy != "reject" {
         add(errs, path+".strategy", "enum", "must be hybrid, truncate, or reject")
@@ -821,9 +932,9 @@ func validateContextConfig(errs *ValidationErrors, path string, c ContextConfig)
     if c.Compression.TargetRatio <= 0 || c.Compression.TargetRatio >= c.Compression.Threshold {
         add(errs, path+".compression.target_ratio", "range", "must be in (0,threshold)")
     }
-    if c.Compression.MinMessages < 2 || c.Compression.PreserveRecent < 0 || c.Compression.Timeout <= 0 {
-        add(errs, path+".compression", "range", "min_messages/preserve_recent/timeout are invalid")
-    }
+    if c.Compression.MinMessages < 2 { add(errs, path+".compression.min_messages", "range", "must be >= 2") }
+    if c.Compression.PreserveRecent < 0 { add(errs, path+".compression.preserve_recent", "range", "must be >= 0") }
+    if c.Compression.Timeout <= 0 { add(errs, path+".compression.timeout", "range", "must be > 0") }
 }
 ```
 

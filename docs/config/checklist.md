@@ -35,9 +35,13 @@
 - [ ] 枚举值校验（如 `log.level` 仅允许 debug/info/warn/error）
 - [ ] 范围校验（如 `min/max`、`port` 1-65535）
 - [ ] 依赖关系校验（如非回环监听必须启用认证）
-- [ ] 语义校验（如 `max_agents` > 0、`timeout` > 0）
+- [ ] 语义校验（如 `tools.max_concurrent` > 0、`timeout` > 0）
+- [ ] Runtime SQLite path、HTTP timeout/header、Agent/Model、Planner、Plugin、Log 基础规则
+- [ ] MCP 非回环 listener 拒绝；disabled/`auto_start=false` 仍完整校验 descriptor
+- [ ] Memory vector/embedding 条件按 effective policy 判定，关闭 Memory 不强制未使用连接字段
+- [ ] Model Thinking effort 枚举、唯一性和 `supports_thinking` 依赖
 - [ ] 校验错误聚合返回（收集所有错误，一次性报告）
-- [ ] 校验错误消息包含字段路径（如 `runtime.api.http.port: invalid value`）
+- [ ] 校验错误消息包含字段路径（如 `runtime.api.http.addr: invalid value`）
 - [ ] Agent `model` 非空；内置 Provider 的 `base_url` 解码后是非空绝对 HTTP(S) URL
 
 ## 热更新

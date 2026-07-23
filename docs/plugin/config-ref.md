@@ -36,16 +36,16 @@ type PluginEntry struct {
 
 | 字段 | 默认值 | 规则 |
 |------|--------|------|
-| `paths` | `["./plugins"]` | 相对路径以主配置文件目录为基准，规范化后扫描 |
+| `paths` | `["./plugins"]` | 每项非空且唯一；相对路径以主配置文件目录为基准，规范化后扫描 |
 | `auto_start` | `true` | false 时只发现/校验 Manifest，不启动进程 |
-| `startup_timeout` | `30s` | 覆盖进程启动、Dial、Handshake、Init、Ready |
-| `stop_timeout` | `10s` | 覆盖 Stop RPC 和等待退出；超时 Kill |
-| `health_interval` | `30s` | Health 调用周期 |
-| `health_timeout` | `5s` | 单次 Health RPC 超时；失败不自动重启 |
+| `startup_timeout` | `30s` | `>0`；覆盖进程启动、Dial、Handshake、Init、Ready |
+| `stop_timeout` | `10s` | `>0`；覆盖 Stop RPC 和等待退出；超时 Kill |
+| `health_interval` | `30s` | `>0`；Health 调用周期 |
+| `health_timeout` | `5s` | `>0` 且 `<= health_interval`；失败不自动重启 |
 | `restart.enabled` | `true` | Runtime 未进入 Stop 时进程退出后是否重启 |
-| `restart.max_attempts` | `3` | 每个 Plugin 每次 Runtime 生命周期的重启上限 |
-| `restart.backoff` | `1s` | 首次等待，之后指数退避，最大 60s |
-| `entries[].id` | 无 | 必须与 Manifest ID 唯一匹配 |
+| `restart.max_attempts` | `3` | `>=0`；每个 Plugin 每次 Runtime 生命周期的重启上限 |
+| `restart.backoff` | `1s` | `(0,60s]`；首次等待，之后指数退避，最大 60s |
+| `entries[].id` | 无 | 非空且在配置内唯一，随后必须与 Manifest ID 唯一匹配 |
 | `entries[].enabled` | 未设置 | 显式 true/false 优先；未设置时使用 `default_enabled` |
 | `entries[].config` | `{}` | 启动前按 Manifest `config_schema` 校验，再通过 Init 传递 |
 

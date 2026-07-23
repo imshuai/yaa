@@ -180,10 +180,10 @@ agents:
 1. 先注入默认值，再校验所有根字段；未知字段在 strict decoder 阶段拒绝。
 2. `max_items`、batch、interval、TTL 和 eviction enum 满足上表范围。
 3. storage type 为 `sqlite|memory`；sqlite path 非空。
-4. threshold/top_k 满足范围；vector 启用时 embedding provider/model/base_url/dimension/timeout 完整且 dimension>0。
+4. threshold/top_k 始终满足范围；至少一个根或 Agent effective policy 同时启用 Memory 和 vector 时，embedding provider/model/base_url/dimension/timeout 必须完整且 dimension>0。
 5. 对每个 Agent 合并 override 后重新校验 policy；Agent 不能越过 root disabled 或修改共享连接。
 
-`enabled=false` 仍校验结构和值，避免下一次启用时才发现坏配置。配置 reload 不重新解释已有 item 的绝对 ExpiresAt。
+`enabled=false` 仍校验 storage、cleanup、policy 与 vector 的结构、枚举和范围；只跳过未启用能力的 embedding 完整性依赖。配置 reload 不重新解释已有 item 的绝对 ExpiresAt。
 
 ## 6. 热更新
 
