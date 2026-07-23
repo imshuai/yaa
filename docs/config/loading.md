@@ -232,7 +232,10 @@ func DecodeInto(raw map[string]any, dst *Config) error {
         MatchName: func(mapKey, fieldName string) bool {
             return mapKey == fieldName
         },
-        DecodeHook: strictDurationDecodeHook(),
+        DecodeHook: mapstructure.ComposeDecodeHookFunc(
+            strictScalarDecodeHook(),
+            strictDurationDecodeHook(),
+        ),
     })
     if err != nil {
         return err
@@ -243,7 +246,7 @@ func DecodeInto(raw map[string]any, dst *Config) error {
 
 `prepareDecodeTarget` 是 `DecodeInto` 的必需前置步骤，不能省略。`mapstructure` 在 `ZeroFields=false` 时会保留目标 slice 的尾部元素，也会静默忽略 `nil`；预处理必须只遍历 raw 中实际存在的字段，按 canonical YAML tag 生成完整路径（数组使用 `[n]`），并执行以下规则：出现的 slice 先设为零值；`null` 只允许写入 pointer、slice、map 或 interface 并设为零值；写入 string、number、bool、struct 等非 nullable 字段时报错；非 null map 保留目标 map 并递归合并。预处理失败时不得调用 decoder。字段名按 YAML tag 大小写精确匹配，不能使用 `mapstructure` 默认的大小写不敏感匹配。
 
-`strictDurationDecodeHook` 只把 Go duration 字符串转换为 `time.Duration`；数值只接受 `0`，用于表示文档中的禁用/继承语义，任何非零数值都返回带完整字段路径的类型错误。该 hook 必须显式区分 `json.Number` 与 Go `string`，不能直接使用 `mapstructure.StringToTimeDurationHookFunc()`：`json.Number` 的底层 kind 也是 string，后者会对 JSON 数值执行错误的类型断言并 panic。普通 string/int/bool 字段也必须在预处理阶段检查原始类型和目标范围，禁止 `json.Number` 到 string、float 到 int 等隐式转换。
+`strictScalarDecodeHook` 只把普通字符串按目标类型显式解析为整数、浮点数或布尔值（环境变量展开和带引号的标量依赖此规则）；`json.Number` 到 string、float 到 int 等隐式转换仍然禁止。`strictDurationDecodeHook` 把 Go duration 字符串转换为 `time.Duration`；数值只接受 `0`，用于表示零值，任何非零数值都返回带完整字段路径的类型错误。两个 hook 都必须显式区分 `json.Number` 与 Go `string`，不能直接使用 `mapstructure.StringToTimeDurationHookFunc()`：`json.Number` 的底层 kind 也是 string，后者会对 JSON 数值执行错误的类型断言并 panic。预处理阶段同时检查原始类型和目标范围。
 
 `parseFileToMap` 按扩展名选择解析器：YAML 使用 `yaml.v3` 解到 `map[string]any`；JSON 使用 `json.Decoder` + `UseNumber` 并拒绝第二个顶层值；TOML 使用 `BurntSushi/toml` 解到 raw Map，并在返回前把 array-of-tables 的 `[]map[string]any` 递归规范化为 `[]any`。TOML 不在此阶段调用 `Undecoded()`（`any` 值会被该库标记为未解码）。所有格式的结构体边界未知字段统一由后续 `DecodeInto(... ErrorUnused=true)` 检查；开放 `map[string]any` 的内部 key 由对应 Provider/Tool/Skill/Plugin 专用 decoder 校验。无扩展名按 YAML。解析器不得直接解到 `Config`，否则会绕过迁移、环境变量和统一 unknown-field 检查。完整格式约定见 [`formats.md`](formats.md)。
 
