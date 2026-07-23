@@ -84,7 +84,7 @@ func (v ConfigSchema) String() string {
 
 ## 2. 迁移注册表
 
-迁移函数接收 presence-aware 的 `map[string]any`，返回新的 Map；它不得直接操作已经解码的 `Config`，否则无法区分显式零值。
+迁移函数接收 presence-aware 的 `map[string]any`，返回迁移后的 Map；它不得直接操作已经解码的 `Config`，否则无法区分显式零值。
 
 ```go
 type MigrationFunc func(map[string]any) (map[string]any, error)
@@ -116,7 +116,7 @@ func Migrate(raw map[string]any, from, to ConfigSchema) (map[string]any, error) 
                 step = candidate
             }
         }
-        if step == nil || step.To.Compare(current) <= 0 || step.To.Compare(to) > 0 {
+        if step == nil || step.Run == nil || step.To.Compare(current) <= 0 || step.To.Compare(to) > 0 {
             return nil, fmt.Errorf("no migration path from %s to %s", current, to)
         }
         var err error
@@ -124,7 +124,13 @@ func Migrate(raw map[string]any, from, to ConfigSchema) (map[string]any, error) 
         if err != nil {
             return nil, fmt.Errorf("migration %s->%s failed: %w", step.From, step.To, err)
         }
+        if result == nil {
+            return nil, fmt.Errorf("migration %s->%s returned a nil config", step.From, step.To)
+        }
         current = step.To
+    }
+    if result == nil {
+        return nil, fmt.Errorf("config migration input is nil")
     }
     result["config_version"] = to.String()
     return result, nil
