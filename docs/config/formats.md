@@ -66,12 +66,8 @@ func ParseToMap(data []byte, format Format) (map[string]any, error) {
             return nil, fmt.Errorf("%w: json: multiple top-level values", ErrConfigParseFailed)
         }
     case FormatTOML:
-        metadata, err := toml.Decode(string(data), &out)
-        if err != nil {
+        if _, err := toml.Decode(string(data), &out); err != nil {
             return nil, fmt.Errorf("%w: toml: %v", ErrConfigParseFailed, err)
-        }
-        if undecoded := metadata.Undecoded(); len(undecoded) != 0 {
-            return nil, fmt.Errorf("%w: toml: undecoded keys: %v", ErrConfigParseFailed, undecoded)
         }
     default:
         return nil, fmt.Errorf("%w: %s", ErrConfigFormatUnsupported, format)
@@ -95,7 +91,7 @@ func ParseFileToMap(path string) (map[string]any, error) {
 }
 ```
 
-JSON number 保持为 `json.Number`，最终由统一解码器按目标字段转换；超出目标整数范围时必须报错。YAML map key 必须是字符串。各解析器的未知字段都由 `DecodeInto(... ErrorUnused=true)` 在同一阶段拒绝。
+JSON number 保持为 `json.Number`，最终由统一解码器按目标字段转换；超出目标整数范围时必须报错。YAML map key 必须是字符串。TOML 解到 raw Map 时不能使用 `Undecoded()` 判错，因为 `any` 值会被该库标记为未解码；所有格式的未知字段统一由后续 `DecodeInto(... ErrorUnused=true)` 拒绝。
 
 ## 3. 跨格式语义
 
