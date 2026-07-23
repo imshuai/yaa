@@ -26,7 +26,7 @@ func TestConfigDTOContract(t *testing.T) {
 		"Memory":  reflect.TypeOf((*MemoryOverride)(nil)),
 		"Session": reflect.TypeOf((*SessionOverride)(nil)),
 		"Context": reflect.TypeOf((*ContextOverride)(nil)),
-		"Planner": reflect.TypeOf((*PlannerConfig)(nil)),
+		"Planner": reflect.TypeOf((*PlannerOverride)(nil)),
 	} {
 		field, ok := agent.FieldByName(fieldName)
 		if !ok || field.Type != wantType {

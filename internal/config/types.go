@@ -96,7 +96,7 @@ type AgentConfig struct {
 	Memory       *MemoryOverride             `yaml:"memory" json:"memory"`
 	Session      *SessionOverride            `yaml:"session" json:"session"`
 	Context      *ContextOverride            `yaml:"context" json:"context"`
-	Planner      *PlannerConfig              `yaml:"planner" json:"planner"`
+	Planner      *PlannerOverride            `yaml:"planner" json:"planner"`
 	ToolsConfig  map[string]any              `yaml:"tools_config" json:"tools_config"`
 	SkillsConfig map[string]AgentSkillConfig `yaml:"skills_config" json:"skills_config"`
 }
@@ -310,6 +310,16 @@ type PlannerConfig struct {
 	MaxSteps      int           `yaml:"max_steps" json:"max_steps"`
 	MaxConcurrent int           `yaml:"max_concurrent" json:"max_concurrent"`
 	Timeout       time.Duration `yaml:"timeout" json:"timeout"`
+}
+
+type PlannerOverride struct {
+	Type          *string        `yaml:"type" json:"type"`
+	Model         *string        `yaml:"model" json:"model"`
+	Temperature   *float64       `yaml:"temperature" json:"temperature"`
+	MaxTokens     *int           `yaml:"max_tokens" json:"max_tokens"`
+	MaxSteps      *int           `yaml:"max_steps" json:"max_steps"`
+	MaxConcurrent *int           `yaml:"max_concurrent" json:"max_concurrent"`
+	Timeout       *time.Duration `yaml:"timeout" json:"timeout"`
 }
 
 type PluginsConfig struct {

@@ -132,3 +132,34 @@ func ResolveContextConfig(root ContextConfig, override *ContextOverride) Context
 	}
 	return out
 }
+
+// ResolvePlannerConfig applies an optional agent planner override.
+func ResolvePlannerConfig(root PlannerConfig, override *PlannerOverride) PlannerConfig {
+	out := root
+	if override == nil {
+		return out
+	}
+	if override.Type != nil {
+		out.Type = *override.Type
+	}
+	if override.Model != nil {
+		out.Model = *override.Model
+	}
+	if override.Temperature != nil {
+		value := *override.Temperature
+		out.Temperature = &value
+	}
+	if override.MaxTokens != nil {
+		out.MaxTokens = *override.MaxTokens
+	}
+	if override.MaxSteps != nil {
+		out.MaxSteps = *override.MaxSteps
+	}
+	if override.MaxConcurrent != nil {
+		out.MaxConcurrent = *override.MaxConcurrent
+	}
+	if override.Timeout != nil {
+		out.Timeout = *override.Timeout
+	}
+	return out
+}

@@ -79,3 +79,30 @@ func TestResolveContextConfigAppliesNestedOverride(t *testing.T) {
 		t.Fatalf("ResolveContextConfig = %#v, want %#v", got, want)
 	}
 }
+
+func TestResolvePlannerConfigAppliesPresentZeroValues(t *testing.T) {
+	root := DefaultPlannerConfig()
+	root.Model = "root-model"
+	model := ""
+	temperature := 0.0
+	maxTokens := 0
+
+	got := ResolvePlannerConfig(root, &PlannerOverride{
+		Model:       &model,
+		Temperature: &temperature,
+		MaxTokens:   &maxTokens,
+	})
+	want := root
+	want.Model = ""
+	wantTemperature := 0.0
+	want.Temperature = &wantTemperature
+	want.MaxTokens = 0
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ResolvePlannerConfig = %#v, want %#v", got, want)
+	}
+
+	temperature = 1.0
+	if *got.Temperature != 0 {
+		t.Fatalf("resolved temperature changed to %v after source mutation", *got.Temperature)
+	}
+}

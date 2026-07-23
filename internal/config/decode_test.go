@@ -250,3 +250,32 @@ func TestDecodeIntoConvertsStringScalars(t *testing.T) {
 		t.Fatalf("planner.temperature = %v, want 0.5", cfg.Planner.Temperature)
 	}
 }
+
+func TestDecodeIntoPreservesPlannerOverridePresence(t *testing.T) {
+	raw := map[string]any{
+		"agents": []any{map[string]any{
+			"planner": map[string]any{
+				"model":       "",
+				"temperature": 0,
+				"max_tokens":  0,
+			},
+		}},
+	}
+	if err := ApplyElementDefaults(raw); err != nil {
+		t.Fatalf("ApplyElementDefaults returned error: %v", err)
+	}
+	cfg := Default()
+	if err := DecodeInto(raw, cfg); err != nil {
+		t.Fatalf("DecodeInto returned error: %v", err)
+	}
+	override := cfg.Agents[0].Planner
+	if override == nil || override.Model == nil || *override.Model != "" {
+		t.Fatalf("planner.model = %#v, want present empty string", override)
+	}
+	if override.Temperature == nil || *override.Temperature != 0 {
+		t.Fatalf("planner.temperature = %#v, want present zero", override)
+	}
+	if override.MaxTokens == nil || *override.MaxTokens != 0 {
+		t.Fatalf("planner.max_tokens = %#v, want present zero", override)
+	}
+}
