@@ -103,10 +103,13 @@ log:
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
 )
+
+var ErrConfigEnvVarMissing = errors.New("envvar: required variable")
 
 // EnvResolver 环境变量引用解析器
 type EnvResolver struct{}
@@ -137,7 +140,7 @@ func (r *EnvResolver) Resolve(value string) (string, error) {
 			return defaultVal
 		}
 		if resolveErr == nil {
-			resolveErr = fmt.Errorf("envvar: required variable %s is not set", varName)
+			resolveErr = fmt.Errorf("%w %s is not set", ErrConfigEnvVarMissing, varName)
 		}
 		return match
 	})
@@ -174,6 +177,8 @@ func (r *EnvResolver) resolveValue(v any) (any, error) {
 	return v, nil
 }
 ```
+
+缺失变量错误必须可通过 `errors.Is(err, ErrConfigEnvVarMissing)` 识别；错误文本包含变量名但不包含任何已解析的变量值。`ResolveMap` 在原始 Map 上原地更新，调用方在错误时应丢弃该 Map，不得继续解码。
 
 ### 4.2 在加载管线中集成
 
