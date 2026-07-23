@@ -241,7 +241,7 @@ type ModelConfig struct {
 | `id` | `string` | — | ❌ | Provider 唯一标识，**必填** |
 | `type` | `string` | — | ❌ | 内置类型：`openai` / `claude` / `gemini` / `ollama` / `azure`，**必填**；静态链接扩展类型须在 Provider Manager 构造前注册，进程外 Plugin 不扩展 Provider |
 | `api_key` | `string` | `""` | ❌ | API 密钥，建议 `${VAR_NAME}` 引用 |
-| `base_url` | `string` | 类型相关 | ❌ | API 基础 URL；内置类型解码后必须为非空绝对 HTTP(S) URL |
+| `base_url` | `string` | 类型相关 | ❌ | API 基础 URL；内置类型解码后必须为非空绝对 HTTP(S) URL；扩展类型的可选性、scheme 和格式由其注册 factory 在 binding 阶段校验 |
 | `timeout` | `duration` | `120s` | ❌ | 一次逻辑 Chat/Stream 调用的总超时，包含重试、退避和完整 stream 生命周期 |
 | `max_retries` | `int` | `3` | ❌ | 可重试 Provider 请求的最大重试次数 |
 | `retry_interval` | `duration` | `1s` | ❌ | 指数退避基数 |

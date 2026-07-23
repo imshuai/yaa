@@ -248,7 +248,7 @@ func DecodeInto(raw map[string]any, dst *Config) error {
 
 `strictScalarDecodeHook` 只把普通字符串按目标类型显式解析为整数、浮点数或布尔值（环境变量展开和带引号的标量依赖此规则）；`json.Number` 到 string、float 到 int 等隐式转换仍然禁止。`strictDurationDecodeHook` 把 Go duration 字符串转换为 `time.Duration`；数值只接受 `0`，用于表示零值，任何非零数值都返回带完整字段路径的类型错误。两个 hook 都必须显式区分 `json.Number` 与 Go `string`，不能直接使用 `mapstructure.StringToTimeDurationHookFunc()`：`json.Number` 的底层 kind 也是 string，后者会对 JSON 数值执行错误的类型断言并 panic。预处理阶段同时检查原始类型和目标范围。
 
-`parseFileToMap` 按扩展名选择解析器：YAML 使用 `yaml.v3` 解到 `map[string]any`；JSON 使用 `json.Decoder` + `UseNumber` 并拒绝第二个顶层值；TOML 使用 `BurntSushi/toml` 解到 raw Map，并在返回前把 array-of-tables 的 `[]map[string]any` 递归规范化为 `[]any`。TOML 不在此阶段调用 `Undecoded()`（`any` 值会被该库标记为未解码）。所有格式的结构体边界未知字段统一由后续 `DecodeInto(... ErrorUnused=true)` 检查；开放 `map[string]any` 的内部 key 由对应 Provider/Tool/Skill/Plugin 专用 decoder 校验。无扩展名按 YAML。解析器不得直接解到 `Config`，否则会绕过迁移、环境变量和统一 unknown-field 检查。完整格式约定见 [`formats.md`](formats.md)。
+`parseFileToMap` 按扩展名选择解析器：YAML 使用 `yaml.v3` 解到 `map[string]any`；此过程物化 alias 并丢失显式 tag 的来源，v1 后续阶段只校验物化值，不承诺按 YAML 源语法拒绝 tag/alias。JSON 使用 `json.Decoder` + `UseNumber` 并拒绝第二个顶层值；TOML 使用 `BurntSushi/toml` 解到 raw Map，并在返回前把 array-of-tables 的 `[]map[string]any` 递归规范化为 `[]any`。TOML 不在此阶段调用 `Undecoded()`（`any` 值会被该库标记为未解码）。所有格式的结构体边界未知字段统一由后续 `DecodeInto(... ErrorUnused=true)` 检查；开放 `map[string]any` 的内部 key 由对应 Provider/Tool/Skill/Plugin 专用 decoder 校验。无扩展名按 YAML。解析器不得直接解到 `Config`，否则会绕过迁移、环境变量和统一 unknown-field 检查。完整格式约定见 [`formats.md`](formats.md)。
 
 ### 4.3 配置文件路径解析
 

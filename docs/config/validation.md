@@ -817,17 +817,16 @@ func validateProviderConfig(errs *ValidationErrors, field string, p ProviderConf
     if p.RetryInterval <= 0 || p.RetryInterval > time.Minute {
         add(errs, field+".retry_interval", "range", "must be in (0,1m]")
     }
-    if p.BaseURL != "" {
-        u, err := url.ParseRequestURI(p.BaseURL)
-        if err != nil || u.Host == "" || u.User != nil ||
-            (u.Scheme != "http" && u.Scheme != "https") {
-            add(errs, field+".base_url", "format", "must be an absolute http/https URL")
-        }
-    }
     switch p.Type {
     case "openai", "claude", "gemini", "ollama", "azure":
         if p.BaseURL == "" {
             add(errs, field+".base_url", "required", "base_url is required for built-in provider types")
+        } else {
+            u, err := url.ParseRequestURI(p.BaseURL)
+            if err != nil || u.Host == "" || u.User != nil ||
+                (u.Scheme != "http" && u.Scheme != "https") {
+                add(errs, field+".base_url", "format", "must be an absolute http/https URL")
+            }
         }
     }
     switch p.Type {
@@ -914,7 +913,7 @@ func validatePlannerConfig(errs *ValidationErrors, path string, c PlannerConfig)
 }
 ```
 
-`validateBindings` 在启动期 Provider factory registry、builtin Tool、Plugin Tool Proxy 和 MCP Tool Proxy 都建立后执行，再确认 `ProviderConfig.Type` 已注册，并校验 Agent、MCP expose Agent/Tool、Skill 与 Tool 引用。每个 `agents[i].skills_config.<name>` 必须同时出现在该 Agent 的 `skills` 精确 allowlist 和已加载 Skill catalog 中。它还对 `tools.builtin.<name>.options` 和 `agents[i].tools_config.<name>.options` 调用每个 builtin 的严格 option decoder，并校验 Agent Tool timeout 位于 `0..max_timeout`；越界错误固定为 `agents[i].tools_config.<name>.timeout / range / must be in 0..max_timeout`，未知 key、类型或范围错误必须带完整源路径。Skill binding 在 frontmatter、root options 和 Agent options 合并后递归规范化 key，拒绝敏感 key，并限制最终 JSON 编码不超过 64 KiB。Reload candidate 在发布前重跑适用于可热更新字段的同一校验。基础 Validator 不把静态链接并已注册的扩展 type 误判成未知枚举；进程外 Plugin 不提供 Provider type。
+`validateBindings` 在启动期 Provider factory registry、builtin Tool、Plugin Tool Proxy 和 MCP Tool Proxy 都建立后执行，再确认 `ProviderConfig.Type` 已注册，并校验 Agent、MCP expose Agent/Tool、Skill 与 Tool 引用。每个 `agents[i].skills_config.<name>` 必须同时出现在该 Agent 的 `skills` 精确 allowlist 和已加载 Skill catalog 中。它还对 `tools.builtin.<name>.options` 和 `agents[i].tools_config.<name>.options` 调用每个 builtin 的严格 option decoder，并校验 Agent Tool timeout 位于 `0..max_timeout`；越界错误固定为 `agents[i].tools_config.<name>.timeout / range / must be in 0..max_timeout`，未知 key、类型或范围错误必须带完整源路径。Skill binding 在 frontmatter、root options 和 Agent options 合并后递归规范化 key，拒绝敏感 key，并限制最终 JSON 编码不超过 64 KiB。Reload candidate 在发布前重跑适用于可热更新字段的同一校验。基础 Validator 不把静态链接并已注册的扩展 type 误判成未知枚举，也不假设扩展 Provider 的 `base_url` scheme；其地址语义由注册 factory 在 binding 阶段校验。进程外 Plugin 不提供 Provider type。
 
 Plugin 和 Log 的静态规则也属于基础 Validator：
 
