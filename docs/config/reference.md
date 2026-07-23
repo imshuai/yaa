@@ -376,7 +376,14 @@ type ToolConfig struct {
 | `max_concurrent_per_session` | `3` | `> 0` 且 `<= max_concurrent` |
 | `default_max_retry` | `1` | `0..10` |
 | `max_result_tokens` | `4000` | `> 0` |
-| `builtin` | canonical builtin entries | key 必须是已注册 builtin name |
+| `builtin` | v1 canonical entries | key 必须是下表中的内置配置键 |
+
+v1 的 `builtin` 配置键固定为：`shell`、`http`、`file`、`config_query`、
+`config_reload`、`runtime_status`、`agent_list`、`agent_inspect`、
+`session_list`、`session_inspect`、`tool_list`、`skill_list`、
+`provider_list` 和 `mcp_list`。其中 `file` 是 `file_read`、`file_write`、
+`file_list`、`file_delete` 四个注册 Tool 共享的配置组；其余键与注册 Tool
+一一对应。配置组未出现时使用内置默认值；没有 `options` 的键只接受空 object。
 
 ### 6.1 tools.builtin.shell
 
