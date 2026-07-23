@@ -50,7 +50,7 @@ SKILL.md frontmatter options
 
 不递归 merge object，不拼接 array，不把 `null` 解释为删除；`null` 是普通 JSON value。合并完成后深拷贝并冻结，标准 JSON 编码不得超过 64 KiB。
 
-Options 只能包含 JSON-compatible scalar、array 和 string-keyed object，不接受 NaN/Infinity、YAML timestamp/tag/alias、函数或循环引用。它们会进入 Provider system prompt，因此不得保存凭据。Validator 递归规范化 key（Unicode case-fold，`-` 转 `_`），并拒绝以下 exact key：
+Options 只能包含 JSON-compatible scalar、array 和 string-keyed object，不接受 NaN/Infinity、YAML timestamp/tag/alias、函数或循环引用。基础 Config Validator 只检查 root/Agent options 可被标准 JSON 编码；合并后的 options 会进入 Provider system prompt，因此不得保存凭据。Skill binding 阶段递归规范化 key（Unicode case-fold，`-` 转 `_`），并拒绝以下 exact key：
 
 ```text
 api_key, password, secret, token, access_token, refresh_token,
@@ -61,13 +61,13 @@ authorization, cookie, set_cookie, private_key, client_secret
 
 ## 4. 校验与重启
 
-Config 基础校验负责类型、未知字段、路径和 option 编码；Skill Manager 加载后执行第二阶段 binding：
+Config 基础校验负责类型、未知字段、路径和 root/Agent option 编码；Skill Manager 加载后执行第二阶段 binding：
 
 1. `per_skill` 和 `skills_config` name 必须对应已加载目录；
 2. Agent allowlist 不得引用 disabled Skill；
 3. 递归 Skill 依赖必须也在 Agent allowlist；
 4. Tool 依赖必须已注册、enabled 且被 Agent 允许；
-5. 合并后的 option 大小和敏感 key 检查通过。
+5. 合并后的 option 大小不超过 64 KiB，并通过敏感 key 检查。
 
 `skills.dir`、`per_skill`、`agents[].skills` 和 `agents[].skills_config` 全部 restart-required。ReloadManager 发现这些变化时整批不发布 candidate，返回 `ReloadResult{RestartRequired:true}`。
 

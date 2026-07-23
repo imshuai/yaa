@@ -96,10 +96,10 @@ runtime:
 - `runtime.api.http.addr` 不是 loopback IP 或 `localhost` 时，`enabled=false` 拒绝启动；`0.0.0.0`、`::` 和空 host 都不是 loopback。
 - `token_type` 只能是 `static|jwt`。Role name 必须非空且唯一；permission 的 action 只能是 `read|write|delete|*`，resource 必须是 Remote 路由总表中的资源或 `*`，effect 只能省略、`allow` 或 `deny`。
 - `public_paths` 每项必须已经 canonical 且全局唯一。
-- `static` 且认证启用时至少有一个 Token；Token name 和 Token value 分别唯一，value 非空，每个 Token 至少引用一个已定义 Role。
-- `jwt` 且认证启用时使用 HS256，Secret 至少 32 bytes，issuer/audience 非空，clock skew 位于 `0..5m`。
+- 已提供的 Token descriptor 无论认证是否启用都必须有非空且唯一的 name/value、至少一个已定义 Role；仅 `static` 且认证启用时才要求至少有一个 Token。
+- JWT issuer/audience 必须非空，clock skew 始终位于 `0..5m`；仅 `jwt` 且认证启用时才要求 HS256 Secret 至少 32 bytes。
 
-Validator 聚合全部错误并报告完整配置路径；不得因认证关闭而跳过监听地址、枚举、Role 或 public path 的结构校验。
+Validator 聚合全部错误并报告完整配置路径；不得因认证关闭而跳过监听地址、枚举、已提供的 Token/JWT descriptor、Role 或 public path 的静态校验。
 
 ## 4. 权限规则格式
 

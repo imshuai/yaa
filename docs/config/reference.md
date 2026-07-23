@@ -368,7 +368,7 @@ type ToolConfig struct {
 }
 ```
 
-`ToolConfig.Options` 只作为不同内置 Tool 的解码边界。启动 binding 阶段必须先按完整配置路径分别严格校验 root 与 Agent override，再做顶层 key merge，并解码为对应的 `Effective*Options`；未知 key、错误类型或范围错误都聚合为 `ValidationError`。例如未知的 Agent Shell key 必须报告 `agents[2].tools_config.shell.options.<key>`，不能静默忽略。没有 options 的内置 Tool 只接受空 object。
+`ToolConfig.Options` 只作为不同内置 Tool 的解码边界。基础 Config Validator 拒绝未知 root builtin key，并检查 root Tool timeout 的 `0..max_timeout` 范围。启动 binding 阶段必须先按完整配置路径分别严格校验 root options 与 Agent override，再做顶层 key merge，并解码为对应的 `Effective*Options`；Agent timeout 也必须位于 `0..max_timeout`，越界错误固定为 `agents[i].tools_config.<name>.timeout / range / must be in 0..max_timeout`。未知 key、错误类型或范围错误都聚合为 `ValidationError`。例如未知的 Agent Shell key 必须报告 `agents[2].tools_config.shell.options.<key>`，不能静默忽略。没有 options 的内置 Tool 只接受空 object。
 
 | 字段 | 默认值 | 校验 |
 |------|--------|------|
@@ -439,7 +439,7 @@ type SkillItemConfig struct {
 | 字段 | 类型 | 默认值 | 热更新 | 说明 |
 |------|------|--------|:------:|------|
 | `dir` | `string` | `"./skills"` | ❌ | 非空 Skill 文件扫描目录 |
-| `per_skill` | `map[string]SkillItemConfig` | `{}` | — | 按非空名称对单个 Skill 的配置覆盖 |
+| `per_skill` | `map[string]SkillItemConfig` | `{}` | — | 按非空名称对单个 Skill 的配置覆盖；options 必须可被标准 JSON 编码 |
 | `per_skill.<name>.enabled` | `bool` | `true` | ❌ | 是否启用该 Skill；改变已加载集合需要重启 |
 | `per_skill.<name>.options` | `map[string]any` | `{}` | ❌ | 传入 Skill 的自定义配置；v1 在加载时冻结 |
 

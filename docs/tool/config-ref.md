@@ -90,6 +90,6 @@ agents:
           working_dir: "/workspace/project"
 ```
 
-`tools_config` 只覆盖该 Agent 的 Tool `timeout` 与 `options`。Manager 将其解码为不含 `Enabled` 的内部 presence-aware override（`Timeout *time.Duration`、nil/非 nil `Options`）；不能复用 root `config.ToolConfig`，也不能让 Agent 重新启用 root disabled Tool。root 和 Agent options 都在启动 binding 阶段按 [Config reference](../config/reference.md#6-tools-节点) 严格解码，未知 key 必须报告完整配置路径。`ToolChoice` 和 `Thinking` 是每次组装 `provider.ChatRequest` 时设置的请求级字段，不是 `AgentConfig` 字段。
+`tools_config` 只覆盖该 Agent 的 Tool `timeout` 与 `options`。Manager 将其解码为不含 `Enabled` 的内部 presence-aware override（`Timeout *time.Duration`、nil/非 nil `Options`）；不能复用 root `config.ToolConfig`，也不能让 Agent 重新启用 root disabled Tool。基础 Config Validator 拒绝未知 root builtin key，并检查 root Tool timeout 的 `0..max_timeout` 范围；root 和 Agent options 以及 Agent timeout 在启动 binding 阶段按 [Config reference](../config/reference.md#6-tools-节点) 严格解码，Agent timeout 必须位于 `0..max_timeout`，错误固定为 `agents[i].tools_config.<name>.timeout / range / must be in 0..max_timeout`，未知 key 必须报告完整配置路径。`ToolChoice` 和 `Thinking` 是每次组装 `provider.ChatRequest` 时设置的请求级字段，不是 `AgentConfig` 字段。
 
 ---

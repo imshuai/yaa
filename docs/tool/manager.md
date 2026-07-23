@@ -126,7 +126,7 @@ tools.default_timeout
   <- agents[].tools_config.<name>.timeout
 ```
 
-Options 同样按 map key 覆盖；nil Agent `Options` 表示未出现，非 nil 空 map 表示没有新增 key，不会清空 root map。最终 timeout 限制在 `tools.max_timeout` 内。`Enabled` 只来自 root Tool 配置，Agent override 无权改变；`MaxRetry` 只来自 `tools.default_max_retry`，不在 ToolConfig/Agent override 重复声明。结果限长从该 snapshot 找到同一 Agent 当前的 Provider ID/Model，经 `providers.Get` 获得 estimator；找不到 Agent/Provider 或估算失败都返回硬错误，不注入未受限 Content。一次 Execute 不再读取第二个 snapshot。
+Options 同样按 map key 覆盖；nil Agent `Options` 表示未出现，非 nil 空 map 表示没有新增 key，不会清空 root map。最终 timeout 必须位于 `0..tools.max_timeout`；越界配置在 binding 阶段拒绝。`Enabled` 只来自 root Tool 配置，Agent override 无权改变；`MaxRetry` 只来自 `tools.default_max_retry`，不在 ToolConfig/Agent override 重复声明。结果限长从该 snapshot 找到同一 Agent 当前的 Provider ID/Model，经 `providers.Get` 获得 estimator；找不到 Agent/Provider 或估算失败都返回硬错误，不注入未受限 Content。一次 Execute 不再读取第二个 snapshot。
 
 ---
 
