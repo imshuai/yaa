@@ -19,6 +19,7 @@ Phase 1：核心骨架。
 - 根配置及各子系统 canonical 默认值已实现，所有容器按调用独立初始化。
 - 配置文件中的数组和动态 Map 元素默认值已实现，并统一规范化 TOML 的对象数组。
 - Presence-aware typed decode 已实现：保留缺失字段、整体替换切片、按 key 合并 Map，并严格处理 null、duration、标量转换、未知字段和完整错误路径。
+- Session、Memory 与 Context 的 presence-aware policy resolver 已实现，显式 `false`/`0` 可覆盖上层值。
 
 ## 下一步
 
