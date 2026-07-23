@@ -21,10 +21,10 @@ Phase 1：核心骨架。
 - Presence-aware typed decode 已实现：保留缺失字段、整体替换切片、按 key 合并 Map，并严格处理 null、duration、标量转换、未知字段和完整错误路径。
 - Session、Memory、Context 与 Planner 的 presence-aware policy resolver 已实现，显式 `false`/`0` 可覆盖上层值。
 - Validator 契约已补齐所有静态 helper、稳定错误、NaN、inactive descriptor、Skill option 编码及静态/binding 两阶段边界。
+- 基础配置 Validator 已实现：聚合结构化错误、校验根与 Agent effective policy，并保持配置只读。
 
 ## 下一步
 
-- 实现基础配置校验。
 - 实现配置路径发现和统一 Loader，再接入健康检查与 Runtime。
 
 每个可独立验收的功能完成后单独提交并推送到 `gitea/main`。
