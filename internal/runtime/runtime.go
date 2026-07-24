@@ -8,6 +8,7 @@ import (
 
 	"github.com/imshuai/yaa/internal/api"
 	"github.com/imshuai/yaa/internal/config"
+	ctxwindow "github.com/imshuai/yaa/internal/context"
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/session"
 	"github.com/imshuai/yaa/internal/storage"
@@ -21,6 +22,7 @@ type Runtime struct {
 	store     storage.Storage
 	providers *provider.Manager
 	sessions  *session.Manager
+	contextM  *ctxwindow.Manager
 	api       *api.Server
 	logger    *slog.Logger
 
@@ -70,6 +72,9 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	}
 	rt.providers = pm
 	rt.components["provider"] = "ready"
+
+	// Context 窗口管理器
+	rt.contextM = ctxwindow.NewManager()
 
 	// Session：Restore 失败阻止 Ready（文档：Remote API 不得在 Restore 完成前进入 Ready）。
 	sm := session.NewManager(rt.cfg.Session, rt.store, rt.logger, session.ManagerOptions{
@@ -173,6 +178,7 @@ func (rt *Runtime) rollback() {
 	}
 	rt.api = nil
 	rt.sessions = nil
+	rt.contextM = nil
 	rt.providers = nil
 	rt.store = nil
 	rt.components = map[string]string{}

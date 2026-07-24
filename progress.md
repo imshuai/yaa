@@ -106,3 +106,18 @@ Phase 1：核心骨架。
 - api 测试 6 用例绿：Create(201+DTO/agent_id/state/id前缀)、Create-AgentNotFound(404 40401)、List(分页)、Get+Pause+Resume+Close+Delete+AfterDelete404、ListMessages(2条顺序)、ClearMessages.
 - 全项目 `go test ./...` + `go vet ./...` + `go build ./...` 全绿。
 - Gitea push 仍 hang（服务端 receive-pack POST 无 ACK，连续 5+ 轮验证；已多方案尝试无果），本地 7 提交待推。
+
+## Context 窗口管理器（已完成）
+
+- `internal/context` 包实现 docs/context 契约：
+  - `errors.go`：8 个稳定错误 sentinel。
+  - `budget.go`：`ResolveContextBudget(cfg, modelWindow, modelMaxOutput, outputTokens)` 计算 EffectiveWindow/ReservedOutput/Input，窗口未知或 reserve/output 关系非法返回对应错误。
+  - `manager.go`：`Manager` 无状态，`Build(ctx, BuildInput)` 唯一公开入口。流程：校验前置条件→计算预算→groupUnits 构造并校验消息单元→EstimateInputTokens 估算完整候选→不超限直接返回→超限时估算 protected-only→按策略（reject/truncate/hybrid）处理→最终估算确认不超限→返回 BuildOutput+Metadata。
+  - `groupUnits`：开头 system 各自成 protected unit；按 user 分 turn；assistant+tool results 组成不可拆分 unit；CurrentTurnStart 所在 turn 及之后受保护；历史 Tool turn 不可压缩；orphan/重复/缺失 Tool result 返回 ErrInvalidMessageSequence。
+  - `truncate`：从最旧可删除 unit 开始删除直到不超限，无可删 unit 返回 ErrContextOverflow。
+  - `hybrid`：v1 暂降级为 truncate（摘要需 Provider 摘要调用，后续补全）。
+  - `copyRequest`：深拷贝 Messages + ToolCalls。
+- 7 个 context 测试全绿：under-budget 直接返回、reject 超限报错、truncate 删旧 unit、groupUnits 分组校验、invalid sequence（orphan/非 user 首条/不完整 Tool chain）、ResolveContextBudget 正常+窗口未知。
+- Runtime 接入 `contextM *ctxwindow.Manager`（Phase 2 后续 Agent 调用）。
+- 全项目 test/vet/build 全绿。
+- 2 个本地 pending 提交（session 2c83ef0 + api 0646a52 + ctx 待提交）。
