@@ -200,3 +200,24 @@ Phase 1：核心骨架。
   - `conversation_handler_test.go` 增 `TestAPISSESessionEnd`：SSE 订阅 + sm.Close 后客户端拿到session_end/closed。
   - 修复 SSE handler 因移除 `data:` 前缀造成的 TestAPISSEEvents 回归。
 - 全项目 build/vet/test 全绿。
+
+## Phase 2：Claude adapter（已完成本地代码）
+
+- `internal/provider/claude.go`（新增）：Anthropic Messages API adapter。
+  - `Chat`：POST `<base>/v1/messages`，header `x-api-key` + `anthropic-version: 2023-06-01`。
+  - 请求转换：
+    - `messages` 中 `system` role 提取到 top-level `system`（多条拼接）。
+    - `tool` role（即 tool 结果） → `user` role + `tool_result` block（带 `tool_use_id`/`content`）。
+    - `assistant` role 带 `tool_calls` 转 content blocks：`thinking`（可选）+ `text` + 每个 `tool_use`（ID/name/input JSON）。
+    - `ToolDef` → Anthropic `{name, description, input_schema}`。
+    - `ToolChoice` 模式映射：auto/none/required/specific → Anthropic `{type:"...","name":...}`。
+    - `ThinkingConfig` → `{type:"enabled", budget_tokens}`。
+    - `Extra` 注入顶层。
+  - `StreamChat`：解析 Anthropic SSE 事件 `message_start`、`content_block_start/delta/stop`、`message_delta`、`message_stop`，映射到 ChatChunk：
+    - `text_delta` → `Delta.Content`；`input_json_delta` → `Delta.ToolCalls[0].Arguments` 增量（带 stable block id）；`thinking_delta` → `Delta.ReasoningContent`。
+    - `stop_reason` → `FinishReason`（end_turn/stop_sequence=stop、tool_use=tool_calls、max_tokens=length）。
+    - usage 合并 input_tokens+output_tokens。
+  - 错误分类：HTTP 401/403/429/5xx → ProviderError Code（401=unauthorized、403=forbidden、429=rate_limit+RetryAfter、5xx=server）；复用 openai 的 `classifyHTTPStatus`。
+- manager.go `init()` 注册 factory `"claude"`。
+- 测试 `claude_test.go` 6 例：Chat 文本（system/max_tokens/Anthropic-Version 校验）、Chat tool_use（input JSON 转 string args）、错误分类（401/403/429 retryable）、Stream text+tool delta（delta 拼接 + tool_use input 增量 + stop_reason→tool_calls）、Stream thinking（`thinking_delta`/`text_delta`/usage）、Manager factory 注册端到端。
+- 全项目 build/vet/test 全绿。
