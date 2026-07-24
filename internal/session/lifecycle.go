@@ -243,6 +243,12 @@ func (m *Manager) Close(ctx context.Context, sessionID string) error {
 			return nil // 幂等
 		}
 		_, err = m.transitionLocked(sessionID, StateClosed, "close")
+		if err == nil {
+			// Hub 关闭并向订阅者发布 session_end{reason:"closed"}。
+			m.mu.Lock()
+			m.closeHubLocked(sessionID, &SessionEndEvent{Reason: "closed"})
+			m.mu.Unlock()
+		}
 		return err
 	})
 }
@@ -288,8 +294,8 @@ func (m *Manager) runInSessionWithinDelete(ctx context.Context, sessionID string
 			delete(set, sessionID)
 		}
 		delete(m.activeTurns, sessionID)
-		// 关闭 hub，通知订阅者 session_end(deleted)。
-		m.closeHubLocked(sessionID, nil)
+		// 关闭 hub，通知订阅者 session_end{reason:"deleted"}。
+		m.closeHubLocked(sessionID, &SessionEndEvent{Reason: "deleted"})
 		m.mu.Unlock()
 		return nil
 	})

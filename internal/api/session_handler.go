@@ -106,6 +106,8 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		s.handleDeleteMessage(w, r, sp, sessionID, subID)
 	case sub == "events" && r.Method == http.MethodGet:
 		s.handleSSEEvents(w, r, sp, sessionID)
+	case sub == "stream" && r.Method == http.MethodGet:
+		s.handleWSStream(w, r, sp, sessionID)
 	default:
 		s.writeError(w, r, http.StatusMethodNotAllowed, 40501, "method not allowed")
 	}

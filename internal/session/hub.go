@@ -133,3 +133,9 @@ func (s *Subscriber) IsClosed() bool {
 		return false
 	}
 }
+
+// SessionEndEvent 是 Hub 注销/关闭时发布的终态事件，SSE/WS 端可借此生成 ConversationFrame{Type:"session_end"}。
+// Reason 取值 "closed"（Session 转入 Closed）或 "deleted"（Session 物理删除）。
+type SessionEndEvent struct {
+	Reason string
+}

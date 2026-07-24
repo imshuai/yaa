@@ -292,3 +292,52 @@ func containsStr(xs []string, x string) bool {
 	}
 	return false
 }
+
+// TestAPISSESessionEnd 校验 Session 被 Close/Delete 时 SSE 订阅者收到 session_end frame。
+func TestAPISSESessionEnd(t *testing.T) {
+	apiSrv, sm := conversationTestEnv(t)
+	hsrv := httptest.NewServer(apiSrv.server.Handler)
+	t.Cleanup(hsrv.Close)
+	ctx := context.Background()
+	s, err := sm.Create(ctx, session.CreateRequest{AgentID: "agent-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sseURL := hsrv.URL + "/api/v1/sessions/" + s.ID + "/events"
+	sseReq, _ := http.NewRequestWithContext(ctx, "GET", sseURL, nil)
+	sseResp, err := http.DefaultClient.Do(sseReq)
+	if err != nil {
+		t.Fatalf("sse connect: %v", err)
+	}
+	defer sseResp.Body.Close()
+
+	// 触发 Close session：should publish session_end{reason:"closed"}。
+	if err := sm.Close(ctx, s.ID); err != nil {
+		t.Fatalf("sm.Close: %v", err)
+	}
+
+	rd := bufio.NewReader(sseResp.Body)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		line, err := rd.ReadString('\n')
+		if err != nil {
+			t.Fatalf("sse read err before session_end: %v", err)
+		}
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		var fr ConversationFrame
+		if jerr := json.Unmarshal([]byte(payload), &fr); jerr != nil {
+			continue
+		}
+		if fr.Type == "session_end" {
+			if fr.Reason != "closed" {
+				t.Fatalf("expected session_end reason=closed, got %q", fr.Reason)
+			}
+			return
+		}
+	}
+	t.Fatalf("did not receive session_end before deadline")
+}

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"time"
+
+	"github.com/imshuai/yaa/internal/session"
 )
 
 // handleSSEEvents 实现 GET /api/v1/sessions/:id/events（SSE 订阅）。
@@ -58,17 +60,26 @@ func (s *Server) handleSSEEvents(w http.ResponseWriter, r *http.Request, sp Sess
 			if !open {
 				return
 			}
-			frame, ok := ev.(ConversationFrame)
-			if !ok {
+			var frame ConversationFrame
+			switch e := ev.(type) {
+			case ConversationFrame:
+				frame = e
+			case *session.SessionEndEvent:
+				frame = sessionEndToFrame(e)
+			default:
 				continue
 			}
+
 			// 写 SSE 帧：event: conversation\ndata: <json>\n\n
 			_, _ = w.Write([]byte("event: conversation\n"))
-			// 将 JSON 放在 data: 行内。enc.Encode 已自带末尾 \n；再补一个空行作为帧分隔。
 			_, _ = w.Write([]byte("data: "))
 			_ = enc.Encode(frame)
 			_, _ = w.Write([]byte("\n"))
 			flusher.Flush()
+			// session_end 帧为订阅终止终态；写完即退出来保证客户端不再等待。
+			if frame.Type == "session_end" {
+				return
+			}
 		case <-ticker.C:
 			_, _ = w.Write([]byte(": heartbeat\n\n"))
 			flusher.Flush()

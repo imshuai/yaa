@@ -122,3 +122,9 @@ func turnEventToFrame(e agent.TurnEvent, turnID string) ConversationFrame {
 	}
 	return f
 }
+
+// sessionEndToFrame 把 session.SessionEndEvent 转 ConversationFrame{Type:"session_end",Reason}。
+// SessionEndEvent 在 Hub Close 时发布给所有订阅者，作为订阅终止终态。
+func sessionEndToFrame(e *session.SessionEndEvent) ConversationFrame {
+	return ConversationFrame{Type: "session_end", Reason: e.Reason}
+}
