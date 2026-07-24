@@ -32,7 +32,7 @@ func ResolveContextBudget(
 		window = cfg.MaxTokens
 	}
 	if cfg.ReservedTokens < outputTokens || cfg.ReservedTokens >= window {
-		return Budget{}, fmt.Errorf("%w: reserved=%d output=%d window=%d", ErrContextConfigInvalid, cfg.ReservedTokens, outputTokens, window)
+		return Budget{}, fmt.Errorf("%w: reserved=%d < output=%d or >= window=%d", ErrContextConfigInvalid, cfg.ReservedTokens, outputTokens, window)
 	}
 	return Budget{
 		EffectiveWindow: window,
