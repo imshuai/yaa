@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 func newTestConfig() *config.Config {
 	cfg := config.Default()
 	cfg.Runtime.API.HTTP.Addr = "127.0.0.1:0"
+	cfg.Runtime.Storage.Type = "memory" // 测试用内存后端，避免落地真实 SQLite 文件
 	return cfg
 }
 
@@ -41,11 +43,14 @@ func TestRuntimeStartMarksReadyAndHealth(t *testing.T) {
 		t.Fatal("not ready after start")
 	}
 	h := rt.Health()
-	if !h.Ready || h.Status != "healthy" {
-		t.Fatalf("health: %+v", h)
+	if !h.Ready || h.Status != "degraded" {
+		t.Fatalf("health: %+v (memory backend => degraded)", h)
 	}
 	if h.Components["api"] != "ready" {
 		t.Fatalf("api component missing: %#v", h.Components)
+	}
+	if h.Components["storage"] != "degraded" {
+		t.Fatalf("storage component should be degraded for memory backend: %#v", h.Components)
 	}
 	if rt.UptimeSeconds() < 0 {
 		t.Fatalf("uptime negative: %d", rt.UptimeSeconds())
@@ -84,6 +89,8 @@ func TestRuntimeHealthNotReadyBeforeStart(t *testing.T) {
 func TestRuntimeE2EHealthHTTP(t *testing.T) {
 	cfg := config.Default()
 	cfg.Runtime.API.HTTP.Addr = "127.0.0.1:0"
+	cfg.Runtime.Storage.Type = "sqlite"
+	cfg.Runtime.Storage.Path = filepath.Join(t.TempDir(), "yaa.db")
 	rt, err := New(cfg, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)

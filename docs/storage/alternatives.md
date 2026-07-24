@@ -113,7 +113,9 @@ func (s *MemoryStorage) cleanupLoop() {
 
 ## 4. 与 persist 的关系
 
-`SessionPolicy.Persist=true` 表示 Session Manager 会调用根 Storage，不保证选中的后端跨进程持久化。若 root type 是 memory，调用在进程内仍成功，但 shutdown 后无法 Restore；启动日志和 `/api/v1/health` 必须明确报告 `durable=false`。
+`SessionPolicy.Persist=true` 表示 Session Manager 会调用根 Storage，不保证选中的后端跨进程持久化。若 root type 是 memory，调用在进程内仍成功，但 shutdown 后无法 Restore。
+
+`/api/v1/health` 的 `components.storage` 反映后端持久性：SQLite 后端报告 `ready`；memory 后端报告 `degraded`（运行期可用但跨进程不持久），启动日志同时以 `durable=false` 标记。不新增 `HealthData` schema 顶层字段，避免与 [system.md](../remote-api/system.md) 的 envelope 契约漂移。
 
 ## 5. 后端对比
 

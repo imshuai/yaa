@@ -6,32 +6,32 @@
 
 ## 接口
 
-- [ ] Storage 完整实现 Get/Set/Delete/Has/Keys/Close。
-- [ ] ErrNotFound/Closed/InvalidKey/InvalidTTL/InvalidPath/ValueTooLarge 可用 errors.Is 判断。
-- [ ] key/value/TTL 固定上限在 sqlite/memory 共同 wrapper 校验。
-- [ ] Set/Get 深拷贝 bytes；Delete 缺失和 Close 重复调用幂等。
-- [ ] Keys 隐藏过期值并按 key 稳定升序。
+- [x] Storage 完整实现 Get/Set/Delete/Has/Keys/Close。
+- [x] ErrNotFound/Closed/InvalidKey/InvalidTTL/InvalidPath/ValueTooLarge 可用 errors.Is 判断。
+- [x] key/value/TTL 固定上限在 sqlite/memory 共同 wrapper 校验。
+- [x] Set/Get 深拷贝 bytes；Delete 缺失和 Close 重复调用幂等。
+- [x] Keys 隐藏过期值并按 key 稳定升序。
 
 ## SQLite
 
-- [ ] 使用 `modernc.org/sqlite`，无 CGO；root 表名不与 Memory 冲突。
-- [ ] schema version、migration、WAL、busy timeout 和单连接初始化失败均阻止 Ready。
-- [ ] Set 使用原子 upsert；Get/Has/Keys 在 SQL 中过滤 expiry。
-- [ ] cleanup 按 expiry/key 排序，每批最多 1000，支持关闭等待。
+- [x] 使用 `modernc.org/sqlite`，无 CGO；root 表名不与 Memory 冲突。
+- [x] schema version、migration、WAL、busy timeout 和单连接初始化失败均阻止 Ready。
+- [x] Set 使用原子 upsert；Get/Has/Keys 在 SQL 中过滤 expiry。
+- [x] cleanup 按 expiry/key 排序，每批最多 1000，支持关闭等待。
 - [ ] Close 后所有方法返回 ErrClosed；online backup/integrity check 有集成测试。
 
 ## Memory 后端
 
-- [ ] 使用 injected Clock，不靠 sleep 测 TTL。
-- [ ] 唯一 60 秒 worker 做 batch 1000 清理；惰性读取仍隐藏过期值。
-- [ ] Close 标记 closed、停止并等待 worker；重复 Close 幂等。
-- [ ] map 内 value 不暴露给调用方；Keys 与 SQLite 排序一致。
-- [ ] health 明确 `durable=false`。
+- [x] 使用 injected Clock，不靠 sleep 测 TTL。
+- [x] 唯一 60 秒 worker 做 batch 1000 清理；惰性读取仍隐藏过期值。
+- [x] Close 标记 closed、停止并等待 worker；重复 Close 幂等。
+- [x] map 内 value 不暴露给调用方；Keys 与 SQLite 排序一致。
+- [x] `/api/v1/health` 的 `components.storage` 反映持久性：SQLite=`ready`，memory=`degraded`；启动日志标记 `durable=false`。
 
 ## 集成
 
-- [ ] `runtime.storage.type` 只接受 `sqlite|memory`，Config 只有 Type/Path。
-- [ ] Root Storage 所有者是 Runtime；Session Manager 不 Close。
+- [x] `runtime.storage.type` 只接受 `sqlite|memory`，Config 只有 Type/Path。
+- [x] Root Storage 所有者是 Runtime；Session Manager 不 Close。
 - [ ] Session 只写 `session:<id>` 完整 snapshot且不传 Storage TTL。
 - [ ] Memory 使用专用 ContentStore，不生成 root KV key。
 - [ ] Restore 遇坏 snapshot 不发布部分状态。
