@@ -59,7 +59,7 @@ func TestClaudeChatText(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"id":   "msg_1",
+			"id":    "msg_1",
 			"model": "claude-3-5-sonnet",
 			"role":  "assistant",
 			"type":  "message",
@@ -67,7 +67,7 @@ func TestClaudeChatText(t *testing.T) {
 				{"type": "text", "text": "Hello"},
 			},
 			"stop_reason": "end_turn",
-			"usage": map[string]any{"input_tokens": 10, "output_tokens": 2},
+			"usage":       map[string]any{"input_tokens": 10, "output_tokens": 2},
 		})
 	}))
 	t.Cleanup(srv.Close)
@@ -115,7 +115,7 @@ func TestClaudeChatToolUse(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"id":   "msg_2",
+			"id":    "msg_2",
 			"model": "claude-3-5-sonnet",
 			"content": []map[string]any{
 				{"type": "tool_use", "id": "toolu_1", "name": "search", "input": map[string]any{"q": "go"}},
@@ -132,7 +132,7 @@ func TestClaudeChatToolUse(t *testing.T) {
 	r, err := p.Chat(context.Background(), &ChatRequest{
 		Model: "claude-3-5-sonnet", MaxTokens: &mt,
 		Messages: []Message{{Role: "user", Content: "search Go"}},
-		Tools:   []ToolDef{{Type: "function", Function: ToolFunction{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`)}}},
+		Tools:    []ToolDef{{Type: "function", Function: ToolFunction{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`)}}},
 	})
 	if err != nil {
 		t.Fatalf("Chat: %v", err)
@@ -150,9 +150,9 @@ func TestClaudeChatToolUse(t *testing.T) {
 
 func TestClaudeChatErrorClassification(t *testing.T) {
 	for _, c := range []struct {
-		status  int
-		other   bool
-		code    ErrorCode
+		status int
+		other  bool
+		code   ErrorCode
 	}{
 		{http.StatusUnauthorized, false, ErrCodeUnauthorized},
 		{http.StatusForbidden, false, ErrCodeForbidden},
@@ -312,8 +312,8 @@ func TestClaudeManagerFactory(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id": "msg_x", "model": "claude-3-5-sonnet",
-			"content": []map[string]any{{"type": "text", "text": "yo"}},
-			"usage": map[string]any{"input_tokens": 1, "output_tokens": 1},
+			"content":     []map[string]any{{"type": "text", "text": "yo"}},
+			"usage":       map[string]any{"input_tokens": 1, "output_tokens": 1},
 			"stop_reason": "end_turn",
 		})
 	}))

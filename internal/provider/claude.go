@@ -84,13 +84,13 @@ type anthropicMessage struct {
 }
 
 type anthropicBlock struct {
-	Type    string          `json:"type"`              // text | tool_use | tool_result | thinking
-	Text    string          `json:"text,omitempty"`
-	ID      string          `json:"id,omitempty"`
-	Name    string          `json:"name,omitempty"`
-	Input   json.RawMessage `json:"input,omitempty"`
-	ToolUseID string        `json:"tool_use_id,omitempty"`
-	Content  string         `json:"content,omitempty"`  // tool_result content (string)
+	Type      string          `json:"type"` // text | tool_use | tool_result | thinking
+	Text      string          `json:"text,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Input     json.RawMessage `json:"input,omitempty"`
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	Content   string          `json:"content,omitempty"` // tool_result content (string)
 }
 
 type anthropicTool struct {
@@ -156,7 +156,7 @@ func (p *claudeProvider) buildAnthropicReq(req *ChatRequest, stream bool) (*anth
 		case "tool":
 			// Anthropic 不区分 tool role，tool 结果 content 提升为 user role 含 tool_result block。
 			out.Messages = append(out.Messages, anthropicMessage{
-				Role:    "user",
+				Role: "user",
 				Content: []anthropicBlock{{
 					Type:      "tool_result",
 					ToolUseID: m.ToolCallID,
@@ -251,11 +251,11 @@ func (p *claudeProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRespo
 		return nil, p.errorFromResponse(resp)
 	}
 	var wire struct {
-		ID      string         `json:"id"`
-		Model   string         `json:"model"`
-		Content []anthropicBlock `json:"content"`
-		StopReason string      `json:"stop_reason"`
-		Usage struct {
+		ID         string           `json:"id"`
+		Model      string           `json:"model"`
+		Content    []anthropicBlock `json:"content"`
+		StopReason string           `json:"stop_reason"`
+		Usage      struct {
 			InputTokens  int `json:"input_tokens"`
 			OutputTokens int `json:"output_tokens"`
 		} `json:"usage"`
@@ -276,8 +276,8 @@ func (p *claudeProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRespo
 				args = "{}"
 			}
 			out.ToolCalls = append(out.ToolCalls, ToolCall{
-				ID:   b.ID,
-				Type: "function",
+				ID:       b.ID,
+				Type:     "function",
 				Function: ToolCallFunction{Name: b.Name, Arguments: args},
 			})
 		}
@@ -338,12 +338,12 @@ func (p *claudeProvider) streamLoop(ctx context.Context, resp *http.Response, ou
 	const maxLine = 1 << 20
 	scanner.Buffer(make([]byte, 0, maxLine), maxLine)
 	var (
-		model      string
-		inputToks  int
-		usage      *Usage
-		finish     string
-		blockIdx   int = -1
-		blockType  string
+		model       string
+		inputToks   int
+		usage       *Usage
+		finish      string
+		blockIdx    int = -1
+		blockType   string
 		blockToolID string
 	)
 	for scanner.Scan() {
@@ -403,8 +403,8 @@ func (p *claudeProvider) streamLoop(ctx context.Context, resp *http.Response, ou
 					argv, _ := d["partial_json"].(string)
 					if argv != "" {
 						delta.ToolCalls = []ToolCall{{
-							ID:   blockToolID,
-							Type: "function",
+							ID:       blockToolID,
+							Type:     "function",
 							Function: ToolCallFunction{Arguments: argv},
 						}}
 					}

@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strings"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,7 +35,7 @@ func TestGeminiChatText(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"candidates": []map[string]any{
 				{
-					"content": map[string]any{"role": "model", "parts": []map[string]any{{"text": "Hello AI"}}},
+					"content":      map[string]any{"role": "model", "parts": []map[string]any{{"text": "Hello AI"}}},
 					"finishReason": "STOP",
 				},
 			},
@@ -88,7 +88,7 @@ func TestGeminiChatToolCall(t *testing.T) {
 	r, err := p.Chat(context.Background(), &ChatRequest{
 		Model: "gemini-2.0", MaxTokens: &mt,
 		Messages: []Message{{Role: "user", Content: "search"}},
-		Tools:   []ToolDef{{Type: "function", Function: ToolFunction{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`)}}},
+		Tools:    []ToolDef{{Type: "function", Function: ToolFunction{Name: "search", Parameters: json.RawMessage(`{"type":"object"}`)}}},
 	})
 	if err != nil {
 		t.Fatalf("Chat: %v", err)

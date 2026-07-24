@@ -64,23 +64,23 @@ func (p *geminiProvider) EstimateInputTokens(ctx context.Context, req *ChatReque
 
 // geminiReq 是 Generative API 请求体最小字段。
 type geminiReq struct {
-	Contents          []geminiContent        `json:"contents"`
-	SystemInstruction *geminiContent         `json:"systemInstruction,omitempty"`
-	Tools             []map[string]any       `json:"tools,omitempty"`
-	ToolConfig        *geminiToolConfig     `json:"toolConfig,omitempty"`
+	Contents          []geminiContent         `json:"contents"`
+	SystemInstruction *geminiContent          `json:"systemInstruction,omitempty"`
+	Tools             []map[string]any        `json:"tools,omitempty"`
+	ToolConfig        *geminiToolConfig       `json:"toolConfig,omitempty"`
 	GenerationConfig  *geminiGenerationConfig `json:"generationConfig,omitempty"`
 }
 
 type geminiContent struct {
-	Role  string         `json:"role,omitempty"` // user | model
-	Parts []geminiPart   `json:"parts"`
+	Role  string       `json:"role,omitempty"` // user | model
+	Parts []geminiPart `json:"parts"`
 }
 
 type geminiPart struct {
-	Text             string          `json:"text,omitempty"`
-	FunctionCall     *geminiFC       `json:"functionCall,omitempty"`
-	FunctionResponse *geminiFR       `json:"functionResponse,omitempty"`
-	Thought          bool            `json:"thought,omitempty"` // Gemini 2.5 thinking block
+	Text             string    `json:"text,omitempty"`
+	FunctionCall     *geminiFC `json:"functionCall,omitempty"`
+	FunctionResponse *geminiFR `json:"functionResponse,omitempty"`
+	Thought          bool      `json:"thought,omitempty"` // Gemini 2.5 thinking block
 }
 
 type geminiFC struct {
@@ -89,7 +89,7 @@ type geminiFC struct {
 }
 
 type geminiFR struct {
-	Name    string          `json:"name"`
+	Name     string          `json:"name"`
 	Response json.RawMessage `json:"response,omitempty"`
 }
 
@@ -101,10 +101,10 @@ type geminiToolConfig struct {
 }
 
 type geminiGenerationConfig struct {
-	MaxOutputTokens *int       `json:"maxOutputTokens,omitempty"`
-	Temperature     *float64   `json:"temperature,omitempty"`
-	TopP            *float64   `json:"topP,omitempty"`
-	StopSequence    []string   `json:"stopSequence,omitempty"`
+	MaxOutputTokens *int           `json:"maxOutputTokens,omitempty"`
+	Temperature     *float64       `json:"temperature,omitempty"`
+	TopP            *float64       `json:"topP,omitempty"`
+	StopSequence    []string       `json:"stopSequence,omitempty"`
 	ThinkingConfig  map[string]any `json:"thinkingConfig,omitempty"`
 }
 
@@ -271,8 +271,8 @@ func (p *geminiProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRespo
 	}
 	var wire struct {
 		Candidates []struct {
-			Content geminiContent `json:"content"`
-			FinishReason string     `json:"finishReason,omitempty"`
+			Content      geminiContent `json:"content"`
+			FinishReason string        `json:"finishReason,omitempty"`
 		} `json:"candidates"`
 		UsageMetadata struct {
 			PromptTokenCount     int `json:"promptTokenCount"`
@@ -299,8 +299,8 @@ func (p *geminiProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRespo
 					args = "{}"
 				}
 				out.ToolCalls = append(out.ToolCalls, ToolCall{
-					ID:   part.FunctionCall.Name, // ponytail: Gemini 不提供 call ID，用 name 作 identity
-					Type: "function",
+					ID:       part.FunctionCall.Name, // ponytail: Gemini 不提供 call ID，用 name 作 identity
+					Type:     "function",
 					Function: ToolCallFunction{Name: part.FunctionCall.Name, Arguments: args},
 				})
 			}
@@ -376,8 +376,8 @@ func (p *geminiProvider) streamLoop(ctx context.Context, resp *http.Response, ou
 		}
 		var ev struct {
 			Candidates []struct {
-				Content geminiContent `json:"content"`
-				FinishReason string    `json:"finishReason,omitempty"`
+				Content      geminiContent `json:"content"`
+				FinishReason string        `json:"finishReason,omitempty"`
 			} `json:"candidates"`
 			UsageMetadata *struct {
 				PromptTokenCount     int `json:"promptTokenCount"`
@@ -399,8 +399,8 @@ func (p *geminiProvider) streamLoop(ctx context.Context, resp *http.Response, ou
 				if part.FunctionCall != nil {
 					args := string(part.FunctionCall.Args)
 					delta.ToolCalls = append(delta.ToolCalls, ToolCall{
-						ID:   part.FunctionCall.Name,
-						Type: "function",
+						ID:       part.FunctionCall.Name,
+						Type:     "function",
 						Function: ToolCallFunction{Name: part.FunctionCall.Name, Arguments: args},
 					})
 				}
