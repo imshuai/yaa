@@ -9,6 +9,7 @@ import (
 	"github.com/imshuai/yaa/internal/api"
 	"github.com/imshuai/yaa/internal/config"
 	"github.com/imshuai/yaa/internal/provider"
+	"github.com/imshuai/yaa/internal/session"
 	"github.com/imshuai/yaa/internal/storage"
 	"golang.org/x/exp/slog"
 )
@@ -19,6 +20,7 @@ type Runtime struct {
 	cfg       *config.Config
 	store     storage.Storage
 	providers *provider.Manager
+	sessions  *session.Manager
 	api       *api.Server
 	logger    *slog.Logger
 
@@ -69,6 +71,19 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	rt.providers = pm
 	rt.components["provider"] = "ready"
 
+	// Session：Restore 失败阻止 Ready（文档：Remote API 不得在 Restore 完成前进入 Ready）。
+	sm := session.NewManager(rt.cfg.Session, rt.store, rt.logger, session.ManagerOptions{})
+	if rerr := sm.Restore(ctx, time.Now().UTC()); rerr != nil {
+		rt.rollback()
+		return rerr
+	}
+	if serr := sm.Start(ctx); serr != nil {
+		rt.rollback()
+		return serr
+	}
+	rt.sessions = sm
+	rt.components["session_restore"] = "ready"
+
 	rt.api = api.NewServer(rt.cfg.Runtime.API.HTTP.Addr, rt, rt.logger)
 	if err := rt.api.Start(ctx); err != nil {
 		rt.rollback()
@@ -118,6 +133,11 @@ func (rt *Runtime) Shutdown(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
+	if rt.sessions != nil {
+		if err := rt.sessions.Shutdown(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if rt.providers != nil {
 		if err := rt.providers.Close(); err != nil {
 			errs = append(errs, err)
@@ -138,6 +158,9 @@ func (rt *Runtime) rollback() {
 	if rt.api != nil {
 		_ = rt.api.Shutdown(context.Background())
 	}
+	if rt.sessions != nil {
+		_ = rt.sessions.Shutdown(context.Background())
+	}
 	if rt.providers != nil {
 		_ = rt.providers.Close()
 	}
@@ -145,6 +168,7 @@ func (rt *Runtime) rollback() {
 		_ = rt.store.Close()
 	}
 	rt.api = nil
+	rt.sessions = nil
 	rt.providers = nil
 	rt.store = nil
 	rt.components = map[string]string{}
