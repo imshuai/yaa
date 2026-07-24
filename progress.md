@@ -29,8 +29,14 @@ Phase 1：核心骨架。
 - `golang.org/x/exp/slog` 已按架构契约引入为固定版本（兼容 Go 1.20）。
 - `loader_test.go` 覆盖路径发现优先级、显式路径不存在、目录非普通文件、默认配置启动、完整管线与环境变量展开、flag 覆盖与非标量/未知字段拒绝。
 
+- 统一 REST `Envelope`、错误 writer（`writeError`，HTTP 状态+两位子码）、成功 writer、request-id middleware 与生成器已实现：复用入站 `X-Request-ID` 否则生成 `req_` 前缀有序 ID，响应回写 `X-Request-ID` 与 envelope `request_id`。
+- Remote API HTTP Server 骨架已实现：`NewServer`、`Start`/`Shutdown`、`recoverMiddleware`、方法校验与未匹配路由 40401。
+- `/api/v1/health` 与 `/api/v1/version` 端点已实现：health 按 `HealthProvider` 返回 200/code0/data（ready=true，degraded 也 200）或 503/code50301/data=null；version 返回 ldflags 可注入的 version/git_commit/build_time/go_version。
+- 已确认 `golang.org/x/exp/slog` 的 `Logger.Error(msg, err, args...)` 与标准 `log/slog` 签名不同，后续迁移需注意。
+- `api_test.go` 覆盖 envelope、X-Request-ID 复用/生成、health ready/degraded/unready、version 四字段、405/404、未启动 Shutdown。
+
 ## 下一步
 
-- 接入第 2 阶段的运行时生命周期（Runtime start/stop）与 `/api/v1/health` 健康检查端点。
+- 接最小 Runtime 生命周期（Start/Stop/Ready、signal context、启停 API server、health 接入 Ready），随后接 Storage 层。
 
 每个可独立验收的功能完成后单独提交并推送到 `gitea/main`。
