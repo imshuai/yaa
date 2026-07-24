@@ -242,3 +242,16 @@ Phase 1：核心骨架。
 - 错误分类：404 含 "model" → `ErrCodeModelNotFound`；其他 HTTP 状态复用 classifyHTTPStatus；429 RetryAfter。
 - Factory `"ollama"` init 注册。
 - 测试 `ollama_test.go` 5 例：Chat text（path 校验 + stream:false）、Chat tool_calls（args JSON + done_reason→tool_calls）、Chat 404 model_not_found、Stream text 累积、Manager factory。
+
+## Phase 3：Tool 系统起步（Manager 已完成本地代码）
+
+- `internal/tool/errors.go` + `tool.go`：sentinel 错误集 + `Tool` 接口 + `ExecutionScope`/`ToolResult`/`ToolInfo` + `RetryableError` + `ValidationError`。
+- `internal/tool/manager.go`：Manager（v1 静态配置注入，无 ReloadManager 动态 reload）。
+  - `NewManager(deps)` 深拷贝 `cfg.Tools.Builtin` 到 configs 和 source=builtin；解析 `cfg.Agents[].Tools` allowlist（空 = AllowAll）。
+  - `Register/Unregister/Get/List/ListForAgent/CheckPermission`、`AgentScope`。
+  - `ToolDefs(agentID)` 把 enabled+authorized 工具映射为 `provider.ToolDef`（v1 canonical name 直接作为 wire alias，未实现 provider.md 的 alias 碰撞反查）。
+  - `Execute` 执行流程：validate AgentID → Tool lookup → enabled → permission → validateParams → effective timeout (Tool 超时 fallback default；上界 MaxTimeout) → 全局 gate semaphore → callCtx WithCancelCause + `time.AfterFunc` 设 ErrToolTimeout cause → Tool.Execute；caller cancel 优先返回 context.Cause(ctx)。
+  - `ExecuteBatch`：保持输入顺序的并发批量，worker 数 = `min(len(calls), MaxConcurrent)`；硬错误通过 `ErrorResult` 投影为单独项的 `ToolResult{IsError:true}`；caller ctx 失败在全部完成后返回 context.Cause。
+  - `ErrorResult` 脱敏映射 6 个 sentinel → 固定 LLM-friendly message（不拼接 err.Error()）。
+  - Ponytail：validateParams 用序列化可行性校验代替 JSON Schema validator（后续接入完整 validator）；ListForAgent 使用稳定插入排序避免引入 sort。硜 Go 1.20 `context.WithCancelCause` + `time.AfterFunc` 实现 cause-preserving timeout（不能使用 1.21 才有的 `context.WithTimeoutCause`）。
+- 测试 `manager_test.go` 11 例：list/listForAgent、checkPermission、execute echo/not found/disabled/denied、timeout、caller cancel cause 保持、batch 顺序+missing tool、ErrorResult mapping。
