@@ -7,3 +7,5 @@ require (
 	github.com/mitchellh/mapstructure v1.5.0
 	gopkg.in/yaml.v3 v3.0.1
 )
+
+require golang.org/x/exp v0.0.0-20230202154922-04ff78cf6831

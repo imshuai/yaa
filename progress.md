@@ -23,8 +23,14 @@ Phase 1：核心骨架。
 - Validator 契约已补齐所有静态 helper、稳定错误、NaN、inactive descriptor、Skill option 编码及静态/binding 两阶段边界。
 - 基础配置 Validator 已实现：聚合结构化错误、校验根与 Agent effective policy，并保持配置只读。
 
+- 配置文件路径发现已实现：按 `--config` → `YAA_CONFIG_PATH` → 当前目录/`~/.yaa`/`/etc/yaa` 顺序、目录内 `.yaml→.yml→.toml→.json`，只接受普通文件、返回词法绝对路径，权限/I/O 错误保留 cause，全部未命中返回空串；显式或环境路径无效返回 `ErrConfigFileNotFound`。
+- 统一配置加载器 `config.Load` 已实现：`Default()` → 解析 → `migrateRaw`（版本检测+迁移）→ 环境变量展开 → `ApplyElementDefaults` → `DecodeInto` → `applyFlags` → `Validate`，默认路径全未命中时用纯默认值启动并输出 warning。
+- 命令行参数覆盖 `applyFlags`/`setByPath` 已实现：按点路径反射设标量叶字段，支持 string/bool/int/uint/float/duration，拒绝数组/动态 Map/非标量/未注册路径。
+- `golang.org/x/exp/slog` 已按架构契约引入为固定版本（兼容 Go 1.20）。
+- `loader_test.go` 覆盖路径发现优先级、显式路径不存在、目录非普通文件、默认配置启动、完整管线与环境变量展开、flag 覆盖与非标量/未知字段拒绝。
+
 ## 下一步
 
-- 实现配置路径发现和统一 Loader，再接入健康检查与 Runtime。
+- 接入第 2 阶段的运行时生命周期（Runtime start/stop）与 `/api/v1/health` 健康检查端点。
 
 每个可独立验收的功能完成后单独提交并推送到 `gitea/main`。

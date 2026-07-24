@@ -35,3 +35,6 @@ Thumbs.db
 vendor/
 go.work
 go.work.sum
+
+# Codebase knowledge graph artifacts
+.codebase-memory/

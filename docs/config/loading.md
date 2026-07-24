@@ -39,9 +39,15 @@ Yaa! 按以下顺序查找配置文件，**第一个找到的文件即为最终�
 |--------|----------|------|
 | 1 | `--config` 命令行参数指定的路径 | 显式指定，最高优先 |
 | 2 | `$YAA_CONFIG_PATH` 环境变量指定的路径 | 环境变量指定 |
-| 3 | `./yaa.yaml`（或 `.yml` / `.toml` / `.json`） | 当前工作目录 |
-| 4 | `~/.yaa/yaa.yaml` | 用户主目录 |
-| 5 | `/etc/yaa/yaa.yaml` | 系统级配置目录（Linux/macOS） |
+| 3 | `./yaa.{yaml,yml,toml,json}` | 当前工作目录 |
+| 4 | `~/.yaa/yaa.{yaml,yml,toml,json}` | 用户主目录；由 `os.UserHomeDir()` 确定 |
+| 5 | `/etc/yaa/yaa.{yaml,yml,toml,json}` | 系统级配置目录；仅 Linux/macOS 等非 Windows 平台 |
+
+默认探测先按目录优先级、再按目录内的 `.yaml` → `.yml` → `.toml` → `.json` 顺序进行。因此当前目录的 `yaa.json` 优先于用户目录的 `yaa.yaml`。Windows 只探测当前目录和 `%USERPROFILE%\.yaa`，不探测 `/etc/yaa`；无法确定用户主目录时跳过用户目录，继续探测其余层级。
+
+`--config` 和 `YAA_CONFIG_PATH` 的值按字面路径使用，不裁剪空白、不展开 `~`；空字符串表示未指定。显式路径可以没有扩展名，也可以使用未知扩展名，路径发现只负责确认文件存在，格式支持由后续解析阶段判断。显式路径或环境变量路径不存在、悬空链接或不是普通文件时返回 `ErrConfigFileNotFound`，不得回退。任何探测中的权限或 I/O 错误都保留底层 cause 并立即返回，不能静默选择低优先级配置。
+
+命中的路径统一经 `filepath.Abs` 清理并返回词法绝对路径，不解析符号链接；链接最终指向普通文件时可以命中。默认候选不存在或不是普通文件时继续探测，全部未命中才返回空字符串。
 
 **格式自动检测：** 根据文件扩展名选择解析器。无扩展名时默认按 YAML 解析。
 
@@ -55,7 +61,7 @@ Yaa! 按以下顺序查找配置文件，**第一个找到的文件即为最终�
               └─ 未设置 → 依次探测:
                           ./yaa.{yaml,yml,toml,json}
                           ~/.yaa/yaa.{yaml,yml,toml,json}
-                          /etc/yaa/yaa.{yaml,yml,toml,json}
+                          /etc/yaa/yaa.{yaml,yml,toml,json}（非 Windows）
                           ├─ 找到 → 使用第一个匹配项
                           └─ 全部未找到 → 使用内置默认配置（仅日志输出 warning）
 ```
@@ -164,7 +170,7 @@ func NewLoader(configPath string, flags map[string]any) *Loader {
 // Load 执行完整的配置加载管线。
 func (l *Loader) Load() (*Config, error) {
 	// Step 1: 确定配置文件路径
-	path, err := l.resolveConfigPath()
+	path, err := resolveConfigPath(l.configPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolve config path: %w", err)
 	}
@@ -253,44 +259,67 @@ func DecodeInto(raw map[string]any, dst *Config) error {
 ### 4.3 配置文件路径解析
 
 ```go
+var ErrConfigFileNotFound = errors.New("config: file not found")
+
 // resolveConfigPath 按优先级顺序确定配置文件路径。
 // 返回空字符串表示未找到配置文件（使用纯默认配置）。
-func (l *Loader) resolveConfigPath() (string, error) {
+func resolveConfigPath(explicit string) (string, error) {
 	// 优先级 1: --config 命令行参数
-	if l.configPath != "" {
-		if _, err := os.Stat(l.configPath); err != nil {
-			return "", fmt.Errorf("config file not found: %s", l.configPath)
-		}
-		return l.configPath, nil
+	if explicit != "" {
+		return requireConfigFile(explicit)
 	}
 
 	// 优先级 2: 环境变量
 	if envPath := os.Getenv("YAA_CONFIG_PATH"); envPath != "" {
-		if _, err := os.Stat(envPath); err != nil {
-			return "", fmt.Errorf("config file not found: %s", envPath)
-		}
-		return envPath, nil
+		return requireConfigFile(envPath)
 	}
 
 	// 优先级 3-5: 依次探测默认路径
-	supportedExts := []string{".yaml", ".yml", ".toml", ".json"}
-	searchDirs := []string{
-		".",                // 当前工作目录
-		expandHomeDir("~/.yaa"), // 用户主目录
-		"/etc/yaa",         // 系统配置目录
+	searchDirs := []string{"."}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		searchDirs = append(searchDirs, filepath.Join(home, ".yaa"))
+	}
+	if runtime.GOOS != "windows" {
+		searchDirs = append(searchDirs, "/etc/yaa")
 	}
 
 	for _, dir := range searchDirs {
-		for _, ext := range supportedExts {
-			path := filepath.Join(dir, "yaa"+ext)
-			if _, err := os.Stat(path); err == nil {
-				return path, nil
+		for _, name := range []string{"yaa.yaml", "yaa.yml", "yaa.toml", "yaa.json"} {
+			path := filepath.Join(dir, name)
+			info, err := os.Stat(path)
+			if err == nil {
+				if info.Mode().IsRegular() {
+					return absoluteConfigPath(path)
+				}
+				continue
+			}
+			if !errors.Is(err, fs.ErrNotExist) {
+				return "", fmt.Errorf("inspect config file %s: %w", path, err)
 			}
 		}
 	}
 
 	// 未找到配置文件，使用默认配置
 	return "", nil
+}
+
+func requireConfigFile(path string) (string, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, fs.ErrNotExist) || err == nil && !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%w: %s", ErrConfigFileNotFound, path)
+	}
+	if err != nil {
+		return "", fmt.Errorf("inspect config file %s: %w", path, err)
+	}
+	return absoluteConfigPath(path)
+}
+
+func absoluteConfigPath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve config file %s: %w", path, err)
+	}
+	return absolute, nil
 }
 ```
 
@@ -359,8 +388,9 @@ func main() {
 
 | 场景 | 行为 |
 |------|------|
-| `--config` 指定的文件不存在 | **报错退出**，不静默降级 |
-| `$YAA_CONFIG_PATH` 指定的文件不存在 | **报错退出** |
+| `--config` 指定的路径不存在或不是普通文件 | 返回 `ErrConfigFileNotFound`，**报错退出**，不静默降级 |
+| `$YAA_CONFIG_PATH` 指定的路径不存在或不是普通文件 | 返回 `ErrConfigFileNotFound`，**报错退出**，不静默降级 |
+| 探测路径发生权限或 I/O 错误 | **报错退出**，保留底层 cause |
 | 默认路径全部未找到配置文件 | **使用内置默认配置**，输出 warning 日志 |
 | 配置文件格式错误 | **报错退出**，附带行号与解析错误信息 |
 | 环境变量引用的变量不存在且没有默认值 | **报错退出**；可选值必须写 `${VAR:-default}` |

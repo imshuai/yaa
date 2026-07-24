@@ -8,14 +8,15 @@
 ## 配置加载
 
 - [ ] `Config` 顶层结构体定义（Runtime, Agents, Providers, MCP, Tools, Skills, Memory, Session, Context, Planner, Plugins, Log）
-- [ ] `Loader` 结构体定义（paths, format, envResolver, cliFlags, logger）
-- [ ] `Load()` 统一入口方法
-- [ ] 配置文件路径发现（`--config` 显式指定 → 默认搜索路径）
-- [ ] 默认搜索路径（`./yaa.yaml` → `~/.yaa/yaa.yaml` → `/etc/yaa/yaa.yaml`）
-- [ ] 单配置文件语义（命中第一个文件后停止查找，不叠加 `conf.d`）
-- [ ] 加载管线顺序：`Default()` → 配置文件迁移/环境变量展开 → `ApplyElementDefaults(raw)` → typed decode → 命令行参数覆盖
-- [ ] 配置文件不存在时使用纯默认值启动（warn 日志，不 fatal）
-- [ ] 加载失败时明确报错（文件解析错误 vs 校验错误）
+- [x] `Loader` 结构体定义（paths, format, envResolver, cliFlags, logger）
+- [x] `Load()` 统一入口方法
+- [x] 配置文件路径发现（`--config` → `YAA_CONFIG_PATH` → 默认搜索路径）
+- [x] 默认搜索按目录优先（当前目录 → 用户 `.yaa` 目录 → 非 Windows 的 `/etc/yaa`），目录内按 `.yaml` → `.yml` → `.toml` → `.json`
+- [x] 路径发现只接受普通文件，命中后返回词法绝对路径；权限/I/O 错误保留 cause
+- [x] 单配置文件语义（命中第一个文件后停止查找，不叠加 `conf.d`）
+- [x] 加载管线顺序：`Default()` → 配置文件迁移/环境变量展开 → `ApplyElementDefaults(raw)` → typed decode → 命令行参数覆盖
+- [x] 仅默认路径全部未命中时使用纯默认值启动（warn 日志，不 fatal）；显式/环境路径无效时返回 `ErrConfigFileNotFound`
+- [x] 加载失败时明确报错（文件解析错误 vs 校验错误）
 
 ## 环境变量
 
@@ -105,7 +106,7 @@
 
 ## 错误处理
 
-- [ ] `ErrConfigFileNotFound`
+- [x] `ErrConfigFileNotFound`
 - [ ] `ErrConfigParseFailed`
 - [ ] `ErrConfigValidationFailed`
 - [ ] `ErrConfigEnvVarMissing`
