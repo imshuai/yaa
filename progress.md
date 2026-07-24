@@ -255,3 +255,11 @@ Phase 1：核心骨架。
   - `ErrorResult` 脱敏映射 6 个 sentinel → 固定 LLM-friendly message（不拼接 err.Error()）。
   - Ponytail：validateParams 用序列化可行性校验代替 JSON Schema validator（后续接入完整 validator）；ListForAgent 使用稳定插入排序避免引入 sort。硜 Go 1.20 `context.WithCancelCause` + `time.AfterFunc` 实现 cause-preserving timeout（不能使用 1.21 才有的 `context.WithTimeoutCause`）。
 - 测试 `manager_test.go` 11 例：list/listForAgent、checkPermission、execute echo/not found/disabled/denied、timeout、caller cancel cause 保持、batch 顺序+missing tool、ErrorResult mapping。
+
+## Phase 3：内置 Tool shell/http/file（已完成本地代码）
+
+- `internal/tool/builtin/shell.go`：`/bin/sh -c` 执行，stdout+stderr 合并，超 max_output_bytes 截断；blocked/allowed 前缀匹配（blocked 优先）；working_dir + env；非零退出 IsError=true 含退出码。
+- `internal/tool/builtin/http.go`：HTTP 请求；headers/body 注入；返回 status_code + headers + body + elapsed_ms JSON；blocked/allowed hosts 精确匹配（blocked 优先）；max_response_bytes 截断。
+- `internal/tool/builtin/file.go`：4 个 file_read/file_write/file_list/file_delete 子 Tool（fileTool 分支 by name）。统一 path canonical 校验（canonicalPath 解析最近祖先、EvalSymlinks、再拼回 tail；validatePath within check）。allowed_paths/blocked_paths，blocked 优先；max_file_size 上限；read 支持 utf-8/base64 + max_bytes；write create_dirs；list 排序；delete 文件或空目录。
+- `internal/tool/builtin/{shell,http,file}_test.go`：shell 5 例、http 4 例、file 6 例（read/write/delete 循环；blocked/not allowed；list sorted；create_dirs；base64）。
+- 全项目 build/vet/test 全绿。
