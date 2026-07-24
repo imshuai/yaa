@@ -98,6 +98,8 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		s.handleCloseSession(w, r, sp, sessionID)
 	case sub == "clear" && r.Method == http.MethodPost:
 		s.handleClearMessages(w, r, sp, sessionID)
+	case sub == "messages" && r.Method == http.MethodPost:
+		s.handlePostMessage(w, r, sp, sessionID)
 	case sub == "messages" && r.Method == http.MethodGet:
 		s.handleListMessages(w, r, sp, sessionID)
 	case sub == "messages" && r.Method == http.MethodDelete:

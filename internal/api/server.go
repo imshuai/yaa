@@ -52,6 +52,7 @@ type Server struct {
 	health       HealthProvider
 	sessions     SessionProvider
 	agentExists  AgentExistsProvider
+	agents       AgentProvider
 	started      time.Time
 	mu           sync.Mutex
 	listener     *http.Server
@@ -82,6 +83,13 @@ func (s *Server) SetSessionProvider(sp SessionProvider, ae AgentExistsProvider) 
 	s.mu.Lock()
 	s.sessions = sp
 	s.agentExists = ae
+	s.mu.Unlock()
+}
+
+// SetAgentProvider 注入 Agent 管理器（在 Runtime Start 时注册）。
+func (s *Server) SetAgentProvider(ap AgentProvider) {
+	s.mu.Lock()
+	s.agents = ap
 	s.mu.Unlock()
 }
 

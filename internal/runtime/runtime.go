@@ -114,6 +114,7 @@ func (rt *Runtime) Start(ctx context.Context) error {
 
 	rt.api = api.NewServer(rt.cfg.Runtime.API.HTTP.Addr, rt, rt.logger)
 	rt.api.SetSessionProvider(sm, rt.agentAPIShim())
+	rt.api.SetAgentProvider(am)
 	if err := rt.api.Start(ctx); err != nil {
 		rt.rollback()
 		return err

@@ -130,3 +130,23 @@ Phase 1：核心骨架。
   - `handle_turn.go`：HandleTurn 校验入参 + Agent 状态(stopped/paused) → session.RunTurn 内执行 runDirectTurn：AppendUser → Session.Snapshot 组装 canonical ChatRequest(system prompt + 历史) → Context.Build → Provider.Chat → Append final assistant。v1 无 Tool loop/alias 投影（Phase 3 补全）。
 - 4 个 agent 测试全绿：Get/List/NotFound、Life cycle Pause/Stop/Start 幂等+状态错误、HandleTurn direct 端到端(fake OpenAI httptest provider, Assert assistant=Mock answer)、HandleTurn invalid 入参与 NotFound。
 - 全项目 test/vet/build 全绿。
+
+## 对话 API 端点（已完成）
+
+- `POST /api/v1/sessions/:id/messages`：提交 user 消息并等待 Agent turn 完成。
+  - 入参 `postMessageRequest{turn_id, content, metadata}`，`turn_id` 校验 1..128 UTF-8 bytes 无控制字符。
+  - 取 session.AgentID 后调 `agent.Manager.HandleTurn` → 在 Session FIFO 内 AppendUser → Context.Build → Provider.Chat → Append final assistant。
+  - 成功返回 `postMessageResponse{turn_id, message(展开 Payload), usage, tool_call_count}`。
+- `writeTurnError` 按 conversation.md cause 优先映射：
+  - context.DeadlineExceeded → 504/50401；context.Canceled → 不写 response
+  - ErrAgentStopped/Paused/InvalidState → 409/40901
+  - ErrAgentManagerClosed → 503/50301
+  - ErrAgentNotFound → 404/40401；ErrAgentInvalidRequest → 400/40001
+  - ErrAgentToolRoundLimit/ProviderProtocol → 500/50001
+  - Session 错误复用 session 错误映射
+  - `*provider.ProviderError` (errors.As) → 502/50202
+- `internal/api/agent_provider.go`：`AgentProvider` 接口（HandleTurn + Get）。
+- `server.go`：Server 加 `agents` 字段 + `SetAgentProvider` 方法。
+- `runtime.go`：Start 后 `SetAgentProvider(am)` 注入。
+- 2 个 conversation 测试全绿：direct turn 端到端（POST → assistant="Hi there"），invalid turn_id 返回 400/40001。
+- 全项目 test/vet/build 全绿。
