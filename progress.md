@@ -231,3 +231,14 @@ Phase 1：核心骨架。
   - 流式：解析 SSE `data:` JSON GenerateContentResponse。每个 candidate 的 text/thought/functionCall 累加为 delta chunk；finishReason 单独一个终态 chunk；usageMetadata chunk。
 - Factory `"gemini"` 在 init 注册。
 - 测试 `gemini_test.go` 6 例：Chat text（URL/key + systemInstruction 校验）、Chat tool_call（args JSON）、Chat 错误 429 rate_limit retryable、Stream text 累积、Stream thinking + tool（thought/text/functionCall 同时帧）、Manager factory。
+
+## Phase 2：Ollama adapter（已完成本地代码）
+
+- `internal/provider/ollama.go`（新增）：Ollama REST `/api/chat` adapter。
+  - Messages 结构与 OpenAI 兼容（role/content/tool_calls）；请求体 `{model, messages, stream, tools, options}`；Extra 注入顶层（如 `keep_alive`）。
+  - options：`MAXTokens → num_predict`、`Temperature`、`TopP`、`Stop`。
+  - Chat 非流式：解析 wire.{message, done, done_reason, prompt_eval_count, eval_count} → ChatResponse。
+  - StreamChat 流式：每行是 JSON object（非 SSE event），逐次 emit ChatChunk：content/tool_calls/done_reason/usage；done=true 时一次性发终态。
+- 错误分类：404 含 "model" → `ErrCodeModelNotFound`；其他 HTTP 状态复用 classifyHTTPStatus；429 RetryAfter。
+- Factory `"ollama"` init 注册。
+- 测试 `ollama_test.go` 5 例：Chat text（path 校验 + stream:false）、Chat tool_calls（args JSON + done_reason→tool_calls）、Chat 404 model_not_found、Stream text 累积、Manager factory。
