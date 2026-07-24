@@ -14,9 +14,11 @@ type fakeProvider struct {
 	model provider.ModelInfo
 }
 
-func (f *fakeProvider) ID() string                          { return "fake" }
-func (f *fakeProvider) Type() string                        { return "fake" }
-func (f *fakeProvider) Chat(context.Context, *provider.ChatRequest) (*provider.ChatResponse, error) { return nil, nil }
+func (f *fakeProvider) ID() string   { return "fake" }
+func (f *fakeProvider) Type() string { return "fake" }
+func (f *fakeProvider) Chat(context.Context, *provider.ChatRequest) (*provider.ChatResponse, error) {
+	return nil, nil
+}
 func (f *fakeProvider) StreamChat(context.Context, *provider.ChatRequest) (<-chan provider.ChatChunk, error) {
 	return nil, nil
 }
@@ -68,7 +70,7 @@ func TestBuildUnderBudget(t *testing.T) {
 func TestBuildReject(t *testing.T) {
 	m := NewManager()
 	fp := newTestProvider(10000, 8192) // input budget = 10000 - 4096 = 5904
-	maxTokens := 4096                   // budget 5904 = 59 messages
+	maxTokens := 4096                  // budget 5904 = 59 messages
 	msgs := make([]provider.Message, 70)
 	for i := range msgs {
 		if i%2 == 0 {
@@ -109,7 +111,7 @@ func TestBuildReject(t *testing.T) {
 func TestBuildTruncate(t *testing.T) {
 	m := NewManager()
 	fp := newTestProvider(6400, 8192) // input budget = 6400 - 4096 = 2304 → 23 messages
-	maxTokens := 4096                  // input budget = 2304-tokens (23 messages)
+	maxTokens := 4096                 // input budget = 2304-tokens (23 messages)
 	// 30 messages = 3000 tokens > 2304
 	msgs := make([]provider.Message, 30)
 	for i := range msgs {

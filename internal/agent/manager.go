@@ -28,10 +28,10 @@ type Dependencies struct {
 
 // agentBinding 是冻结的 Agent 特有配置。
 type agentBinding struct {
-	id       string
-	name     string
-	provider string
-	model    string
+	id        string
+	name      string
+	provider  string
+	model     string
 	sysPrompt string
 	maxTokens int
 	status    Status
@@ -39,10 +39,10 @@ type agentBinding struct {
 
 // Manager 是 Agent Manager。
 type Manager struct {
-	deps    Dependencies
-	mu      sync.Mutex
-	agents  map[string]*agentBinding
-	closed  bool
+	deps   Dependencies
+	mu     sync.Mutex
+	agents map[string]*agentBinding
+	closed bool
 }
 
 // NewManager 构造 Agent Manager。

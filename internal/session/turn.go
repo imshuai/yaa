@@ -89,8 +89,8 @@ func (t *Turn) AppendUser(content string, metadata map[string]any) (SessionMessa
 }
 
 // Append 提交完整 assistant 或 Tool unit。每个 batch 必须满足：
-//   1. 单条无 ToolCalls 的 final assistant；
-//   2. 一条含 ToolCalls 的 assistant + 一一对应的全部 tool results。
+//  1. 单条无 ToolCalls 的 final assistant；
+//  2. 一条含 ToolCalls 的 assistant + 一一对应的全部 tool results。
 func (t *Turn) Append(inputs []AppendInput) ([]SessionMessage, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

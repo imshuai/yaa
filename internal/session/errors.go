@@ -7,7 +7,7 @@ import (
 
 // 稳定错误集合，调用方与 Remote API 通过 errors.Is 分类。
 var (
-	ErrSessionNotFound        = errors.New("session: session not found")
+	ErrSessionNotFound         = errors.New("session: session not found")
 	ErrMessageNotFound         = errors.New("session: message not found")
 	ErrAgentNotFound           = errors.New("session: agent not found")
 	ErrSessionClosed           = errors.New("session: session closed")

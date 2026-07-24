@@ -34,15 +34,15 @@ type AgentExistsProvider interface {
 
 // sessionDTO 是 Session REST 响应的 JSON 表示。
 type sessionDTO struct {
-	ID             string            `json:"id"`
-	AgentID        string            `json:"agent_id"`
-	State          string            `json:"state"`
-	MessageCount   int               `json:"message_count"`
-	Metadata       map[string]any    `json:"metadata"`
-	Policy         sessionPolicyDTO   `json:"policy"`
-	CreatedAt      string            `json:"created_at"`
-	UpdatedAt      string            `json:"updated_at"`
-	LastActivityAt string            `json:"last_activity_at"`
+	ID             string           `json:"id"`
+	AgentID        string           `json:"agent_id"`
+	State          string           `json:"state"`
+	MessageCount   int              `json:"message_count"`
+	Metadata       map[string]any   `json:"metadata"`
+	Policy         sessionPolicyDTO `json:"policy"`
+	CreatedAt      string           `json:"created_at"`
+	UpdatedAt      string           `json:"updated_at"`
+	LastActivityAt string           `json:"last_activity_at"`
 }
 
 type sessionPolicyDTO struct {
@@ -76,34 +76,34 @@ type deleteSessionDTO struct {
 
 // messageDTO 是单条消息的 REST 表示（展开 Payload）。
 type messageDTO struct {
-	ID               string             `json:"id"`
-	SessionID        string             `json:"session_id"`
-	TurnID           string             `json:"turn_id"`
-	Role             string             `json:"role"`
-	Content          string             `json:"content"`
-	ReasoningContent string             `json:"reasoning_content"`
-	Name             string             `json:"name"`
+	ID               string              `json:"id"`
+	SessionID        string              `json:"session_id"`
+	TurnID           string              `json:"turn_id"`
+	Role             string              `json:"role"`
+	Content          string              `json:"content"`
+	ReasoningContent string              `json:"reasoning_content"`
+	Name             string              `json:"name"`
 	ToolCalls        []provider.ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID       string             `json:"tool_call_id"`
-	Refusal          string             `json:"refusal"`
-	Metadata         map[string]any    `json:"metadata"`
-	CreatedAt        string             `json:"created_at"`
+	ToolCallID       string              `json:"tool_call_id"`
+	Refusal          string              `json:"refusal"`
+	Metadata         map[string]any      `json:"metadata"`
+	CreatedAt        string              `json:"created_at"`
 }
 
 // createSessionRequest 是 POST /agents/:id/sessions 的入参。
 type createSessionRequest struct {
-	Metadata map[string]any            `json:"metadata"`
-	Policy   *config.SessionOverride   `json:"policy"`
+	Metadata map[string]any          `json:"metadata"`
+	Policy   *config.SessionOverride `json:"policy"`
 }
 
 // toSessionDTO 把内部 Session 转为 REST DTO。
 func toSessionDTO(s *session.Session) sessionDTO {
 	return sessionDTO{
-		ID:             s.ID,
-		AgentID:        s.AgentID,
-		State:          string(s.State),
-		MessageCount:   len(s.Messages),
-		Metadata:       s.Metadata,
+		ID:           s.ID,
+		AgentID:      s.AgentID,
+		State:        string(s.State),
+		MessageCount: len(s.Messages),
+		Metadata:     s.Metadata,
 		Policy: sessionPolicyDTO{
 			MaxMessages:     s.Policy.MaxMessages,
 			MaxMessageBytes: s.Policy.MaxMessageBytes,

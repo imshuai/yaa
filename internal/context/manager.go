@@ -168,12 +168,12 @@ func (m *Manager) truncate(ctx stdctx.Context, in BuildInput, units []messageUni
 		if tokens <= budget.Input {
 			return &BuildOutput{
 				Request:         req,
-				InputTokens:    tokens,
+				InputTokens:     tokens,
 				InputBudget:     budget.Input,
 				EffectiveWindow: budget.EffectiveWindow,
 				Metadata: BuildMetadata{
-					Strategy:          strategy,
-					OriginalMessages:  originalCount,
+					Strategy:         strategy,
+					OriginalMessages: originalCount,
 					FinalMessages:    len(msgs),
 					TruncatedUnits:   truncated,
 					BuildDuration:    time.Since(start),

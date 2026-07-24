@@ -101,17 +101,17 @@ func cloneAnyMap(m map[string]any) map[string]any {
 
 // Snapshot 是 Persistent DTO（v1 唯一格式）。
 type snapshotV1 struct {
-	SchemaVersion  int                    `json:"schema_version"`
-	ID            string                 `json:"id"`
-	AgentID       string                 `json:"agent_id"`
-	State         string                 `json:"state"`
-	CreatedAt     string                 `json:"created_at"`
-	UpdatedAt     string                 `json:"updated_at"`
-	LastActivity  string                 `json:"last_activity_at"`
-	Policy        snapshotPolicy         `json:"policy"`
-	Messages      []snapshotMessage      `json:"messages"`
-	Metadata      map[string]any         `json:"metadata"`
-	UsedTurnIDs   []string               `json:"used_turn_ids"`
+	SchemaVersion int               `json:"schema_version"`
+	ID            string            `json:"id"`
+	AgentID       string            `json:"agent_id"`
+	State         string            `json:"state"`
+	CreatedAt     string            `json:"created_at"`
+	UpdatedAt     string            `json:"updated_at"`
+	LastActivity  string            `json:"last_activity_at"`
+	Policy        snapshotPolicy    `json:"policy"`
+	Messages      []snapshotMessage `json:"messages"`
+	Metadata      map[string]any    `json:"metadata"`
+	UsedTurnIDs   []string          `json:"used_turn_ids"`
 }
 
 type snapshotPolicy struct {
@@ -123,11 +123,11 @@ type snapshotPolicy struct {
 }
 
 type snapshotMessage struct {
-	ID        string             `json:"id"`
-	TurnID    string             `json:"turn_id"`
-	Message   provider.Message   `json:"message"`
-	CreatedAt string             `json:"created_at"`
-	Metadata  map[string]any    `json:"metadata"`
+	ID        string           `json:"id"`
+	TurnID    string           `json:"turn_id"`
+	Message   provider.Message `json:"message"`
+	CreatedAt string           `json:"created_at"`
+	Metadata  map[string]any   `json:"metadata"`
 }
 
 // 仅为引用 context 以便后续 Manager 方法签名一致；此处暂不直接使用。

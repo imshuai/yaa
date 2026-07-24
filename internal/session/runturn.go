@@ -84,9 +84,9 @@ func (m *Manager) RunTurn(
 	// 唯一 defer：无论 enqueue 失败、queued cancel、Delete、panic 或 callback 完成，
 	// 都从 activeTurns 移除并 close(done)。
 	var (
-		turn    *Turn
-		runErr  error
-		done    = make(chan error, 1)
+		turn   *Turn
+		runErr error
+		done   = make(chan error, 1)
 	)
 	defer func() {
 		close(tc.done)
