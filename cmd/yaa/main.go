@@ -10,9 +10,8 @@ import (
 	"time"
 
 	"github.com/imshuai/yaa/internal/config"
+	"github.com/imshuai/yaa/internal/logging"
 	"github.com/imshuai/yaa/internal/runtime"
-
-	"golang.org/x/exp/slog"
 )
 
 func main() {
@@ -26,11 +25,14 @@ func main() {
 }
 
 func run(configPath string) error {
-	logger := slog.Default()
-
 	cfg, err := config.Load(configPath, nil)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
+	}
+
+	logger, logCloser, err := logging.SetDefault(cfg.Log)
+	if err != nil {
+		return fmt.Errorf("init logger: %w", err)
 	}
 
 	// 入口监听中断与终止信号；Windows 不依赖 SIGTERM（syscall.SIGTERM 在 Windows 未定义时忽略）。
@@ -52,6 +54,7 @@ func run(configPath string) error {
 		}
 	}()
 
+	defer logCloser()
 	logger.Info("runtime started", "addr", cfg.Runtime.API.HTTP.Addr)
 
 	<-ctx.Done()
