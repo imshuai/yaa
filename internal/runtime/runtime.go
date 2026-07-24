@@ -72,7 +72,10 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	rt.components["provider"] = "ready"
 
 	// Session：Restore 失败阻止 Ready（文档：Remote API 不得在 Restore 完成前进入 Ready）。
-	sm := session.NewManager(rt.cfg.Session, rt.store, rt.logger, session.ManagerOptions{})
+	sm := session.NewManager(rt.cfg.Session, rt.store, rt.logger, session.ManagerOptions{
+		AgentExists:   rt.agentExists,
+		AgentOverride: rt.agentSessionOverride,
+	})
 	if rerr := sm.Restore(ctx, time.Now().UTC()); rerr != nil {
 		rt.rollback()
 		return rerr
@@ -85,6 +88,7 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	rt.components["session_restore"] = "ready"
 
 	rt.api = api.NewServer(rt.cfg.Runtime.API.HTTP.Addr, rt, rt.logger)
+	rt.api.SetSessionProvider(sm, rt.agentAPIShim())
 	if err := rt.api.Start(ctx); err != nil {
 		rt.rollback()
 		return err
@@ -172,6 +176,45 @@ func (rt *Runtime) rollback() {
 	rt.providers = nil
 	rt.store = nil
 	rt.components = map[string]string{}
+}
+
+
+// agentExists 判断某 Agent ID 是否在配置中注册。
+func (rt *Runtime) agentExists(agentID string) bool {
+	for _, a := range rt.cfg.Agents {
+		if a.ID == agentID {
+			return true
+		}
+	}
+	return false
+}
+
+// agentSessionOverride 返回某 Agent 的 Session override 配置。
+func (rt *Runtime) agentSessionOverride(agentID string) *config.SessionOverride {
+	for _, a := range rt.cfg.Agents {
+		if a.ID == agentID {
+			return a.Session
+		}
+	}
+	return nil
+}
+
+// agentAPIShim 实现 api.AgentExistsProvider，供 Session REST 端点校验 Agent。
+type agentAPIProvider struct {
+	exists   func(string) bool
+	override func(string) *config.SessionOverride
+}
+
+func (a *agentAPIProvider) AgentExists(agentID string) bool                  { return a.exists(agentID) }
+func (a *agentAPIProvider) AgentSessionOverride(agentID string) *config.SessionOverride {
+	return a.override(agentID)
+}
+
+func (rt *Runtime) agentAPIShim() *agentAPIProvider {
+	return &agentAPIProvider{
+		exists:   rt.agentExists,
+		override: rt.agentSessionOverride,
+	}
 }
 
 // APIAddr 返回 API Server 的实际监听地址。

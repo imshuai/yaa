@@ -49,10 +49,12 @@ type Server struct {
 	addr     string
 	logger   *slog.Logger
 	server   *http.Server
-	health   HealthProvider
-	started  time.Time
-	mu       sync.Mutex
-	listener *http.Server
+	health       HealthProvider
+	sessions     SessionProvider
+	agentExists  AgentExistsProvider
+	started      time.Time
+	mu           sync.Mutex
+	listener     *http.Server
 }
 
 // NewServer 创建 Remote API Server。addr 为监听地址；health 可为 nil（视为未就绪）。
@@ -75,10 +77,21 @@ func NewServer(addr string, health HealthProvider, logger *slog.Logger) *Server 
 	return s
 }
 
+// SetSessionProvider 注入 Session 管理器（在 Runtime Start 时注册）。
+func (s *Server) SetSessionProvider(sp SessionProvider, ae AgentExistsProvider) {
+	s.mu.Lock()
+	s.sessions = sp
+	s.agentExists = ae
+	s.mu.Unlock()
+}
+
 // register 注册全部 v1 路由。
 func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/health", s.methodGet(s.handleHealth))
 	mux.HandleFunc("/api/v1/version", s.methodGet(s.handleVersion))
+
+	s.registerSessionRoutes(mux)
+
 	mux.HandleFunc("/", s.notFound)
 }
 
