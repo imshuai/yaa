@@ -16,9 +16,9 @@ import (
 
 // SQLiteStorage 是基于 modernc.org/sqlite（纯 Go，无 CGO）的根 KV 后端。
 type SQLiteStorage struct {
-	db       *sql.DB
-	stop     chan struct{}
-	done     chan struct{}
+	db        *sql.DB
+	stop      chan struct{}
+	done      chan struct{}
 	closeOnce sync.Once
 }
 

@@ -167,7 +167,6 @@ func normalizeStatus(status string, ready bool) string {
 	}
 }
 
-
 // methodGet 包装仅接受 GET 的 handler，其余返回 40513。
 func (s *Server) methodGet(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {

@@ -20,8 +20,8 @@ func (m memItem) expired(now time.Time) bool {
 
 // MemoryStorage 是纯内存根 KV 后端，实现同一 Storage 接口；多用于测试和临时运行。
 type MemoryStorage struct {
-	clock Clock
-	mu    sync.RWMutex
+	clock  Clock
+	mu     sync.RWMutex
 	closed bool
 	values map[string]memItem
 

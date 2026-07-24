@@ -8,6 +8,7 @@ import (
 
 	"github.com/imshuai/yaa/internal/api"
 	"github.com/imshuai/yaa/internal/config"
+	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/storage"
 	"golang.org/x/exp/slog"
 )
@@ -15,13 +16,14 @@ import (
 // Runtime 是系统根容器，负责启动/停止子系统与提供健康检查。
 // Phase 1 阶段已接 Config + Storage + API；后续阶段逐步接入 Provider/Tool 等组件。
 type Runtime struct {
-	cfg     *config.Config
-	store   storage.Storage
-	api     *api.Server
-	logger  *slog.Logger
+	cfg       *config.Config
+	store     storage.Storage
+	providers *provider.Manager
+	api       *api.Server
+	logger    *slog.Logger
 
-	ready     atomic.Bool
-	startedAt time.Time
+	ready      atomic.Bool
+	startedAt  time.Time
 	components map[string]string
 }
 
@@ -57,6 +59,15 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	} else {
 		rt.components["storage"] = "ready"
 	}
+
+	// Provider：未知类型/重复 ID/构造失败阻止 Ready。
+	pm, perr := provider.NewManager(rt.cfg.Providers)
+	if perr != nil {
+		rt.rollback()
+		return perr
+	}
+	rt.providers = pm
+	rt.components["provider"] = "ready"
 
 	rt.api = api.NewServer(rt.cfg.Runtime.API.HTTP.Addr, rt, rt.logger)
 	if err := rt.api.Start(ctx); err != nil {
@@ -107,6 +118,11 @@ func (rt *Runtime) Shutdown(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
+	if rt.providers != nil {
+		if err := rt.providers.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if rt.store != nil {
 		if err := rt.store.Close(); err != nil {
 			errs = append(errs, err)
@@ -122,10 +138,14 @@ func (rt *Runtime) rollback() {
 	if rt.api != nil {
 		_ = rt.api.Shutdown(context.Background())
 	}
+	if rt.providers != nil {
+		_ = rt.providers.Close()
+	}
 	if rt.store != nil {
 		_ = rt.store.Close()
 	}
 	rt.api = nil
+	rt.providers = nil
 	rt.store = nil
 	rt.components = map[string]string{}
 }

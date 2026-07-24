@@ -52,6 +52,9 @@ func TestRuntimeStartMarksReadyAndHealth(t *testing.T) {
 	if h.Components["storage"] != "degraded" {
 		t.Fatalf("storage component should be degraded for memory backend: %#v", h.Components)
 	}
+	if h.Components["provider"] != "ready" {
+		t.Fatalf("provider component should be ready: %#v", h.Components)
+	}
 	if rt.UptimeSeconds() < 0 {
 		t.Fatalf("uptime negative: %d", rt.UptimeSeconds())
 	}

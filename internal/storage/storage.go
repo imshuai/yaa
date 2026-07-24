@@ -36,7 +36,6 @@ type Clock interface {
 	Now() time.Time
 }
 
-//
 // Stats 是可选观察接口，不作为业务依赖。
 type Stats interface {
 	Stats() StorageStats
