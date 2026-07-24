@@ -13,16 +13,18 @@ import (
 	ctxwindow "github.com/imshuai/yaa/internal/context"
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/session"
+	"github.com/imshuai/yaa/internal/tool"
 	"golang.org/x/exp/slog"
 )
 
 // Dependencies 是 Runtime 持有并借给 Agent Manager 的对象。
-// ponytail: v1 不含 Memory/Tool/Skill；使用 nil 兼容。
+// ponytail: v1 不含 Memory/Skill；Tool 已注入；使用 nil 兼容。
 type Dependencies struct {
 	Config    *config.Config
 	Sessions  *session.Manager
 	Context   *ctxwindow.Manager
 	Providers *provider.Manager
+	Tools     *tool.Manager
 	Logger    *slog.Logger
 }
 
@@ -244,5 +246,12 @@ func (m *Manager) CancelTurn(ctx context.Context, agentID, sessionID, turnID str
 func (m *Manager) SetSessions(sm *session.Manager) {
 	m.mu.Lock()
 	m.deps.Sessions = sm
+	m.mu.Unlock()
+}
+
+// SetTools 延迟注入 Tool Manager（Runtime 先构造 Agent，再创建 Tool Manager 并注册 builtin）。
+func (m *Manager) SetTools(tm *tool.Manager) {
+	m.mu.Lock()
+	m.deps.Tools = tm
 	m.mu.Unlock()
 }

@@ -85,6 +85,23 @@ func NewManager(deps Dependencies) (*Manager, error) {
 		m.configs[name] = config.ToolConfig{Enabled: bc.Enabled, Timeout: bc.Timeout, Options: opts}
 		m.source[name] = "builtin"
 	}
+	// file 容器分裂：docs/config/reference.md §6.3 约定 tools.builtin.file 是
+	// file_read/file_write/file_list/file_delete 四个注册 Tool 共享的配置组。
+	// 此处把容器配置复制到 4 个 canonical 名，使 Enabled/Timeout/Options 与文档语义一致；
+	// 仅当未显式配置 file_read 等键时才复制（显式覆盖优先）。
+	if fc, hasFile := tc.Builtin["file"]; hasFile {
+		for _, n := range []string{"file_read", "file_write", "file_list", "file_delete"} {
+			if _, explicit := m.configs[n]; explicit {
+				continue
+			}
+			m.configs[n] = config.ToolConfig{
+				Enabled: fc.Enabled,
+				Timeout: fc.Timeout,
+				Options: cloneAnyMap(fc.Options),
+			}
+			m.source[n] = "builtin"
+		}
+	}
 	// 计算每个 Agent 的 allowlist。
 	for _, ag := range deps.Config.Agents {
 		if len(ag.Tools) == 0 {
@@ -220,25 +237,6 @@ func (m *Manager) CheckPermission(agentID, toolName string) bool {
 	}
 	_, allowed := b.Allowed[toolName]
 	return allowed
-}
-
-// ToolDefs 返回 Agent 可用的 Provider ToolDef。
-// v1 让 canonical name 直接作为 Provider wire alias（function.name）。
-// 暴露在外以便 Agent turn 投影和 alias 反查。
-func (m *Manager) ToolDefs(agentID string) []provider.ToolDef {
-	all := m.ListForAgent(agentID)
-	out := make([]provider.ToolDef, 0, len(all))
-	for _, ti := range all {
-		out = append(out, provider.ToolDef{
-			Type: "function",
-			Function: provider.ToolFunction{
-				Name:        ti.Name,
-				Description: ti.Description,
-				Parameters:  ti.Parameters,
-			},
-		})
-	}
-	return out
 }
 
 // Execute 单次执行 Tool，按 Manager §6 流程。

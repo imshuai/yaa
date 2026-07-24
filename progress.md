@@ -263,3 +263,92 @@ Phase 1：核心骨架。
 - `internal/tool/builtin/file.go`：4 个 file_read/file_write/file_list/file_delete 子 Tool（fileTool 分支 by name）。统一 path canonical 校验（canonicalPath 解析最近祖先、EvalSymlinks、再拼回 tail；validatePath within check）。allowed_paths/blocked_paths，blocked 优先；max_file_size 上限；read 支持 utf-8/base64 + max_bytes；write create_dirs；list 排序；delete 文件或空目录。
 - `internal/tool/builtin/{shell,http,file}_test.go`：shell 5 例、http 4 例、file 6 例（read/write/delete 循环；blocked/not allowed；list sorted；create_dirs；base64）。
 - 全项目 build/vet/test 全绿。
+
+## Phase 3：Runtime 注册 builtin + Agent Tool Loop 闭环（已完成本地代码）
+
+本段让 Tool 系统与 Agent turn 真正闭环：内置工具在 Runtime 启动时注册到 Tool Manager，
+Agent turn 内按 docs/agent.md §4 + docs/tool/provider.md §3-§5 完整走 Tool loop 端到端。
+
+### Tool Manager：ProviderToolProjection（`internal/tool/projection.go` 新增）
+
+- `ProviderToolProjection`：不可变 turn-local 投影。`defs []provider.ToolDef`（按 canonical name UTF-8 升序）、`canonicalToAlias map`（definitions + history-only 的并集）、`aliasToCanonical map`（仅 executable definitions）。
+- 算法（docs/tool/provider.md §2 严格实现）：
+  - `providerSafeToolName = ^[A-Za-z_][A-Za-z0-9_-]{0,63}$`；安全 canonical 直接 identity，unsafe 走 `t_` + 完整 SHA-256 base32（不 trim、不截断）。
+  - 合并 current definitions（ListForAgent）与 history 中出现过的 canonical name（assistant ToolCalls[].Function.Name / tool 消息 Name 非空）；碰撞返回 `ErrToolAliasCollision`（含稳定构造分支：取任一 unsafe canonical 的 hash alias，把它本身作为第二个 canonical 再投影）。
+  - history-only 名进入 union 表（可投影历史回传），但**不进 executable 反查表**（不恢复执行权限）。
+- API：
+  - `ToToolDefs(agentID, history) (*ProviderToolProjection, error)`
+  - `ProjectRequest(req ChatRequest) (ChatRequest, error)`：要求 `req.Tools` 必须空；深拷贝 req 并注入冻结 defs、改写 assistant ToolCalls 名 / tool message Name / specific ToolChoice。
+  - `ResolveExecutable(alias) (canonical string, ok bool)`：精确大小写敏感查找；不着色 history-only/unknown。
+  - `Defs()` 返回深拷贝。
+- 深拷贝 helper：`cloneToolDef` / `cloneRawMessage` / `cloneChatRequest`（Message.ToolCalls、ToolChoice、Stop、Extra、Thinking、ResponseFormat 均独立）。
+- 删除旧简化版 `Manager.ToolDefs(agentID)`（无外部测试依赖）。
+- Ponytail 决策：v1 内置工具名（shell/http/file_read/write/list/delete）均 provider-safe，投影路径恒等映射；但仍按文档算法实现 hash alias 以坐实安全边界（Ponytail 例外：input validation at trust boundaries），后续接 MCP/插件带 unsafe canonical 名时无需重构 Agent loop。
+- 测试 `projection_test.go` 6 例：defs 仅 authorized、ProjectRequest 写 alias + 深拷贝不破坏原请求、ProjectRequest 拒非空 Tools、specific ToolChoice 命中 executable 校验、hash alias + 稳定 ErrToolAliasCollision 构造、history-only 名可投影但不可执行。
+
+### Manager 文件容器分裂（`internal/tool/manager.go`）
+
+- docs/config/reference.md §6.3 约定 `tools.builtin.file` 是 `file_read/file_write/file_list/file_delete` 共享配置组。
+- `NewManager` 在 builtin 配置复制循环后追加 `file` 容器分裂：把 `Builtin["file"]` 复制到 4 个 canonical 名的 configs（仅当显式配置 file_read 等键时跳过），保证 Enabled/Timeout/Options 与文档语义一致，不依赖 Register 默认填空。
+- 既有 Manager 11 项测试全绿（行为不受影响）。
+
+### Runtime 注册 builtin（`internal/tool/builtin/register.go`）
+
+- `RegisterBuiltin(m *tool.Manager, cfg *config.Config) error`：把 shell/http/file_read/file_write/file_list/file_delete 6 个 Tool 构造并 Register，配置取自 `cfg.Tools.Builtin`（file_* 共享 `file` 容器）。
+- disabled Tool 也 Register（保留在 List 以维持禁用语义，docs/tool/manager.md §3 step 4）。
+- `Runtime.Start` 在 Provider ready 后插入：
+  1. `tool.NewManager(Dependencies{Config, Providers, Logger})`
+  2. `RegisterBuiltin(tm, cfg)`
+  3. 每个 Agent 当前 definitions 空历史 `ToToolDefs(ag.ID, nil)` 校验（启动 binding 检查；alias 碰撞或非法名在 Ready 前尽早失败）
+  4. `rt.agents.SetTools(tm)` 注入。
+- Shutdown 逆序置 `rt.tools = nil`。
+- Runtime struct 加 `tools *tool.Manager` 字段，Health components 多 "tool": "ready" 一项。
+
+### Agent Tool Loop（`internal/agent/handle_turn.go` 重写 runDirectTurn）
+
+新 `runDirectTurn` 按 docs/agent.md §4 完整 Tool loop：
+
+1. `turn.AppendUser(req.Content, req.Metadata)`
+2. 重复最多 `maxToolRounds=8` 轮（types.go 新增常量）：
+   1. `turn.Snapshot()` 拿 canonical history（system + 历史消息）
+   2. 找 ModelInfo、算 currentTurnStart（最后一条 user）
+   3. `m.deps.Tools.ToToolDefs(a.id, canonicalMsgs)` 冻结 projection；Tools 未注入时 projection 退化为 nil（兼容 v1）
+   4. 组装 canonical `ChatRequest`（Tools 留空）
+   5. `projection.ProjectRequest` 注入 alias definitions 与历史 ToolCalls 名投影
+   6. `Context.Build(已投影请求)`（看到最终 wire alias）
+   7. `callProvider`（direct / stream 二选一）累积 assistantMsg + usage；totalUsage 逐轮累加
+   8. Tool 判定：`len(assistantMsg.ToolCalls)>0 && proj != nil` 时 `resolveToolCalls` 校验 + 反查
+   9. 无 tool_calls → `turn.Append` 单条 final assistant → emit `assistant_done`（Usage=累计、ToolCallCount=累计）→ 返回
+   10. `rounds+1 >= maxToolRounds` → `ErrAgentToolRoundLimit`（不提交 partial unit）
+   11. `tool.ExecuteBatch(ctx, ExecutionScope{AgentID, SessionID}, calls)` 执行 results
+   12. canonical 名写回 assistantMsg.ToolCalls（Session 永远只持有 canonical，不外泄 wire alias）
+   13. 构造单批 unit `[assistant(tool_calls), tool, tool, ...]` 一一对应；`turn.Append` 原子提交（Session classifyAppendBatch + validateBatchSequence 已支持）
+   14. 流式下 emit `tool_call` / `tool_result` 进度事件（按 call 输入顺序）
+   - 进入下一轮（复用本 turn 冻结的 projection）
+
+- `resolveToolCalls`：每个 call `Arguments` 必须 `isValidArgsObject`（单个 JSON object + 拒绝 trailing token；用 `json.NewDecoder` + `dec.More()`）；alias 经 `ResolveExecutable` 精确反查；任一失败 `ErrAgentProviderProtocol`，整批 not executed、不提交 partial（docs/agent.md §5）。
+- `isValidArgsObject` 拒空串、数组、标量、object 后接字符。
+- `callProvider`/`callChat`/`callStream` 保持纯净（不感知 projection），反查在主 loop 做。
+- 修正旧注释里的中文乱码（"圈 - 暫跳构建...在 v1 direct 不绕 Context..."）。
+
+### Pre-existing bug 修复：RunTurn callback sentinel 透传（`internal/session/runturn.go`）
+
+发现并修复一个 pre-existing 契约 bug：`RunTurn` `<-done` case 无条件 `cancel(nil)` 抹掉了 `context.Cause(turnCtx)`，导致 callback 返回的业务 sentinel（如 `ErrAgentProviderProtocol`/`ErrAgentToolRoundLimit`）一律变成 `context.Canceled`，`HandleTurn` 调用方永远拿不到业务错误分类。
+- 改为：done 收到 err 时，非 nil 用 `cancel(err)` 设 cause 让 `context.Cause` 透传；nil path 仍 `cancel(nil)` 回收资源。
+- session.Manager 既有所有测试不变；conversation_handler 的 `errors.Is(err, ErrAgentToolRoundLimit/ErrAgentProviderProtocol)` 业务分类自此可命中。
+
+### Agent Tool Loop 测试（`internal/agent/handle_turn_test.go` 新增）
+
+- `localEchoTool`：agent 包内 Tool stub，回 `params["msg"]`。
+- `newToolLoopEnv`：完整链路（memory Session + Provider mock（httptest + atomic 计数切换响应）+ `tool.Manager` + 注册 echo + Agent `Tools: ["echo"]` allowlist）。
+- 4 项端到端测试：
+  - `TestAgentHandleTurnWithToolLoop`：round1 tool_calls(echo,"hi") → round2 final("done")；`ToolCallCount==1`；Provider 恰好被调用 2 次；Session 4 条消息序列正确（user, assistant(tool_calls), tool["echo: hi"], assistant(final)）；tool_call 持久化的是 canonical 名 `echo`。
+  - `TestAgentHandleTurnUnknownToolAlias`：Provider round1 返回 alias `"not_registered"` → `ErrAgentProviderProtocol`，Session 仅 user 一条（无 partial assistant/tool）。
+  - `TestAgentHandleTurnRoundLimit`：Provider 每轮恒返回 tool_calls → `ErrAgentToolRoundLimit`。
+  - `TestAgentHandleTurnInvalidArgsObject`：arguments 是数组 `[1,2,3]` → `ErrAgentProviderProtocol`。
+
+### 验证
+
+- `go vet ./...` / `go build ./...`：0 issue / 0 error。
+- `go test -count=1 -timeout 120s ./...`：全部 ok（agent/api/config/context/logging/provider/runtime/session/storage/tool/tool/builtin）。
+- WS 取消延迟 race 一度在混合时间窗观察到 transient fail（测试内 `time.Sleep 200ms` 固有计时误差），重测单测 + count=20 稳定绿。

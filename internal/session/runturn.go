@@ -143,7 +143,14 @@ func (m *Manager) RunTurn(
 	select {
 	case err := <-done:
 		runErr = err
-		cancel(nil) // 回收 context 资源
+		// callback 返回非 nil 错误时把 sentinel 作为 cancel cause，使 context.Cause(turnCtx)
+		// 透传给调用方（成功 path 仍 cancel(nil) 回收资源）。否则 callback 的 sentinel
+		// 会被后续 cancel(nil) 抹成 context.Canceled，丢失业务错误分类。
+		if err != nil {
+			cancel(err)
+		} else {
+			cancel(nil)
+		}
 	case <-m.closing:
 		cancel(ErrAgentStopped)
 		<-done

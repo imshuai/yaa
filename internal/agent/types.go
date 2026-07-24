@@ -16,6 +16,9 @@ const (
 	StatusStopped Status = "stopped"
 )
 
+// maxToolRounds 是 v1 一个 turn 的 Tool round 上限（docs/agent.md §4.8）。
+const maxToolRounds = 8
+
 // 错误 sentinel。
 var (
 	ErrAgentNotFound         = errors.New("agent not found")

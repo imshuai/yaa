@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -13,6 +14,8 @@ import (
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/session"
 	"github.com/imshuai/yaa/internal/storage"
+	"github.com/imshuai/yaa/internal/tool"
+	"github.com/imshuai/yaa/internal/tool/builtin"
 	"golang.org/x/exp/slog"
 )
 
@@ -25,6 +28,7 @@ type Runtime struct {
 	sessions  *session.Manager
 	contextM  *ctxwindow.Manager
 	agents    *agent.Manager
+	tools     *tool.Manager
 	api       *api.Server
 	logger    *slog.Logger
 
@@ -75,6 +79,27 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	rt.providers = pm
 	rt.components["provider"] = "ready"
 
+	// Tool Manager：注册 builtin → 每 Agent 空历史 projection binding 校验（docs/tool/manager.md §2.2）。
+	tm, terr := tool.NewManager(tool.Dependencies{Config: rt.cfg, Providers: pm, Logger: rt.logger})
+	if terr != nil {
+		rt.rollback()
+		return terr
+	}
+	if rerr := builtin.RegisterBuiltin(tm, rt.cfg); rerr != nil {
+		rt.rollback()
+		return rerr
+	}
+	// 启动 binding 校验：每个 Agent 当前 definitions 的空历史投影；碰撞或非法名尽早拒绝 Ready
+	// （docs/agent.md §4 step 3 + docs/tool/manager.md §2.2）。
+	for _, ag := range rt.cfg.Agents {
+		if _, perr := tm.ToToolDefs(ag.ID, nil); perr != nil {
+			rt.rollback()
+			return fmt.Errorf("runtime: tool binding for agent %q: %w", ag.ID, perr)
+		}
+	}
+	rt.tools = tm
+	rt.components["tool"] = "ready"
+
 	// Context 窗口管理器
 	rt.contextM = ctxwindow.NewManager()
 
@@ -107,8 +132,9 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	rt.sessions = sm
 	rt.components["session_restore"] = "ready"
 
-	// 将 Session Manager 注入 Agent（先前构造时为 nil，此处补全指针）
+	// 将 Session Manager 和 Tool Manager 注入 Agent（先前构造时为 nil，此处补全指针）
 	am.SetSessions(sm)
+	am.SetTools(rt.tools)
 	rt.agents = am
 	rt.components["agent"] = "ready"
 
@@ -211,6 +237,7 @@ func (rt *Runtime) rollback() {
 	if rt.agents != nil {
 		_ = rt.agents.Shutdown(context.Background())
 	}
+	rt.tools = nil
 	if rt.sessions != nil {
 		_ = rt.sessions.Shutdown(context.Background())
 	}
@@ -221,6 +248,7 @@ func (rt *Runtime) rollback() {
 		_ = rt.store.Close()
 	}
 	rt.api = nil
+	rt.tools = nil
 	rt.agents = nil
 	rt.sessions = nil
 	rt.contextM = nil

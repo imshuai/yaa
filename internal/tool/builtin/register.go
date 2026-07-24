@@ -1,0 +1,50 @@
+// Package builtin 提供 Runtime 启动时注册内置 Tool 的入口。
+// docs/tool/manager.md §3：启动顺序 builtin → plugin proxy → MCP proxy。
+// 本文件仅做 builtin → tool.Manager 的注册胶水，不含工具本体实现。
+package builtin
+
+import (
+	"fmt"
+
+	"github.com/imshuai/yaa/internal/config"
+	"github.com/imshuai/yaa/internal/tool"
+)
+
+// RegisterBuiltin 把 shell/http/file_read/file_write/file_list/file_delete 等内置 Tool
+// 构造并注册到 m。配置取自 cfg.Tools.Builtin；file_read|write|list|delete 共享 file 容器
+// （ToolManager 内部已把 file 容器复制到 4 个 canonical 名的 config，此处直接用对应 ToolConfig）。
+//
+// disabled Tool 仍 Register（保留在 List 中以保持 Enabled 语义），文档 §3 注册说明：无论
+// cfg.Enabled 为何都写入注册表。
+func RegisterBuiltin(m *tool.Manager, cfg *config.Config) error {
+	regs := []struct {
+		canonical string
+		ctor      func(config.ToolConfig) (tool.Tool, error)
+	}{
+		{"shell", func(c config.ToolConfig) (tool.Tool, error) { return NewShell(c) }},
+		{"http", func(c config.ToolConfig) (tool.Tool, error) { return NewHTTP(c) }},
+		{"file_read", func(c config.ToolConfig) (tool.Tool, error) { return NewFileRead(c) }},
+		{"file_write", func(c config.ToolConfig) (tool.Tool, error) { return NewFileWrite(c) }},
+		{"file_list", func(c config.ToolConfig) (tool.Tool, error) { return NewFileList(c) }},
+		{"file_delete", func(c config.ToolConfig) (tool.Tool, error) { return NewFileDelete(c) }},
+	}
+	// 文档规范：file_* 共享 file 容器配置；shell/http 取同名 key。
+	fileCfg := cfg.Tools.Builtin["file"]
+	for _, r := range regs {
+		var tc config.ToolConfig
+		switch r.canonical {
+		case "file_read", "file_write", "file_list", "file_delete":
+			tc = fileCfg
+		default:
+			tc = cfg.Tools.Builtin[r.canonical]
+		}
+		t, err := r.ctor(tc)
+		if err != nil {
+			return fmt.Errorf("tool: construct builtin %q: %w", r.canonical, err)
+		}
+		if err := m.Register(t); err != nil {
+			return fmt.Errorf("tool: register builtin %q: %w", r.canonical, err)
+		}
+	}
+	return nil
+}
