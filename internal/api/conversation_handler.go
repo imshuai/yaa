@@ -19,23 +19,23 @@ type postMessageRequest struct {
 
 // postMessageResponse 是成功返回的 data 结构。
 type postMessageResponse struct {
-	TurnID         string                       `json:"turn_id"`
-	Message        sessionMessageResult         `json:"message"`
-	Usage          usageResult                  `json:"usage"`
-	ToolCallCount  int                          `json:"tool_call_count"`
+	TurnID        string               `json:"turn_id"`
+	Message       sessionMessageResult `json:"message"`
+	Usage         usageResult          `json:"usage"`
+	ToolCallCount int                  `json:"tool_call_count"`
 }
 
 type sessionMessageResult struct {
-	ID               string                       `json:"id"`
-	TurnID           string                       `json:"turn_id"`
-	Role             string                       `json:"role"`
-	Content          string                       `json:"content"`
-	ReasoningContent string                       `json:"reasoning_content"`
-	ToolCalls        []any                        `json:"tool_calls"`
-	ToolCallID       string                       `json:"tool_call_id"`
-	Refusal          string                       `json:"refusal"`
-	Metadata         map[string]any               `json:"metadata"`
-	CreatedAt        string                       `json:"created_at"`
+	ID               string         `json:"id"`
+	TurnID           string         `json:"turn_id"`
+	Role             string         `json:"role"`
+	Content          string         `json:"content"`
+	ReasoningContent string         `json:"reasoning_content"`
+	ToolCalls        []any          `json:"tool_calls"`
+	ToolCallID       string         `json:"tool_call_id"`
+	Refusal          string         `json:"refusal"`
+	Metadata         map[string]any `json:"metadata"`
+	CreatedAt        string         `json:"created_at"`
 }
 
 type usageResult struct {
@@ -45,9 +45,12 @@ type usageResult struct {
 }
 
 // handlePostMessage 提交 user 消息并等待 Agent turn 完成。
+// 当注入 SessionManager 时开启 Stream 路径并把 Emit 接到 Session Hub，
+// 因此先建立的 SSE 订阅能观察 REST 触发的增量帧；REST 仍同步等待结果并以 JSON 返回。
 func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request, sp SessionProvider, sessionID string) {
 	s.mu.Lock()
 	agents := s.agents
+	sessionMgr := s.sessionMgr
 	s.mu.Unlock()
 	if agents == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, 50301, "runtime not ready")
@@ -89,8 +92,27 @@ func (s *Server) handlePostMessage(w http.ResponseWriter, r *http.Request, sp Se
 		Stream:    false,
 	}
 
+	// SSE 转发：若 SessionManager 已注入且该 Session Hub 可用，则把 TurnEvents 发布到 Hub。
+	var hubPub func(any) bool
+	if sessionMgr != nil {
+		if hub, herr := sessionMgr.Hub(sessionID); herr == nil {
+			turnReq.Stream = true
+			turnReq.Emit = func(e agent.TurnEvent) {
+				hub.Publish(turnEventToFrame(e, req.TurnID))
+			}
+			hubPub = func(ev any) bool {
+				hub.Publish(ev)
+				return true
+			}
+		}
+	}
+
 	result, err := agents.HandleTurn(r.Context(), sess.AgentID, turnReq)
 	if err != nil {
+		// 向已订阅 SSE 的客户端发布一个 error frame（REST 仍走 JSON response）。
+		if hubPub != nil {
+			hubPub(errorFrameFromTurnError(err, req.TurnID))
+		}
 		s.writeTurnError(w, r, err, req.TurnID)
 		return
 	}
@@ -189,4 +211,51 @@ func (s *Server) writeTurnError(w http.ResponseWriter, r *http.Request, err erro
 func isProviderError(err error) bool {
 	var pe *provider.ProviderError
 	return errors.As(err, &pe)
+}
+
+// errorFrameFromTurnError 把 turn 失败映射成 SSE/WS 用的 ConversationFrame error 终态。
+// code 与 REST writeTurnError 状态/业务码保持一致（十进制串）；cancel 用 "canceled"。
+// ponytail: v1 复用 writeTurnError 的语义；HTTP 504/502 等映射成对应十进制字符串。
+func errorFrameFromTurnError(err error, turnID string) ConversationFrame {
+	frame := ConversationFrame{Type: "error", TurnID: turnID}
+	switch {
+	case errors.Is(err, context.Canceled):
+		// 客户端取消 → canceled；REST 不写 response，但帧仍符合文档。
+		frame.Code = "canceled"
+		frame.Message = "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		frame.Code = "50401"
+		frame.Message = "request timed out"
+	case errors.Is(err, agent.ErrAgentStopped), errors.Is(err, agent.ErrAgentPaused), errors.Is(err, agent.ErrAgentInvalidState):
+		frame.Code = "40901"
+		frame.Message = "agent state not allowed"
+	case errors.Is(err, agent.ErrAgentManagerClosed):
+		frame.Code = "50301"
+		frame.Message = "runtime unavailable"
+	case errors.Is(err, agent.ErrAgentNotFound):
+		frame.Code = "40401"
+		frame.Message = "agent not found"
+	case errors.Is(err, agent.ErrAgentInvalidRequest):
+		frame.Code = "40001"
+		frame.Message = "invalid request"
+	case errors.Is(err, agent.ErrAgentToolRoundLimit), errors.Is(err, agent.ErrAgentProviderProtocol):
+		frame.Code = "50001"
+		frame.Message = "internal agent error"
+	case errors.Is(err, session.ErrSessionNotFound), errors.Is(err, session.ErrMessageNotFound):
+		frame.Code = "40401"
+		frame.Message = "resource not found"
+	case errors.Is(err, session.ErrSessionClosed), errors.Is(err, session.ErrSessionPaused):
+		frame.Code = "40901"
+		frame.Message = "session state not allowed"
+	case errors.Is(err, session.ErrTurnIDConflict):
+		frame.Code = "40001"
+		frame.Message = "turn id already used"
+	case isProviderError(err):
+		frame.Code = "50202"
+		frame.Message = "provider error"
+	default:
+		frame.Code = "50001"
+		frame.Message = "internal error"
+	}
+	return frame
 }

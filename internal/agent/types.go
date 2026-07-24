@@ -56,13 +56,21 @@ type TurnRequest struct {
 	Emit      func(TurnEvent) // nil 表示不发布增量
 }
 
-// TurnEvent 是随 turn 发出的流式事件。v1 direct 无 Tool 路径使用 assistant_delta/assistant_done。
+// TurnEvent 是随 turn 发出的流式事件。queued/assistant_start/..._delta/assistant_done 用同一结构。
 type TurnEvent struct {
-	Kind       string // queued | assistant_start | reasoning_delta | assistant_delta | tool_call | tool_result
+	Kind       string // queued | assistant_start | reasoning_delta | assistant_delta | tool_call | tool_result | assistant_done | error | session_end
 	Position   *int   // 只在 queued 时非 nil
 	Delta      string
 	ToolCall   *provider.ToolCall
 	ToolResult *ToolResultEvent
+	// assistant_done 专有：已提交的 final assistant message + usage + tool_call_count。
+	Assistant     *session.SessionMessage
+	Usage         *provider.Usage
+	ToolCallCount *int
+	// error 专有：稳定 cause code（REST business code 十进制串或 "canceled"）+ error message。
+	Code    string
+	Message string
+	Reason  string // session_end: closed|deleted
 }
 
 // ToolResultEvent 是 Tool 结果的事件。

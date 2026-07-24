@@ -21,7 +21,7 @@ type Manager struct {
 	store  storage.Storage
 	logger *slog.Logger
 	clock  Clock
-	ids   idGenerator
+	ids    idGenerator
 
 	// agentOverride 在 Create 时 提供 Agent 的 SessionOverride（可为 nil）。
 	// 由外部传入，Manager 自己不查 Agent 注册表（依赖单一方向）。
@@ -32,6 +32,7 @@ type Manager struct {
 	sessions    map[string]*Session
 	agentIdx    map[string]map[string]struct{} // agentID -> set(sessionID)
 	runners     map[string]*runner
+	hubs        map[string]*Hub
 	activeTurns map[string]map[string]*turnControl // sessionID -> turnID -> control
 
 	closing chan struct{}
@@ -95,6 +96,7 @@ func newManagerWith(cfg config.SessionConfig, store storage.Storage, logger *slo
 		sessions:      map[string]*Session{},
 		agentIdx:      map[string]map[string]struct{}{},
 		runners:       map[string]*runner{},
+		hubs:          map[string]*Hub{},
 		activeTurns:   map[string]map[string]*turnControl{},
 		closing:       make(chan struct{}),
 	}
@@ -198,6 +200,18 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 		runners[k] = r
 	}
 	m.mu.Unlock()
+
+	// 关闭所有 session hub，通知订阅者 session_end。
+	hubs := map[string]*Hub{}
+	m.mu.Lock()
+	for id, h := range m.hubs {
+		hubs[id] = h
+	}
+	m.hubs = nil
+	m.mu.Unlock()
+	for _, h := range hubs {
+		h.Close(nil)
+	}
 
 	if err := m.cancelAllTurns(ctx); err != nil {
 		return err
@@ -331,8 +345,6 @@ func (m *Manager) stopRunner(sessionID string) {
 	}
 }
 
-
-
 // runInSession 在指定 session runner 内同步执行 task 并返回结果。
 // 锁序：持锁获取 runner 指针；释放锁后 send 到 tasks channel。
 // runner 终止通过关闭 stop channel 实现（非 close(tasks)），因此不产生 send-on-closed panic。
@@ -429,4 +441,31 @@ func (m *Manager) commit(cand *Session) error {
 	m.sessions[cand.ID] = cand
 	m.mu.Unlock()
 	return nil
+}
+
+// Hub 返回指定 Session 的事件 Hub。不存在则返回 ErrSessionNotFound。
+// 同一 Session 多次调用返回同一 *Hub；Close/Delete 时 Hub 被 Close(reason)。
+func (m *Manager) Hub(sessionID string) (*Hub, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil, ErrManagerClosed
+	}
+	if _, ok := m.sessions[sessionID]; !ok {
+		return nil, fmt.Errorf("%w: session %s", ErrSessionNotFound, sessionID)
+	}
+	if h, ok := m.hubs[sessionID]; ok {
+		return h, nil
+	}
+	h := NewHub(m.logger)
+	m.hubs[sessionID] = h
+	return h, nil
+}
+
+// closeHubLocked 关闭并摘除 Hub；已在 mu 内调用。幂等。
+func (m *Manager) closeHubLocked(sessionID string, reason any) {
+	if h, ok := m.hubs[sessionID]; ok {
+		delete(m.hubs, sessionID)
+		h.Close(reason)
+	}
 }

@@ -6,8 +6,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/imshuai/yaa/internal/api"
 	"github.com/imshuai/yaa/internal/agent"
+	"github.com/imshuai/yaa/internal/api"
 	"github.com/imshuai/yaa/internal/config"
 	ctxwindow "github.com/imshuai/yaa/internal/context"
 	"github.com/imshuai/yaa/internal/provider"
@@ -115,6 +115,7 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	rt.api = api.NewServer(rt.cfg.Runtime.API.HTTP.Addr, rt, rt.logger)
 	rt.api.SetSessionProvider(sm, rt.agentAPIShim())
 	rt.api.SetAgentProvider(am)
+	rt.api.SetSessionManager(sm)
 	if err := rt.api.Start(ctx); err != nil {
 		rt.rollback()
 		return err
@@ -228,7 +229,6 @@ func (rt *Runtime) rollback() {
 	rt.components = map[string]string{}
 }
 
-
 // agentExists 判断某 Agent ID 是否在配置中注册。
 func (rt *Runtime) agentExists(agentID string) bool {
 	for _, a := range rt.cfg.Agents {
@@ -255,7 +255,7 @@ type agentAPIProvider struct {
 	override func(string) *config.SessionOverride
 }
 
-func (a *agentAPIProvider) AgentExists(agentID string) bool                  { return a.exists(agentID) }
+func (a *agentAPIProvider) AgentExists(agentID string) bool { return a.exists(agentID) }
 func (a *agentAPIProvider) AgentSessionOverride(agentID string) *config.SessionOverride {
 	return a.override(agentID)
 }

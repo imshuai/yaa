@@ -1,11 +1,14 @@
 package api
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,9 +24,31 @@ import (
 func conversationTestEnv(t *testing.T) (*Server, *session.Manager) {
 	t.Helper()
 
-	// Provider mock
+	// Provider mock：stream=true 时回 SSE 流（单段 assistant_start 制导致多 chunk），否则回非流式 JSON。
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 只回 Chat completion
+		buf, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		if bytes.Contains(buf, []byte(`"stream":true`)) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			flusher, _ := w.(http.Flusher)
+			wsse := func(obj map[string]any) {
+				b, _ := json.Marshal(obj)
+				_, _ = w.Write([]byte("data: "))
+				_, _ = w.Write(b)
+				_, _ = w.Write([]byte("\n\n"))
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			wsse(map[string]any{"id": "s1", "model": "test-model", "choices": []map[string]any{{"index": 0, "delta": map[string]any{"role": "assistant", "content": "Hi"}}}})
+			wsse(map[string]any{"id": "s1", "model": "test-model", "choices": []map[string]any{{"index": 0, "delta": map[string]any{"content": " there"}, "finish_reason": "stop"}}, "usage": map[string]any{"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}})
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id":    "x",
@@ -100,6 +125,7 @@ func conversationTestEnv(t *testing.T) (*Server, *session.Manager) {
 		agents: map[string]bool{"agent-test": true},
 	})
 	apiSrv.SetAgentProvider(am)
+	apiSrv.SetSessionManager(sm)
 	return apiSrv, sm
 }
 
@@ -163,4 +189,106 @@ func TestAPIPostMessageInvalidTurnID(t *testing.T) {
 	if env.Code != 40001 {
 		t.Fatalf("expected 40001, got %d", env.Code)
 	}
+}
+
+// TestAPISSEEvents 验证 SSE 端点能转发 Hub 发布的 ConversationFrame 给订阅者。
+// ponytail: 不耦合 stream/POST 路径，手工 Publish 帧，再读 SSE 验证 wire 格式与心跳。
+func TestAPISSEEvents(t *testing.T) {
+	apiSrv, sm := conversationTestEnv(t)
+	hsrv := httptest.NewServer(apiSrv.server.Handler)
+	t.Cleanup(hsrv.Close)
+
+	ctx := context.Background()
+	s, err := sm.Create(ctx, session.CreateRequest{AgentID: "agent-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. SSE 订阅连接。
+	sseURL := hsrv.URL + "/api/v1/sessions/" + s.ID + "/events"
+	sseReq, _ := http.NewRequestWithContext(ctx, "GET", sseURL, nil)
+	sseResp, err := http.DefaultClient.Do(sseReq)
+	if err != nil {
+		t.Fatalf("sse connect: %v", err)
+	}
+	defer sseResp.Body.Close()
+	if sseResp.StatusCode != 200 {
+		t.Fatalf("sse status=%d", sseResp.StatusCode)
+	}
+	if ct := sseResp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("sse content-type=%q", ct)
+	}
+
+	// 2. 手工 Publish 一串 ConversationFrame（模拟 turn 帧流）。
+	hub, _ := sm.Hub(s.ID)
+	publishFrame := func(f ConversationFrame) { hub.Publish(f) }
+	publishFrame(ConversationFrame{Type: "queued", TurnID: "turn_sse_1", Position: intPtr(0)})
+	publishFrame(ConversationFrame{Type: "assistant_start", TurnID: "turn_sse_1"})
+	d := "Hi "
+	publishFrame(ConversationFrame{Type: "assistant_delta", TurnID: "turn_sse_1", Delta: &d})
+	d2 := "there"
+	publishFrame(ConversationFrame{Type: "assistant_delta", TurnID: "turn_sse_1", Delta: &d2})
+	done := ConversationFrame{Type: "assistant_done", TurnID: "turn_sse_1", ToolCallCount: intPtr(0)}
+	publishFrame(done)
+
+	// 3. 逐行读 SSE，直到看到 assistant_done。
+	rd := bufio.NewReader(sseResp.Body)
+	var got []ConversationFrame
+	deadline := time.Now().Add(5 * time.Second)
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		for time.Now().Before(deadline) {
+			line, err := rd.ReadString('\n')
+			if err != nil {
+				return
+			}
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, ":") || strings.HasPrefix(line, "event:") {
+				continue
+			}
+			if strings.HasPrefix(line, "data:") {
+				payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+				if payload == "" {
+					continue
+				}
+				var fr ConversationFrame
+				if jerr := json.Unmarshal([]byte(payload), &fr); jerr == nil {
+					got = append(got, fr)
+					if fr.Type == "assistant_done" {
+						return
+					}
+				}
+			}
+		}
+	}()
+	<-doneCh
+
+	kinds := make([]string, 0, len(got))
+	for _, f := range got {
+		kinds = append(kinds, f.Type)
+	}
+	if !containsStr(kinds, "queued") || !containsStr(kinds, "assistant_start") ||
+		!containsStr(kinds, "assistant_delta") || !containsStr(kinds, "assistant_done") {
+		t.Fatalf("missing required SSE frames, got %v", kinds)
+	}
+	var acc string
+	for _, f := range got {
+		if f.Type == "assistant_delta" && f.Delta != nil {
+			acc += *f.Delta
+		}
+	}
+	if acc != "Hi there" {
+		t.Fatalf("delta acc=%q want Hi there", acc)
+	}
+}
+
+func intPtr(v int) *int { return &v }
+func containsStr(xs []string, x string) bool {
+	for _, s := range xs {
+		if s == x {
+			return true
+		}
+	}
+	return false
 }

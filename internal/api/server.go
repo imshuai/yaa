@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/imshuai/yaa/internal/session"
 	"golang.org/x/exp/slog"
 )
 
@@ -46,16 +47,17 @@ type HealthProvider interface {
 
 // Server 是 Remote API 的 HTTP 服务。
 type Server struct {
-	addr     string
-	logger   *slog.Logger
-	server   *http.Server
-	health       HealthProvider
-	sessions     SessionProvider
-	agentExists  AgentExistsProvider
-	agents       AgentProvider
-	started      time.Time
-	mu           sync.Mutex
-	listener     *http.Server
+	addr        string
+	logger      *slog.Logger
+	server      *http.Server
+	health      HealthProvider
+	sessions    SessionProvider
+	agentExists AgentExistsProvider
+	agents      AgentProvider
+	sessionMgr  *session.Manager
+	started     time.Time
+	mu          sync.Mutex
+	listener    *http.Server
 }
 
 // NewServer 创建 Remote API Server。addr 为监听地址；health 可为 nil（视为未就绪）。
@@ -90,6 +92,14 @@ func (s *Server) SetSessionProvider(sp SessionProvider, ae AgentExistsProvider) 
 func (s *Server) SetAgentProvider(ap AgentProvider) {
 	s.mu.Lock()
 	s.agents = ap
+	s.mu.Unlock()
+}
+
+// SetSessionManager 注入 Session 管理器用于 SSE/WS 事件订阅。
+// 与 SetSessionProvider 同时注入（二者都来自 *session.Manager）。
+func (s *Server) SetSessionManager(sm *session.Manager) {
+	s.mu.Lock()
+	s.sessionMgr = sm
 	s.mu.Unlock()
 }
 

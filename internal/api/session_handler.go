@@ -17,7 +17,7 @@ import (
 // Go 1.20 ServeMux 不支持路径参数，用最长前缀匹配 + 手动解析。
 func (s *Server) registerSessionRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/agents/", s.handleAgentsSessions) // :id/sessions
-	mux.HandleFunc("/api/v1/sessions/", s.handleSessions)    // :id...sub-resource
+	mux.HandleFunc("/api/v1/sessions/", s.handleSessions)     // :id...sub-resource
 }
 
 // handleAgentsSessions 处理 /api/v1/agents/:id/sessions 的 POST/GET。
@@ -104,6 +104,8 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		s.handleListMessages(w, r, sp, sessionID)
 	case sub == "messages" && r.Method == http.MethodDelete:
 		s.handleDeleteMessage(w, r, sp, sessionID, subID)
+	case sub == "events" && r.Method == http.MethodGet:
+		s.handleSSEEvents(w, r, sp, sessionID)
 	default:
 		s.writeError(w, r, http.StatusMethodNotAllowed, 40501, "method not allowed")
 	}

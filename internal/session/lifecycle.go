@@ -288,6 +288,8 @@ func (m *Manager) runInSessionWithinDelete(ctx context.Context, sessionID string
 			delete(set, sessionID)
 		}
 		delete(m.activeTurns, sessionID)
+		// 关闭 hub，通知订阅者 session_end(deleted)。
+		m.closeHubLocked(sessionID, nil)
 		m.mu.Unlock()
 		return nil
 	})

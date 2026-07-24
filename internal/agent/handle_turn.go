@@ -138,35 +138,27 @@ func (m *Manager) runDirectTurn(
 	if err != nil {
 		return TurnResult{}, err
 	}
-	// 4. Provider.Chat
-	resp, err := p.Chat(ctx, &built.Request)
+	// 4. Provider.Chat（按 stream 选择流式/非流式路径，流式路径 emit 中间事件）
+	assistantMsg, usage, err := m.callProvider(ctx, &built.Request, p, req)
 	if err != nil {
-		return TurnResult{Usage: resp.Usage}, err
-	}
-
-	// 5. 组装 final assistant Message
-	assistantMsg := provider.Message{
-		Role:             "assistant",
-		Content:          resp.Content,
-		ReasoningContent: resp.ReasoningContent,
-		Refusal:          resp.Refusal,
-		ToolCalls:        resp.ToolCalls,
+		return TurnResult{Usage: usage}, err
 	}
 
 	// 6. Append final assistant（无 Tool 路径单条 batch）
 	appended, err := turn.Append([]session.AppendInput{{Message: assistantMsg}})
 	if err != nil {
-		return TurnResult{Usage: resp.Usage}, err
+		return TurnResult{Usage: usage}, err
 	}
 	if len(appended) > 0 && req.Emit != nil {
-		req.Emit(TurnEvent{Kind: "assistant_done"})
+		tcc := 0
+		req.Emit(TurnEvent{Kind: "assistant_done", Assistant: &appended[0], Usage: &usage, ToolCallCount: &tcc})
 	} else if len(appended) == 0 {
-		return TurnResult{Usage: resp.Usage}, fmt.Errorf("%w: assistant append empty", ErrAgentProviderProtocol)
+		return TurnResult{Usage: usage}, fmt.Errorf("%w: assistant append empty", ErrAgentProviderProtocol)
 	}
 
 	return TurnResult{
 		Message:       appended[0],
-		Usage:         resp.Usage,
+		Usage:         usage,
 		ToolCallCount: 0,
 	}, nil
 }
@@ -182,3 +174,102 @@ func (m *Manager) resolveAgentContextConfig(a *agentBinding) config.ContextConfi
 }
 
 var _ = fmt.Sprintf
+
+// callProvider 按 req.Stream 选择流式/非流式执行 Path；二者返回累积后的 assistant message + usage + 错误。
+// 流式路径在首个 chunk 前出现错误时由 retryingProvider 负责重试，首个可见 chunk 后不再重试。
+func (m *Manager) callProvider(
+	ctx context.Context,
+	req *provider.ChatRequest,
+	p provider.Provider,
+	turnReq TurnRequest,
+) (provider.Message, provider.Usage, error) {
+	if !turnReq.Stream {
+		return m.callChat(ctx, req, p)
+	}
+	return m.callStream(ctx, req, p, turnReq)
+}
+
+// callChat 是非流式 fallback：直接用 Provider.Chat。
+func (m *Manager) callChat(ctx context.Context, req *provider.ChatRequest, p provider.Provider) (provider.Message, provider.Usage, error) {
+	resp, err := p.Chat(ctx, req)
+	if err != nil {
+		return provider.Message{}, resp.Usage, err
+	}
+	return provider.Message{
+		Role:             "assistant",
+		Content:          resp.Content,
+		ReasoningContent: resp.ReasoningContent,
+		Refusal:          resp.Refusal,
+		ToolCalls:        resp.ToolCalls,
+	}, resp.Usage, nil
+}
+
+// callStream 用 Provider.StreamChat，累积 delta 并通过 Emit 回调发布。
+// v1 无 Tool 路径，ToolCalls 增量会累积到最终 message；Tool 描述的反查与执行在 Phase 3 补全。
+func (m *Manager) callStream(
+	ctx context.Context,
+	req *provider.ChatRequest,
+	p provider.Provider,
+	turnReq TurnRequest,
+) (provider.Message, provider.Usage, error) {
+	// 标记 stream 请求；某些 adapter 靠此 flag 在 request body 中加 stream:true。
+	req.Stream = true
+	ch, err := p.StreamChat(ctx, req)
+	if err != nil {
+		return provider.Message{}, provider.Usage{}, err
+	}
+	var out provider.Message
+	var usage provider.Usage
+	started := false
+	emit := turnReq.Emit
+	for chunk := range ch {
+		if chunk.Error != nil {
+			return out, usage, chunk.Error
+		}
+		d := chunk.Delta
+		// 首个 chunk 带 role 时宣告 assistant_start。
+		if !started && d.Role == "assistant" {
+			started = true
+			if emit != nil {
+				emit(TurnEvent{Kind: "assistant_start"})
+			}
+		} else if !started && (d.Content != "" || d.ReasoningContent != "" || d.Refusal != "") {
+			started = true
+			if emit != nil {
+				emit(TurnEvent{Kind: "assistant_start"})
+			}
+		}
+		// 累积各字段。
+		out.Role = pickNonEmpty(out.Role, d.Role)
+		out.Content += d.Content
+		out.ReasoningContent += d.ReasoningContent
+		out.Refusal += d.Refusal
+		if len(d.ToolCalls) > 0 {
+			out.ToolCalls = append(out.ToolCalls, d.ToolCalls...)
+		}
+		// emit delta：reasoning 与 正常 content 分开帧；二者可同时为空但均发帧（文档允许空 delta）。
+		if emit != nil {
+			if d.ReasoningContent != "" {
+				emit(TurnEvent{Kind: "reasoning_delta", Delta: d.ReasoningContent})
+			}
+			if d.Content != "" {
+				emit(TurnEvent{Kind: "assistant_delta", Delta: d.Content})
+			}
+		}
+		if chunk.Usage != nil {
+			usage = *chunk.Usage
+		}
+	}
+	if out.Role == "" {
+		out.Role = "assistant"
+	}
+	return out, usage, nil
+}
+
+// pickNonEmpty 若 b 非空则返回 b，否则返回 a。用于累积 role。
+func pickNonEmpty(a, b string) string {
+	if b != "" {
+		return b
+	}
+	return a
+}
