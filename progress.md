@@ -35,8 +35,15 @@ Phase 1：核心骨架。
 - 已确认 `golang.org/x/exp/slog` 的 `Logger.Error(msg, err, args...)` 与标准 `log/slog` 签名不同，后续迁移需注意。
 - `api_test.go` 覆盖 envelope、X-Request-ID 复用/生成、health ready/degraded/unready、version 四字段、405/404、未启动 Shutdown。
 
+- 最小 Runtime 生命周期已实现：`runtime.New`（拒绝 nil config）→ `Start`（启动 API、标记 Ready、记录 components.api）→ `Ready`/`Health`/`UptimeSeconds` → `Shutdown`（先原子 Not Ready 再按逆序关 API，错误用 `errors.Join`）；启动失败按逆序 `rollback`。
+- Runtime 实现 `api.HealthProvider`，health 接入 Ready 状态；`APIAddr()` 暴露实际监听地址。
+- `cmd/yaa` 入口已接入：`--config` flag → `config.Load` → `runtime.New` → `signal.NotifyContext(Interrupt, SIGTERM)` 等 ctx → 按 `http.write_timeout` 限期 `Shutdown`。
+- Makefile `build` 已通过 ldflags 注入 `api.Version/GitCommit/BuildTime`。
+- Runtime 真实二进制冒烟通过：`/api/v1/health` 200/code0/data、`/api/v1/version` 含 ldflags 值、未匹配路由 404、kill 后正常退出。
+- `runtime_test.go` 覆盖 nil config、Start/Ready/Health/components、Shutdown 清除 Ready、启动前 not ready、端到端真实 HTTP /health。
+
 ## 下一步
 
-- 接最小 Runtime 生命周期（Start/Stop/Ready、signal context、启停 API server、health 接入 Ready），随后接 Storage 层。
+- 接入 Storage 层（SQLite + KV 接口），并将其纳入 Runtime 初始化与 health 组件；随后接基本 HTTP 配置项（read/write timeout、max_header_bytes）与日志级别控制。
 
 每个可独立验收的功能完成后单独提交并推送到 `gitea/main`。

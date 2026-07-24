@@ -200,3 +200,13 @@ func recoverMiddleware(next http.Handler) http.Handler {
 func (s *Server) notFound(w http.ResponseWriter, r *http.Request) {
 	s.writeError(w, r, http.StatusNotFound, 40401, "resource not found")
 }
+
+// Addr 返回实际监听地址；未启动时返回配置的 addr。
+func (s *Server) Addr() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.server != nil && s.server.Addr != "" {
+		return s.server.Addr
+	}
+	return s.addr
+}
