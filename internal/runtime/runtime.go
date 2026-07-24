@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/imshuai/yaa/internal/api"
+	"github.com/imshuai/yaa/internal/agent"
 	"github.com/imshuai/yaa/internal/config"
 	ctxwindow "github.com/imshuai/yaa/internal/context"
 	"github.com/imshuai/yaa/internal/provider"
@@ -23,6 +24,7 @@ type Runtime struct {
 	providers *provider.Manager
 	sessions  *session.Manager
 	contextM  *ctxwindow.Manager
+	agents    *agent.Manager
 	api       *api.Server
 	logger    *slog.Logger
 
@@ -76,6 +78,19 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	// Context 窗口管理器
 	rt.contextM = ctxwindow.NewManager()
 
+	// Agent Manager：冻结 Provider/Tool/Skill allowlist + effective policy。
+	am, aerr := agent.NewManager(agent.Dependencies{
+		Config:    rt.cfg,
+		Sessions:  nil, // 先填 nil，下面 Restore+Start 完成后再注入
+		Context:   rt.contextM,
+		Providers: pm,
+		Logger:    rt.logger,
+	})
+	if aerr != nil {
+		rt.rollback()
+		return aerr
+	}
+
 	// Session：Restore 失败阻止 Ready（文档：Remote API 不得在 Restore 完成前进入 Ready）。
 	sm := session.NewManager(rt.cfg.Session, rt.store, rt.logger, session.ManagerOptions{
 		AgentExists:   rt.agentExists,
@@ -91,6 +106,11 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	}
 	rt.sessions = sm
 	rt.components["session_restore"] = "ready"
+
+	// 将 Session Manager 注入 Agent（先前构造时为 nil，此处补全指针）
+	am.SetSessions(sm)
+	rt.agents = am
+	rt.components["agent"] = "ready"
 
 	rt.api = api.NewServer(rt.cfg.Runtime.API.HTTP.Addr, rt, rt.logger)
 	rt.api.SetSessionProvider(sm, rt.agentAPIShim())
@@ -117,10 +137,24 @@ func (rt *Runtime) Health() api.HealthData {
 		// 关键组件 ready 但 storage 降级（memory 后端）→ degraded、ready=true。
 		status = "degraded"
 	}
+	var agentCounts api.AgentCounts
+	if rt.agents != nil {
+		for _, info := range rt.agents.List(nil) {
+			agentCounts.Total++
+			switch info.Status {
+			case agent.StatusRunning:
+				agentCounts.Running++
+			case agent.StatusPaused:
+				agentCounts.Paused++
+			case agent.StatusStopped:
+				agentCounts.Stopped++
+			}
+		}
+	}
 	return api.HealthData{
 		Status:     status,
 		Ready:      rt.ready.Load(),
-		Agents:     api.AgentCounts{},
+		Agents:     agentCounts,
 		Components: cloneComponents(rt.components),
 	}
 }
@@ -147,6 +181,11 @@ func (rt *Runtime) Shutdown(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
+	if rt.agents != nil {
+		if err := rt.agents.Shutdown(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if rt.providers != nil {
 		if err := rt.providers.Close(); err != nil {
 			errs = append(errs, err)
@@ -167,6 +206,9 @@ func (rt *Runtime) rollback() {
 	if rt.api != nil {
 		_ = rt.api.Shutdown(context.Background())
 	}
+	if rt.agents != nil {
+		_ = rt.agents.Shutdown(context.Background())
+	}
 	if rt.sessions != nil {
 		_ = rt.sessions.Shutdown(context.Background())
 	}
@@ -177,6 +219,7 @@ func (rt *Runtime) rollback() {
 		_ = rt.store.Close()
 	}
 	rt.api = nil
+	rt.agents = nil
 	rt.sessions = nil
 	rt.contextM = nil
 	rt.providers = nil

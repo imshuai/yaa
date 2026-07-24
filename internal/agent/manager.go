@@ -52,9 +52,8 @@ func NewManager(deps Dependencies) (*Manager, error) {
 	if deps.Config == nil {
 		return nil, errors.New("agent: config is nil")
 	}
-	if deps.Sessions == nil {
-		return nil, errors.New("agent: sessions is nil")
-	}
+	// Sessions 可延迟注入（Runtime 先构造 Agent，再创建和 Restore Session，
+	// 最后通过 SetSessions 补全指针），构造时允许 nil。
 	if deps.Context == nil {
 		return nil, errors.New("agent: context is nil")
 	}
@@ -238,4 +237,12 @@ func (m *Manager) CancelTurn(ctx context.Context, agentID, sessionID, turnID str
 		return fmt.Errorf("%w: %s", ErrAgentNotFound, agentID)
 	}
 	return m.deps.Sessions.CancelTurn(sessionID, turnID, ErrAgentStopped)
+}
+
+// SetSessions 注入 Session Manager（在 Runtime 启动 Session 完成后调用）。
+// 用于解决 Agent 依赖 Session 但 Session 也依赖 Agent 信息的循环。
+func (m *Manager) SetSessions(sm *session.Manager) {
+	m.mu.Lock()
+	m.deps.Sessions = sm
+	m.mu.Unlock()
 }
