@@ -45,14 +45,18 @@
 
 ## 4. Transport — stdio
 
-- [ ] `StdioClient` / `StdioServer` 结构体定义（cmd, stdin, stdout）
-- [ ] 子进程启动（`exec.Command`）
-- [ ] stdin/stdout 管道建立
-- [ ] JSON-RPC 消息读写（行分隔）
-- [ ] stderr 日志捕获与转发
-- [ ] 子进程退出检测与通知
-- [ ] 子进程环境变量注入
-- [ ] 优雅关闭（关闭 stdin → 等待退出 → 超时 kill；不发送未定义的 `shutdown` RPC）
+- [x] `StdioClient` / `StdioServer` 结构体定义（cmd, stdin, stdout） — `StdioClient` 已落地（Start/Send/Recv/Close/Info 实现 ClientTransport）；`StdioServer` 待 §3 本地 MCP Server commit
+- [x] 子进程启动（`exec.Command`） —— `cmd := exec.Command(command, args...)` + cmd.Env 注入
+- [x] stdin/stdout 管道建立 —— cmd.StdinPipe / StdoutPipe / StderrPipe + cmd.Start
+- [x] JSON-RPC 消息读写（行分隔） —— Send: json.Marshal + 写 stdin 加行尾；Recv: bufio.Reader.ReadString('\n') → json.Unmarshal
+- [x] stderr 日志捕获与转发 —— pumpStderr goroutine 行级转发至 slog.Info（带 server 标签，不混入协议流）
+- [x] 子进程退出检测与通知 —— Close 关 stdin → process.Wait with 5s timeout → Kill；开启 recvLoop exit on transport close
+- [x] 子进程环境变量注入 —— composeStdioEnv：白名单 PATH/HOME/USER/LANG/LC_ALL + 用户 env 注入（docs/mcp/integration.md §7 过滤）
+- [x] 优雅关闭（关闭 stdin → 等待退出 → 超时 kill；不发送未定义的 `shutdown` RPC） —— CloseClose 先 stdin.Close → wait with stdioCloseGraceTimeout=5s → cmd.Process.Kill
+
+### §4 Client 8 项全部实现 + 集成测试覆盖
+
+集成：fake stdio MCP server（python3 inline 脚本）+ Client 端到端 lifecycle / CallTool / Send 超 4 MiB / 不存在的命令 / Close 幂等 / Info 状态 / 子进程 kill → Recv / env 注入通过 serverInfo.name 回显 = 8 例全绿
 
 ## 5. Transport — SSE
 

@@ -1168,3 +1168,88 @@ lifecycle commit 落地）。无 §2-9 改动。
 - mapRPCError 中 -32601 → ErrMCPToolNotFound（本地 catalog 查找用）；其他统一
   ErrMCPToolExecFailed（含 -32001 不假设过载语义），与 docs/mcp/errors.md §2 "不能假设 -32001 固定
   表示过载" 对齐。
+
+## Phase 3 下一步 #10：stdio Client transport（cmd/yaasmoke 临时辅助）+ Client.Connect Start 顺序修复 + Python 端到端集成测试（commit 待 push）
+
+### 范围
+落地 `internal/mcp/StdioClient` 全量实现 docs/mcp/checklist.md §4 Transport — stdio。
+通过真实 Python subprocess fake MCP server 完成 8 例端到端集成测试。**Manager.runUpstream 仍未接**（留下个 commit）。
+**同时修一处 Client.Connect 真实 bug**：startLoops 必须在 transport.Start 之后启动 recvLoop，否则 recvLoop 在
+transport stdout 尚未初始化时阻塞（rg：`recvReady nil channel select permanent block`）。
+
+### 文档改动
+`docs/mcp/checklist.md §4 Transport — stdio` 全部 8 项勾选 + 备注（StdioServer 留 §3 本地 MCP Server commit）。
+
+### `internal/mcp/stdio.go`（新）
+- `StdioClient` 结构 / `NewStdioClient(command, args, env, logger)` / `Start/Send/Recv/Close/Info`
+- `recvReady chan struct{}` NewStdioClient 时 make + Start 时 close —— 防 Recv 在卡 nil channel
+- `Start`：exec.Command + cmd.Env=composeStdioEnv(userEnv) + StdinPipe/StdoutPipe/StderrPipe + cmd.Start + pumpStderr goroutine
+- `pumpStderr`：bufio.Reader 行级 ReadString → slog.Info（subprocess stderr 标签，不混入协议流）
+- `composeStdioEnv`：白名单 inheritEnvKeys = [PATH/HOME/USER/LANG/LC_ALL] + 用户 env 覆盖（docs/mcp/integration.md §7）
+- `Send`：json.Marshal → stdin.Write + 行尾；关闭/closed 时返 ErrMCPTransportClosed；body > 4 MiB 返 ErrMCPProtocolError
+- `Recv`：readerForRecv lazy 跨 Recv 复用 bufio.Reader (4 MiB buffer)；ReadString → json.Unmarshal；
+  EOF → ErrMCPTransportClosed；行超/解码失败 → ErrMCPProtocolError
+- `Close`：closeOnce 幂等；close stdin → 5s timeout 等 cmd.Wait → 超时 SIGKILL → close stderr/stdout
+  + stderrWG.Wait
+- 常量：stdioMessageMaxBytes=4*1024*1024 / stdioCloseGraceTimeout=5s
+
+### `internal/mcp/client.go` 改动（真实 bug 修复）
+Connect 顺序改为**先 transport.Start 再 startLoops** —— startLoops 启动 recvLoop 调 transport.Recv 需要 transport stdout 已就绪；
+反序会让 recvLoop 卡在 `select case <-c.recvReady:` (nil chan select permanent) → 整个 Initialize 路径死锁。
+
+新流程：
+1. 先 c.transport.Start(connCtx) — failure 时复位 status=Disconnected + cancel ctx 返错（不调 c.Close 避免误触 failOnce 失败路径）
+2. 后 c.startLoops(connCtx) - failure 时调 c.Close 走 teardown
+
+### `internal/mcp/stdio_test.go`（新，8 例 + 1 helper）
+- `fakeMCPStdioServer` Python inline 脚本：实现 initialize / notifications/initialized / ping /
+  tools/list / tools/call 的 JSON 响应；其他 method → -32601
+- `requirePython3` — skip 测试沙箱无 python3 时（沙箱有 python3，全 8 例绿）
+- `stdioClientEndToEnd` helper — 启动 fake MCP server + Client，Connect + Initialize + Cleanup
+- TestStdioClientEndToEndLifecycle：Connect→Initialize 拓.connected→Ping OK→DiscoverTools 2 tools (mcp.fake.alpha/beta)→Close.disconnected
+- TestStdioClientCallToolEndToEnd：name="remoteFoo" → content hello remoteFoo
+- TestStdioClientSendBodyTooLarge：4 MiB + 10 上限触发 ErrMCPProtocolError
+- TestStdioClientStartCommandNotFound：不存在 command → ErrMCPConnRefused
+- TestStdioClientCloseIdempotent：多次 Close 同 sentinel
+- TestStdioClientInfoConnected：Start 前 Connected=false / Start 后=true / Close 后=false
+- TestStdioClientRecvOnSubprocessExit：process.Kill → Recv 返 ErrMCPTransportClosed
+- TestStdioClientEnvInjection：用户 env 通过 transport 注入子进程，serverInfo.name="env:injected"
+
+### 验证
+- `go vet ./internal/mcp/`：通过
+- `go build ./cmd/yaasmoke`（临时诊断工具）端到端：Initialize→DiscoverTools→Ping→CallTool→Close 全绿
+  （诊断命令行已删；stdio.go 真实端到端通过 stdio_test.go 8 例验证）
+- `go test -count=1 -timeout 60s ./internal/mcp/`：manager 13 + transport 9 + client 15 + stdio 8 共 45 例全绿
+- `go test -count=1 -timeout 240s ./...`：18 包中 mcp/api/runtime 等全绿；TestWSStreamDisconnectCancelsTurn
+  本轮触发一次已知 timing flake（200ms time.Sleep），单跑/-count=3 全绿，非本 commit 引入
+- `go mod tidy`：无新依赖
+
+### 副债清单 / v1 已知限制
+- 没接 Manager.runUpstream：构造 StdioClient + 启动 + DiscoverTools → 注册 ToolManager 稳定 Proxy，后续 commit
+- StdioServer（Yaa! 作为 stdio MCP Server）未实现；checklist §3 待本地 Server commit
+- stdio client 子进程 stderr 用 bufio.NewReader（ 默认大小），不是 4 MiB 上限；超长 stderr 行可能截断 ok
+  docs 仅协议 body 限 4 MiB（stderr 不入协议流故截断可接受）
+- env inherit 白名单固定 5 项；用户实际 MCP server 需要更多 env 由配置 mcp.servers[*].env 显式注入
+- 子进程优雅关闭超时 5s 硬编码；配置后续 commit 可接 mcp.timeout.connect（schema 已存在）
+
+### 下一轮方向 → checklist §1 + §7 + §9 Manager.runUpstream + Tool Proxy
+1. **Manager.runUpstream 雏形**（checklist §1 §7 §9）：
+   - Manager 构造时启动 auto-start=true 的 stdio Client 串接 lifecycle
+   - DiscoverTools → 把每个 Tool 经过 normalizeTool → ToolManager 注册稳定 Proxy（`mcp.<server>.<remote>` 命名前缀）
+   - ServerStatus.ToolCount>0、Status=connected、ConnectedAtimestamp 注入
+   - Stable Proxy 一旦失败置 unavailable、atomic client handle 置 nil → 调用返 ErrMCPUnavailable
+2. **重连与 catalog reconciliation**（checklist §1 §7 + docs/mcp/client.md §5）：
+   - 失败时按 reconnect 配置指数退避重连，重新 Initialize + DiscoverTools
+   - Tool name/description/schema 精确一致才原子替换 client handle；差异保持 unavailable+ErrMCPProtocolError 要求重启
+3. **heartbeat**：Manager 定期 Ping；失败换 Client
+4. §5 SSE / §6 Streamable HTTP transport / §3 本地 MCPServer / §9 observability → Planner step 1-2
+
+### Ponytail 决策
+- 本 commit 同时修 Client.Connect 真实 bug 属于"修复文档先，然后审查已有代码冲突"框架 —— Connect 顺序 bug 是
+  代码偏离而非文档 bug；fakeTransport 测试因 Recv 始终可读未触发该 bug，stdio 真实 stdout 才暴露。
+- env 白名单而非全部继承：docs/mcp/integration.md §7 "stdio 子进程继承经过过滤的 env"；白名单 5 项足够
+  npx / node 找命令 (PATH) + 基本 locale，其他按需由 mcp.servers[*].env 显式注入避免隐式泄漏 Token / API key 等
+- PumpStderr bufio buffer 用 default 大小（不是 4 MiB）—— stderr 行通常 < 64K，YAGNI 4 MiB buffer
+- Python fake MCP server 用 `-c` inline 字符串避免临时文件管理；每个测试独立 python subprocess 不复用
+- 删 cmd/yaasmoke + /tmp 辅助脚本：诊断工具复用任务结束，按 ponytail "few files, no scaffolding" 原则不留
+- 选用 `exec.Command`（不是 `exec.CommandContext`）：避免 ctx cancel 触发立即 SIGKILL 绕过 stdin.close 等待路径；Close 自己控 5s 超时

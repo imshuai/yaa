@@ -127,14 +127,21 @@ func (c *Client) Connect(startupCtx context.Context) error {
 	c.cancel = cancel
 	c.mu.Unlock()
 
-	// 启动 dispatcher / control loop（构造时一次性加入 wg）。
-	if err := c.startLoops(connCtx); err != nil {
+	// 先 transport.Start 拿到底层连接，再启动 dispatcher / control loop：
+	// recvLoop 进入 transport.Recv 时需 transport stdout 已就绪（如 StdioClient）；
+	// 反序会让 recvLoop 卡在尚未初始化的资源上。Start 失败则复位 status，不触发 failOnce。
+	if err := c.transport.Start(connCtx); err != nil {
+		c.mu.Lock()
+		if c.cancel != nil {
+			c.cancel()
+		}
+		c.status = StatusDisconnected
+		c.mu.Unlock()
 		return err
 	}
 
-	// transport.Start：startupCtx 约束超时；连接 ctx 才是 transport 生命周期。
-	// 若 Start 失败 Close 并露出错误。
-	if err := c.transport.Start(connCtx); err != nil {
+	// 启动 dispatcher / control loop（构造时一次性加入 wg）。
+	if err := c.startLoops(connCtx); err != nil {
 		_ = c.Close()
 		return err
 	}
