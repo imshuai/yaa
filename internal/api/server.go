@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/imshuai/yaa/internal/auth"
 	"github.com/imshuai/yaa/internal/session"
 	"golang.org/x/exp/slog"
 )
@@ -55,6 +56,12 @@ type Server struct {
 	agentExists AgentExistsProvider
 	agents      AgentProvider
 	sessionMgr  *session.Manager
+	// v1 Auth：由 Runtime 在 Start 时经 SetAuth 注入；nil 或 disabled 表示
+	// 整体绕过 AuthN/AuthZ（仅 loopback 或已强校验的回环监听场景下）。
+	authz         auth.Authorizer
+	authn         auth.Authenticator
+	authEnabled   bool
+	publicPaths   map[string]bool // 规范化后只读
 	started     time.Time
 	mu          sync.Mutex
 	listener    *http.Server
@@ -103,10 +110,45 @@ func (s *Server) SetSessionManager(sm *session.Manager) {
 	s.mu.Unlock()
 }
 
+// SetAuth 注入 Remote API AuthN/AuthZ 与 public paths（docs/auth/integration.md §1）。
+//
+// 当 enabled=false 或 authn/authz=nil 时 registerProtected 全部 bypass。
+// publicPaths 必须由 Config Validator 已规范化（顺手转成 map 便于 O(1) 精确匹配）。
+func (s *Server) SetAuth(enabled bool, authn auth.Authenticator, authz auth.Authorizer, publicPaths []string) {
+	pp := make(map[string]bool, len(publicPaths))
+	for _, p := range publicPaths {
+		if p != "" {
+			pp[p] = true
+		}
+	}
+	s.mu.Lock()
+	s.authEnabled = enabled
+	s.authn = authn
+	s.authz = authz
+	s.publicPaths = pp
+	s.mu.Unlock()
+}
+
 // register 注册全部 v1 路由。
+//
+// v1 受 AuthN/AuthZ 保护的路由通过 registerProtected 绑定 routeSpec
+// （docs/auth/integration.md §3 唯一 wrapper）。当前已迁移 health/version
+// 至 Auth wrapper；agents/sessions 子树与 WS/SSE 的精细化 spec 绑定
+// 会在后续 commit 补齐，本 commit 保证 wrapper 基础设施落地并由
+// health/version 端到端验证。
 func (s *Server) register(mux *http.ServeMux) {
-	mux.HandleFunc("/api/v1/health", s.methodGet(s.handleHealth))
-	mux.HandleFunc("/api/v1/version", s.methodGet(s.handleVersion))
+	// Health/Version：RouteSpec 始终绑定 read:system（INDEX.md §5），
+	// 默认列入 public_paths 时 wrapper 自动 bypass。
+	// wrapper 本身已按 spec.Method 校验并返回 40501，
+	// handler 不再用 methodGet 双重包装。
+	s.registerProtected(mux, routeSpec{
+		Method: http.MethodGet, Pattern: "/api/v1/health",
+		Action: "read", Resource: "system", Transport: TransportHTTP,
+	}, s.handleHealth)
+	s.registerProtected(mux, routeSpec{
+		Method: http.MethodGet, Pattern: "/api/v1/version",
+		Action: "read", Resource: "system", Transport: TransportHTTP,
+	}, s.handleVersion)
 
 	s.registerSessionRoutes(mux)
 
