@@ -45,9 +45,14 @@ type wsClientFrame struct {
 // 握手必须使用 Authorization Header。
 // 连接断开取消该连接发起的全部非终态 turn。每个连接最多一个运行中 turn，其余由 Session FIFO 排队。
 func (s *Server) handleWSStream(w http.ResponseWriter, r *http.Request, sp SessionProvider, sessionID string) {
-	// 文档：握手必须使用 Authorization Header。v1 只校验存在。
-	if r.Header.Get("Authorization") == "" {
-		s.writeError(w, r, http.StatusUnauthorized, 40101, "authorization required")
+	// Auth wrapper 已在 registerProtected 完成 AuthN/AuthZ 并注入 Identity 到 request context
+	// （docs/auth/integration.md §5）。这里读回 Identity：
+	//   - 启用 Auth 且非 public：无 Identity 表示 wrapper 已拦截但防止 wrapper 漏绑 → 拒绝握手（40101）
+	//   - disabled 或 public：identity 为 nil 也允许 anonymous
+	identity, ok := s.authIdentityForWebSocket(r)
+	_ = identity
+	if !ok {
+		s.writeError(w, r, http.StatusUnauthorized, 40101, "unauthorized")
 		return
 	}
 

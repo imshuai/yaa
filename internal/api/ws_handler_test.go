@@ -106,8 +106,11 @@ func TestWSStreamTurnFlow(t *testing.T) {
 }
 
 func TestWSStreamCancelBeforeStart(t *testing.T) {
-	// 测试缺少 Authorization 被拒。
+	// 测试启用 Auth 且缺少 Bearer 被拒（docs/auth/integration.md §5：disabled 允许 anonymous，
+	// 启用 Auth 且非 public 必须无 Identity 拒绝）。先把 conversationTestEnv 的 server 启用 auth。
 	apiSrv, sm := conversationTestEnv(t)
+	authn, authz := staticAuth(t)
+	apiSrv.SetAuth(true, authn, authz, nil)
 	hsrv := httptest.NewServer(apiSrv.server.Handler)
 	t.Cleanup(hsrv.Close)
 	ctx := context.Background()
@@ -127,6 +130,31 @@ func TestWSStreamCancelBeforeStart(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", resp.StatusCode)
 	}
+}
+
+// TestWSStreamDisabledAuthAllowsAnonymous 验证 disabled auth 下 WS upgrade 允许 anonymous
+// （docs/auth/integration.md §1：auth disabled 时 wrapper 全部 bypass，握手应进入业务 handler）。
+func TestWSStreamDisabledAuthAllowsAnonymous(t *testing.T) {
+	apiSrv, sm := conversationTestEnv(t)
+	authn, authz := staticAuth(t)
+	apiSrv.SetAuth(false, authn, authz, nil)
+	hsrv := httptest.NewServer(apiSrv.server.Handler)
+	t.Cleanup(hsrv.Close)
+	ctx := context.Background()
+	s, _ := sm.Create(ctx, session.CreateRequest{AgentID: "agent-test"})
+
+	// 无 Authorization 头：disabled 时不应返 401，应进入业务 handler；
+	// 后续 handler 在 runtime 未 ready 时返 50301，但只要不是 401 即可。
+	hdr := http.Header{}
+	wsURL := strings.Replace(hsrv.URL, "http://", "ws://", 1)
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL+"/api/v1/sessions/"+s.ID+"/stream", hdr)
+	if resp != nil {
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusUnauthorized {
+			t.Fatalf("disabled auth should not return 401, got %d", resp.StatusCode)
+		}
+	}
+	_ = err
 }
 
 func TestWSStreamCancelRunningTurn(t *testing.T) {

@@ -4,129 +4,151 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"net/url"
 	"strconv"
-	"strings"
 
 	"github.com/imshuai/yaa/internal/config"
 	"github.com/imshuai/yaa/internal/session"
 	"github.com/imshuai/yaa/internal/storage"
 )
 
-// registerSessionRoutes 注册所有 session 相关路由。
-// Go 1.20 ServeMux 不支持路径参数，用最长前缀匹配 + 手动解析。
-func (s *Server) registerSessionRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/api/v1/agents/", s.handleAgentsSessions) // :id/sessions
-	mux.HandleFunc("/api/v1/sessions/", s.handleSessions)     // :id...sub-resource
-}
-
-// handleAgentsSessions 处理 /api/v1/agents/:id/sessions POST/GET 与
-// /api/v1/agents/:id/memory/... 子资源 8 端点（docs/remote-api/memory.md）。
-// Auth wrapping 的 registerProtected 精细化 spec 绑定留待后续 wrap-only 接入
-// （progress #6 决策记录：现有 sessions 同样未走 wrapper，与 memory 保持一致）。
-func (s *Server) handleAgentsSessions(w http.ResponseWriter, r *http.Request) {
-	// 路径: /api/v1/agents/:id/<sub>
-	rest := strings.TrimPrefix(r.URL.Path, "/api/v1/agents/")
-	parts := strings.SplitN(rest, "/", 2)
-	if len(parts) < 2 || parts[1] == "" {
-		s.writeError(w, r, http.StatusNotFound, 40401, "resource not found")
-		return
-	}
-	agentID, err := url.PathUnescape(parts[0])
-	if err != nil || agentID == "" {
-		s.writeError(w, r, http.StatusBadRequest, 40001, "invalid agent id")
-		return
-	}
-	sub := parts[1]
-
-	// /api/v1/agents/:id/memory[/:key | /promote | /reindex]
-	if sub == "memory" || strings.HasPrefix(sub, "memory/") {
-		s.handleMemorySubtree(w, r, agentID, sub)
-		return
-	}
-
-	if sub != "sessions" {
-		s.writeError(w, r, http.StatusNotFound, 40401, "resource not found")
-		return
-	}
-
-	// sessions 子资源：需要 SessionProvider
+// sessionProvider 取注入的 SessionProvider；nil 返 50301 表示 Runtime 未就绪。
+// 路由层保证请求落到具体 sub-handler 时已通过 RouteSpec 完成 Auth；这里只补
+// SessionProvider 可用性检查（Runtime 启动期或 reload 时可能短暂 nil）。
+func (s *Server) sessionProvider(w http.ResponseWriter, r *http.Request) (SessionProvider, bool) {
 	s.mu.Lock()
 	sp := s.sessions
+	s.mu.Unlock()
+	if sp == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, 50301, "runtime not ready")
+		return nil, false
+	}
+	return sp, true
+}
+
+func (s *Server) agentExistsProvider() AgentExistsProvider {
+	s.mu.Lock()
 	ae := s.agentExists
 	s.mu.Unlock()
-	if sp == nil {
-		s.writeError(w, r, http.StatusServiceUnavailable, 50301, "runtime not ready")
-		return
-	}
-
-	switch r.Method {
-	case http.MethodPost:
-		s.handleCreateSession(w, r, sp, ae, agentID)
-	case http.MethodGet:
-		s.handleListSessions(w, r, sp, agentID)
-	default:
-		s.writeError(w, r, http.StatusMethodNotAllowed, 40501, "method not allowed")
-	}
+	return ae
 }
 
-// handleSessions 处理 /api/v1/sessions/:id/... 子路由。
-func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	sp := s.sessions
-	s.mu.Unlock()
-	if sp == nil {
-		s.writeError(w, r, http.StatusServiceUnavailable, 50301, "runtime not ready")
+// handleCreateSessionRoute — POST /api/v1/agents/{id}/sessions（write:sessions）
+func (s *Server) handleCreateSessionRoute(w http.ResponseWriter, r *http.Request) {
+	sp, ok := s.sessionProvider(w, r)
+	if !ok {
 		return
 	}
+	agentID := pathVar(r, "id")
+	s.handleCreateSession(w, r, sp, s.agentExistsProvider(), agentID)
+}
 
-	// 路径: /api/v1/sessions/:id[/pause|/resume|/close|/clear|/messages|/messages/:msgid]
-	rest := strings.TrimPrefix(r.URL.Path, "/api/v1/sessions/")
-	if rest == "" {
-		s.writeError(w, r, http.StatusNotFound, 40401, "resource not found")
+// handleListSessionsRoute — GET /api/v1/agents/{id}/sessions（read:sessions）
+func (s *Server) handleListSessionsRoute(w http.ResponseWriter, r *http.Request) {
+	sp, ok := s.sessionProvider(w, r)
+	if !ok {
 		return
 	}
-	parts := strings.SplitN(rest, "/", 3)
-	sessionID, err := url.PathUnescape(parts[0])
-	if err != nil || sessionID == "" {
-		s.writeError(w, r, http.StatusBadRequest, 40001, "invalid session id")
-		return
-	}
-	sub := ""
-	if len(parts) > 1 {
-		sub = parts[1]
-	}
-	subID := ""
-	if len(parts) > 2 {
-		subID = parts[2]
-	}
+	agentID := pathVar(r, "id")
+	s.handleListSessions(w, r, sp, agentID)
+}
 
-	switch {
-	case sub == "" && r.Method == http.MethodGet:
-		s.handleGetSession(w, r, sp, sessionID)
-	case sub == "" && r.Method == http.MethodDelete:
-		s.handleDeleteSession(w, r, sp, sessionID)
-	case sub == "pause" && r.Method == http.MethodPost:
-		s.handlePauseSession(w, r, sp, sessionID)
-	case sub == "resume" && r.Method == http.MethodPost:
-		s.handleResumeSession(w, r, sp, sessionID)
-	case sub == "close" && r.Method == http.MethodPost:
-		s.handleCloseSession(w, r, sp, sessionID)
-	case sub == "clear" && r.Method == http.MethodPost:
-		s.handleClearMessages(w, r, sp, sessionID)
-	case sub == "messages" && r.Method == http.MethodPost:
-		s.handlePostMessage(w, r, sp, sessionID)
-	case sub == "messages" && r.Method == http.MethodGet:
-		s.handleListMessages(w, r, sp, sessionID)
-	case sub == "messages" && r.Method == http.MethodDelete:
-		s.handleDeleteMessage(w, r, sp, sessionID, subID)
-	case sub == "events" && r.Method == http.MethodGet:
-		s.handleSSEEvents(w, r, sp, sessionID)
-	case sub == "stream" && r.Method == http.MethodGet:
-		s.handleWSStream(w, r, sp, sessionID)
-	default:
-		s.writeError(w, r, http.StatusMethodNotAllowed, 40501, "method not allowed")
+// handleGetSessionRoute — GET /api/v1/sessions/{id}（read:sessions）
+func (s *Server) handleGetSessionRoute(w http.ResponseWriter, r *http.Request) {
+	sp, ok := s.sessionProvider(w, r)
+	if !ok {
+		return
 	}
+	s.handleGetSession(w, r, sp, pathVar(r, "id"))
+}
+
+// handlePauseSessionRoute — POST /api/v1/sessions/{id}/pause（write:sessions）
+func (s *Server) handlePauseSessionRoute(w http.ResponseWriter, r *http.Request) {
+	sp, ok := s.sessionProvider(w, r)
+	if !ok {
+		return
+	}
+	s.handlePauseSession(w, r, sp, pathVar(r, "id"))
+}
+
+// handleResumeSessionRoute — POST /api/v1/sessions/{id}/resume（write:sessions）
+func (s *Server) handleResumeSessionRoute(w http.ResponseWriter, r *http.Request) {
+	sp, ok := s.sessionProvider(w, r)
+	if !ok {
+		return
+	}
+	s.handleResumeSession(w, r, sp, pathVar(r, "id"))
+}
+
+// handleCloseSessionRoute — POST /api/v1/sessions/{id}/close（write:sessions）
+func (s *Server) handleCloseSessionRoute(w http.ResponseWriter, r *http.Request) {
+	sp, ok := s.sessionProvider(w, r)
+	if !ok {
+		return
+	}
+	s.handleCloseSession(w, r, sp, pathVar(r, "id"))
+}
+
+// handleDeleteSessionRoute — DELETE /api/v1/sessions/{id}（delete:sessions）
+func (s *Server) handleDeleteSessionRoute(w http.ResponseWriter, r *http.Request) {
+	sp, ok := s.sessionProvider(w, r)
+	if !ok {
+		return
+	}
+	s.handleDeleteSession(w, r, sp, pathVar(r, "id"))
+}
+
+// handleClearMessagesRoute — POST /api/v1/sessions/{id}/clear（write:sessions）
+func (s *Server) handleClearMessagesRoute(w http.ResponseWriter, r *http.Request) {
+	sp, ok := s.sessionProvider(w, r)
+	if !ok {
+		return
+	}
+	s.handleClearMessages(w, r, sp, pathVar(r, "id"))
+}
+
+// handleListMessagesRoute — GET /api/v1/sessions/{id}/messages（read:sessions）
+func (s *Server) handleListMessagesRoute(w http.ResponseWriter, r *http.Request) {
+	sp, ok := s.sessionProvider(w, r)
+	if !ok {
+		return
+	}
+	s.handleListMessages(w, r, sp, pathVar(r, "id"))
+}
+
+// handleDeleteMessageRoute — DELETE /api/v1/sessions/{id}/messages/{msgid}（delete:sessions）
+func (s *Server) handleDeleteMessageRoute(w http.ResponseWriter, r *http.Request) {
+	sp, ok := s.sessionProvider(w, r)
+	if !ok {
+		return
+	}
+	s.handleDeleteMessage(w, r, sp, pathVar(r, "id"), pathVar(r, "msgid"))
+}
+
+// handlePostMessageRoute — POST /api/v1/sessions/{id}/messages（write:sessions）
+func (s *Server) handlePostMessageRoute(w http.ResponseWriter, r *http.Request) {
+	sp, ok := s.sessionProvider(w, r)
+	if !ok {
+		return
+	}
+	s.handlePostMessage(w, r, sp, pathVar(r, "id"))
+}
+
+// handleSSEEventsRoute — GET /api/v1/sessions/{id}/events（read:sessions）
+func (s *Server) handleSSEEventsRoute(w http.ResponseWriter, r *http.Request) {
+	sp, ok := s.sessionProvider(w, r)
+	if !ok {
+		return
+	}
+	s.handleSSEEvents(w, r, sp, pathVar(r, "id"))
+}
+
+// handleWSStreamRoute — GET /api/v1/sessions/{id}/stream（write:sessions, WebSocket）
+func (s *Server) handleWSStreamRoute(w http.ResponseWriter, r *http.Request) {
+	sp, ok := s.sessionProvider(w, r)
+	if !ok {
+		return
+	}
+	s.handleWSStream(w, r, sp, pathVar(r, "id"))
 }
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, sp SessionProvider, ae AgentExistsProvider, agentID string) {

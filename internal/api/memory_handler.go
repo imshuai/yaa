@@ -6,9 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/imshuai/yaa/internal/config"
@@ -87,77 +85,104 @@ type memoryReindexData struct {
 	Indexed  int              `json:"indexed"`
 }
 
-// handleMemorySubtree 处理 /api/v1/agents/:id/memory[/:key | /promote | /reindex]
-// 共 8 个端点（5 个 method+path 组合）。
-//
-//   GET    /api/v1/agents/:id/memory                      -> Search
-//   GET    /api/v1/agents/:id/memory/:key                 -> Get single
-//   POST   /api/v1/agents/:id/memory                      -> Put upsert
-//   DELETE /api/v1/agents/:id/memory/:key                 -> Delete one
-//   DELETE /api/v1/agents/:id/memory                      -> Clear scope
-//   POST   /api/v1/agents/:id/memory/promote              -> Promote
-//   POST   /api/v1/agents/:id/memory/reindex              -> Reindex
-func (s *Server) handleMemorySubtree(w http.ResponseWriter, r *http.Request, agentID, sub string) {
+// resolveMemoryProvider 从注入的 provider + resolver 解析 agent 的 effective policy。
+// Route adapter 内复用：handler 不再走 sub-tree dispatcher，由 RouteSpec 直接命中。
+// 返 (mp, policy, agentID, ok)；ok=false 时已经写错误响应。
+func (s *Server) resolveMemoryProvider(w http.ResponseWriter, r *http.Request, agentID string) (MemoryProvider, config.MemoryPolicy, bool) {
 	s.mu.Lock()
 	mp := s.memoryProvider
 	resolver := s.memoryResolver
 	s.mu.Unlock()
 	if mp == nil || resolver == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, 50301, "memory subsystem unavailable")
-		return
+		return nil, config.MemoryPolicy{}, false
 	}
 	policy, ok := resolver(agentID)
 	if !ok {
 		s.writeError(w, r, http.StatusNotFound, 40401, "agent not found")
+		return nil, config.MemoryPolicy{}, false
+	}
+	return mp, policy, true
+}
+
+// handleMemorySearchRoute — GET /api/v1/agents/{id}/memory（read:memory）
+func (s *Server) handleMemorySearchRoute(w http.ResponseWriter, r *http.Request) {
+	agentID := pathVar(r, "id")
+	mp, policy, ok := s.resolveMemoryProvider(w, r, agentID)
+	if !ok {
 		return
 	}
+	s.handleMemorySearch(w, r, mp, agentID, policy)
+}
 
-	// 拆 path：sub 已是 "memory" 形式；如果带 sub-res 则 sub="memory/x"
-	suffix := strings.TrimPrefix(sub, "memory")
-	suffix = strings.TrimPrefix(suffix, "/") // "memory" -> "" ; "memory/k1" -> "k1" ; "memory/promote" -> "promote"
-
-	switch r.Method {
-	case http.MethodGet:
-		if suffix == "" {
-			s.handleMemorySearch(w, r, mp, agentID, policy)
-		} else if suffix == "promote" || suffix == "reindex" {
-			// GET 不允许对 promote/reindex 子资源；返回 40501 而不是 40401
-			s.writeError(w, r, http.StatusMethodNotAllowed, 40501, "method not allowed")
-		} else {
-			key, kerr := url.PathUnescape(suffix)
-			if kerr != nil || key == "" {
-				s.writeError(w, r, http.StatusBadRequest, 40001, "invalid key path segment")
-				return
-			}
-			s.handleMemoryGet(w, r, mp, agentID, key, policy)
-		}
-	case http.MethodPost:
-		switch suffix {
-		case "":
-			s.handleMemoryPut(w, r, mp, agentID, policy)
-		case "promote":
-			s.handleMemoryPromote(w, r, mp, agentID, policy)
-		case "reindex":
-			s.handleMemoryReindex(w, r, mp, agentID, policy)
-		default:
-			s.writeError(w, r, http.StatusMethodNotAllowed, 40501, "method not allowed")
-		}
-	case http.MethodDelete:
-		if suffix == "" {
-			s.handleMemoryClear(w, r, mp, agentID, policy)
-		} else if suffix == "promote" || suffix == "reindex" {
-			s.writeError(w, r, http.StatusMethodNotAllowed, 40501, "method not allowed")
-		} else {
-			key, kerr := url.PathUnescape(suffix)
-			if kerr != nil || key == "" {
-				s.writeError(w, r, http.StatusBadRequest, 40001, "invalid key path segment")
-				return
-			}
-			s.handleMemoryDeleteOne(w, r, mp, agentID, key, policy)
-		}
-	default:
-		s.writeError(w, r, http.StatusMethodNotAllowed, 40501, "method not allowed")
+// handleMemoryGetRoute — GET /api/v1/agents/{id}/memory/{key}（read:memory）
+func (s *Server) handleMemoryGetRoute(w http.ResponseWriter, r *http.Request) {
+	agentID := pathVar(r, "id")
+	key := pathVar(r, "key")
+	if key == "" {
+		s.writeError(w, r, http.StatusBadRequest, 40001, "invalid key path segment")
+		return
 	}
+	mp, policy, ok := s.resolveMemoryProvider(w, r, agentID)
+	if !ok {
+		return
+	}
+	s.handleMemoryGet(w, r, mp, agentID, key, policy)
+}
+
+// handleMemoryPutRoute — POST /api/v1/agents/{id}/memory（write:memory）
+func (s *Server) handleMemoryPutRoute(w http.ResponseWriter, r *http.Request) {
+	agentID := pathVar(r, "id")
+	mp, policy, ok := s.resolveMemoryProvider(w, r, agentID)
+	if !ok {
+		return
+	}
+	s.handleMemoryPut(w, r, mp, agentID, policy)
+}
+
+// handleMemoryDeleteOneRoute — DELETE /api/v1/agents/{id}/memory/{key}（delete:memory）
+func (s *Server) handleMemoryDeleteOneRoute(w http.ResponseWriter, r *http.Request) {
+	agentID := pathVar(r, "id")
+	key := pathVar(r, "key")
+	if key == "" {
+		s.writeError(w, r, http.StatusBadRequest, 40001, "invalid key path segment")
+		return
+	}
+	mp, policy, ok := s.resolveMemoryProvider(w, r, agentID)
+	if !ok {
+		return
+	}
+	s.handleMemoryDeleteOne(w, r, mp, agentID, key, policy)
+}
+
+// handleMemoryClearRoute — DELETE /api/v1/agents/{id}/memory（delete:memory）
+func (s *Server) handleMemoryClearRoute(w http.ResponseWriter, r *http.Request) {
+	agentID := pathVar(r, "id")
+	mp, policy, ok := s.resolveMemoryProvider(w, r, agentID)
+	if !ok {
+		return
+	}
+	s.handleMemoryClear(w, r, mp, agentID, policy)
+}
+
+// handleMemoryPromoteRoute — POST /api/v1/agents/{id}/memory/promote（write:memory）
+func (s *Server) handleMemoryPromoteRoute(w http.ResponseWriter, r *http.Request) {
+	agentID := pathVar(r, "id")
+	mp, policy, ok := s.resolveMemoryProvider(w, r, agentID)
+	if !ok {
+		return
+	}
+	s.handleMemoryPromote(w, r, mp, agentID, policy)
+}
+
+// handleMemoryReindexRoute — POST /api/v1/agents/{id}/memory/reindex（write:memory）
+func (s *Server) handleMemoryReindexRoute(w http.ResponseWriter, r *http.Request) {
+	agentID := pathVar(r, "id")
+	mp, policy, ok := s.resolveMemoryProvider(w, r, agentID)
+	if !ok {
+		return
+	}
+	s.handleMemoryReindex(w, r, mp, agentID, policy)
 }
 
 // ============ handlers ============

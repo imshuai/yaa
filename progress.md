@@ -671,3 +671,81 @@ Agent turn 内按 docs/agent.md §4 + docs/tool/provider.md §3-§5 完整走 To
 - go test -count=1 ./internal/api/：含新 ~25 例全绿，原 sessions/conversation/ws/auth 测试无 regression。
 - go test -count=1 ./internal/runtime/：含新 1 例全绿。
 - go test -count=1 ./...：除 `TestWSStreamDisconnectCancelsTurn` 偶发 timing flake（已记录）外全绿。
+
+## Phase 3 下一步 #5：gorilla/mux 路由层重构 + AD-004 37 路由精细 RouteSpec 绑定（commit 待 push）
+
+按 `docs/auth/integration.md §2-§5` + `docs/auth/decisions.md AD-004` + `docs/remote-api/INDEX.md §3/§5`
+让 RouteSpec 与唯一 wrapper 真正生效，消化 progress #6 的 wrap binding 技术债。
+
+### 文档/代码冲突修复
+- 文档（`integration.md §3` 代码示例 + `INDEX.md §5` "不得从 URL 段猜权限" + AD-004 "37 路由必须 metadata 测试" + checklist "每条路由显式绑定 RouteSpec"）一致要求用 gorilla/mux 路径模板 + 唯一 wrapper 逐条 RouteSpec 绑定；现行代码用裸 `http.ServeMux` + 前缀 dispatcher 偏离契约。
+- 引入 `github.com/gorilla/mux v1.8.1`（Go 1.20 兼容最新版），把 router 从 `*http.ServeMux` 切到 `*mux.Router`；保留 gorilla/websocket 不受影响。
+
+### `internal/api/server.go` 改动
+- Server 增 `router *mux.Router` + `registeredRoutes []routeSpec` 字段（mu 保护）。
+- `NewServer` 改用 `mux.NewRouter()` 装中间件链。
+- `register(r *mux.Router)` 调 `registerRoutes`：注册完 37 路由后设
+  - `r.MethodNotAllowedHandler = s.methodNotAllowed`：让 gorilla/mux `r.Methods()` 在 method 不匹配时返 envelope 40501 而非默认 text/plain。
+  - `r.NotFoundHandler = s.notFound`。
+- `RegisteredRoutes()` getter 返 spec slice 副本供注册测试与 AuthZ 元数据审计（AD-004）。
+
+### `internal/api/route_auth.go` 改动
+- `routeSpec` 注释：Pattern 改为 gorilla/mux `{id}/{key}/{msgid}/{name}` 路径模板。
+- `registerProtected(r *mux.Router, spec, h)`：
+  - 调用前 push spec 到 `s.registeredRoutes`（注册测试 source）。
+  - method 校验仍保留在 wrapper 内（`spec.Method != req.Method → envelope 40501`）作为 sanity，即使 disabled 也 40501（保留 `TestServerMethodCheckStill40501WithAuth` 契约）。
+  - 注册改用 `r.HandleFunc(spec.Pattern, protected).Methods(spec.Method)` 让同 Pattern 不同 Method 的路由被 method-aware 选中；与 wrapper 内 method 校验互不矛盾（method match 命中后走 wrapper，sanity 永远过；method mismatch 走 MethodNotAllowedHandler→envelope 40501）。
+
+### `internal/api/routes.go`（新文件）
+- `registerRoutes(r)` 集中按 `docs/remote-api/INDEX.md §3` 注册全部 37 条 RouteSpec：
+  - 3.1 系统（3）：health/version/config
+  - 3.2 Agent（5）：`/agents` list、`/agents/{id}` get、`/{id}/start|pause|stop`
+  - 3.3 Session（10）：`/agents/{id}/sessions` POST/GET、`/sessions/{id}` 8 条子资源
+  - 3.4 对话（3）：`/sessions/{id}/messages` POST、`/events` SSE、`/stream` WS（Transport=TransportWebSocket）
+  - 3.5 Tool/Skill/Provider（7）
+  - 3.6 Memory（7）
+  - 3.7 MCP（2）
+- 已实现端点指向 `*Route` adapter；尚未实现的 15 条（config/agent status/tool/skill/provider/mcp）绑 `s.notImplemented` 占位：返 501/50101 表示端点契约存在但 handler 未交付，RouteSpec metadata 在位，后续 commit 替换 handler 时 spec 不动。
+- `pathVar(r, name)` helper：取 `mux.Vars(r)[name]`；adapter 用它把 path 参数传给 inner handler。
+
+### `internal/api/session_handler.go` 重构
+- 删除 `registerSessionRoutes` + `handleAgentsSessions` + `handleSessions` 两个 dispatcher。
+- 新增 12 个 `*Route` adapter（CreateSessionRoute / ListSessionsRoute / GetSessionRoute / PauseSessionRoute / ResumeSessionRoute / CloseSessionRoute / DeleteSessionRoute / ClearMessagesRoute / ListMessagesRoute / DeleteMessageRoute / PostMessageRoute / SSEEventsRoute / WSStreamRoute）：每个用 `sessionProvider(w, r)` 取 SessionProvider（nil → 50301）+ `pathVar(r, "id" / "msgid")` 后调原 inner handler（签名不变）。
+- 去掉 `net/url` / `strings` import（不再做 prefix split），保留 `encoding/json`/`errors`/`net/http`/`strconv` + `config`/`session`/`storage`。
+
+### `internal/api/memory_handler.go` 重构
+- 删除 `handleMemorySubtree` prefix dispatcher。
+- 新增 `resolveMemoryProvider(w, r, agentID)` helper：取 provider + resolver + cache policy；nil → 50301；agent unknown → 40401。
+- 新增 7 个 `*Route` adapter（SearchRoute / GetRoute / PutRoute / DeleteOneRoute / ClearRoute / PromoteRoute / ReindexRoute）：每个 `pathVar(r, "id")` + Get/DeleteOne 顺带 `pathVar(r, "key")` 校验 + `resolveMemoryProvider` → 调原 inner handler（签名不变）。
+- 去掉 `net/url` / `strings` import（suffix 解析不再需要），保留 `context`/`encoding/json`/`errors`/`io`/`net/http`/`strconv`/`time` + `config`/`memory`。
+
+### `internal/api/ws_handler.go` 改动
+- 删除 `r.Header.Get("Authorization") == ""` 简陋 v1 占位校验。
+- 改用 `s.authIdentityForWebSocket(r)`（已实现于 `route_auth.go`）返 `(identity, ok)`：
+  - disabled / public path → ok=true，允许 anonymous 握手（docs §1/§5）。
+  - 启用 Auth 且非 public：无 Identity（wrapper 未绑定）→ ok=false → 写 envelope 40101。
+- identity 留作后续 AuditLogger 用，本步持 `_ = identity` 占位不打破编译。
+
+### `internal/api/routes_test.go`（新文件，5 例）
+- `expectedRoutes` 与 `docs/remote-api/INDEX.md §3` 总表逐项一一对应（37 条），便于人肉 audit。
+- `TestRouteRegistrationMatchIndexTable`：sortSpecs 后对照 INDEX 全条目 method/pattern/action/resource/transport。
+- `TestRouteRegistrationCountIs37`：精确 37（AD-004）。
+- `TestRouteRegistrationWebSocketStreamBound`：WS stream 必绑 `Method=GET` + `Transport=TransportWebSocket`。
+- `TestRouteRegistrationNoDuplicatePatternMethod`：防误增重复注册。
+- `TestRouteRegistrationMatchedAgainstRouter`：用 `router.Match` 直接验证 37 条 spec 都能在 `*mux.Router` 命中（不只 s.registeredRoutes 字段，验收 router 真注册生效）。
+
+### `internal/api/ws_handler_test.go` 改动
+- `TestWSStreamCancelBeforeStart` 改成"启用 Auth + 缺 Bearer → 401"（文档 §1/§5：disabled 允许 anonymous，启用 Auth 且非 public 才拒绝）—— 修复原测试与文档契约冲突。
+- 新增 `TestWSStreamDisabledAuthAllowsAnonymous`：disabled auth 下 WS 不返 401，验证 §1 bypass 与 §5 anonymous 通路。
+
+### 决策记录
+- **选取 (A) 引入 gorilla/mux 而非 (B) 改文档承认裸 ServeMux**：文档契约（integration.md §3 示例代码 + AD-004 + INDEX §5 + checklist）一致承诺 gorilla/mux + 37 路由精细绑定；偏离文档属于代码偏离而非文档错。AuthN/AuthZ 是 trust boundary， ponytail YAGNI 不适用。
+- **`.Methods(spec.Method)` + wrapper 内 sanity 校验并存**：gorilla/mux `.Methods()` 让同 Pattern 多 Method 路由能被 method-aware 选中正确 wrapper；wrapper 内 `spec.Method` 校验保留以让 40501 也走 envelope 同时保证 disabled 路径仍 40501（已测 `TestServerMethodCheckStill40501WithAuth`）。
+- **占位 stub 仍绑 RouteSpec**：未实现的 15 条端点（agent config/tool/skill/provider/mcp）绑 `s.notImplemented` 占位但仍挂载正确 RouteSpec metadata，让 37 路由注册测试可逐项断言；后续 commit 替换 handler 时 spec 不动，避免"为通过测试而补注册"的返工。
+- **WS Identity 从 `authIdentityForWebSocket` 取**：与 registerProtected 注入的 IdentityFromContext 配合，删除 v1 简陋 Authorization Header 存在性检查；保留 principalID 字段占位为后续 AuditLogger 留钩。
+
+### 验证
+- go vet / go build ./...：通过。
+- go test -count=1 ./internal/api/：含新 5 路由注册 + WS disabled auth + 原 sessions/conversation/auth/memory/ws 测试，全绿。
+- go test -count=1 ./...：除 `TestWSStreamDisconnectCancelsTurn` 偶发 timing flake（已记录，单跑通过）外全绿。
+- go mod tidy 后 gorilla/mux 从 indirect 转正。

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/gorilla/mux"
 
 	"github.com/imshuai/yaa/internal/auth"
 	"github.com/imshuai/yaa/internal/config"
@@ -241,7 +242,7 @@ func TestServerIdentityInjectedIntoContext(t *testing.T) {
 	s.SetAuth(true, authn, authz, nil)
 	// 注册一条临时路由验证 IdentityFromContext
 	var seenID string = ""
-	testMux := http.NewServeMux()
+	testMux := mux.NewRouter()
 	s.registerProtected(testMux, routeSpec{
 		Method: http.MethodGet, Pattern: "/api/v1/inspect-identity",
 		Action: "read", Resource: "system", Transport: TransportHTTP,

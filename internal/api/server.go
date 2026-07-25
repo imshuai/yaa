@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/mux"
 	"github.com/imshuai/yaa/internal/auth"
 	"github.com/imshuai/yaa/internal/session"
 	"golang.org/x/exp/slog"
@@ -51,6 +52,8 @@ type Server struct {
 	addr        string
 	logger      *slog.Logger
 	server      *http.Server
+	router      *mux.Router
+	registeredRoutes []routeSpec
 	health      HealthProvider
 	sessions    SessionProvider
 	agentExists   AgentExistsProvider
@@ -80,11 +83,12 @@ func NewServer(addr string, health HealthProvider, logger *slog.Logger) *Server 
 		health:  health,
 		started: time.Now(),
 	}
-	mux := http.NewServeMux()
-	s.register(mux)
+	r := mux.NewRouter()
+	s.router = r
+	s.register(r)
 	s.server = &http.Server{
 		Addr:    addr,
-		Handler: requestIDMiddleware(recoverMiddleware(mux)),
+		Handler: requestIDMiddleware(recoverMiddleware(r)),
 	}
 	return s
 }
@@ -141,30 +145,33 @@ func (s *Server) SetAuth(enabled bool, authn auth.Authenticator, authz auth.Auth
 	s.mu.Unlock()
 }
 
-// register 注册全部 v1 路由。
-//
-// v1 受 AuthN/AuthZ 保护的路由通过 registerProtected 绑定 routeSpec
-// （docs/auth/integration.md §3 唯一 wrapper）。当前已迁移 health/version
-// 至 Auth wrapper；agents/sessions 子树与 WS/SSE 的精细化 spec 绑定
-// 会在后续 commit 补齐，本 commit 保证 wrapper 基础设施落地并由
-// health/version 端到端验证。
-func (s *Server) register(mux *http.ServeMux) {
-	// Health/Version：RouteSpec 始终绑定 read:system（INDEX.md §5），
-	// 默认列入 public_paths 时 wrapper 自动 bypass。
-	// wrapper 本身已按 spec.Method 校验并返回 40501，
-	// handler 不再用 methodGet 双重包装。
-	s.registerProtected(mux, routeSpec{
-		Method: http.MethodGet, Pattern: "/api/v1/health",
-		Action: "read", Resource: "system", Transport: TransportHTTP,
-	}, s.handleHealth)
-	s.registerProtected(mux, routeSpec{
-		Method: http.MethodGet, Pattern: "/api/v1/version",
-		Action: "read", Resource: "system", Transport: TransportHTTP,
-	}, s.handleVersion)
+// register 注册全部 v1 路由到 router（37 条 RouteSpec，docs/remote-api/INDEX.md §3）。
+// 每条受保护路由统一用 registerProtected 绑定 RouteSpec（docs/auth/integration.md §3
+// 唯一 wrapper），不再有第二套 dispatcher 入口。
+func (s *Server) register(r *mux.Router) {
+	s.registerRoutes(r)
+	// gorilla/mux 默认 405 是 text/plain；用 MethodNotAllowedHandler 包成 envelope 40501
+	// （docs/auth/integration.md §3：唯一 route wrapper 的错误回 envelope）。
+	r.MethodNotAllowedHandler = http.HandlerFunc(s.methodNotAllowed)
+	// 未匹配兜底：gorilla/mux NotFoundHandler 返回的响应包成 envelope。
+	r.NotFoundHandler = http.HandlerFunc(s.notFound)
+}
 
-	s.registerSessionRoutes(mux)
+// RegisteredRoutes 返回 register 时收集的全部 RouteSpec metadata。
+// 供路由注册测试与 AuthZ 依赖枚举使用（AD-004：37 路由 metadata 必须可审计）。
+func (s *Server) RegisteredRoutes() []routeSpec {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]routeSpec, len(s.registeredRoutes))
+	copy(out, s.registeredRoutes)
+	return out
+}
 
-	mux.HandleFunc("/", s.notFound)
+// methodNotAllowed 是 gorilla/mux 在 path 命中但 method 无匹配时调用的兜底
+// （同 Pattern 多 Method 已经在 registerRoutes 里 .Methods() 精细注册）。
+// 与 registerProtected 内 method 校验返回完全一致：envelope 40501。
+func (s *Server) methodNotAllowed(w http.ResponseWriter, r *http.Request) {
+	s.writeError(w, r, http.StatusMethodNotAllowed, 40501, "method not allowed")
 }
 
 // Start 同步启动 HTTP 监听并在后台阻塞 serve。

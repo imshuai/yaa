@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/gorilla/mux"
+
 	"github.com/imshuai/yaa/internal/auth"
 )
 
@@ -19,8 +21,9 @@ const (
 // routeSpec 描述远程 API 一条路由的 AuthN/AuthZ 元数据
 // （docs/auth/integration.md §2 RouteSpec 的 v1 实现）。
 //
-// PatternPrefix 使用 http.ServeMux 的前缀字符串（v1 没换到 gorilla/mux）；
-// 注册前已模仿 mux 的 {id} 规范：实际注册时仍用 ServeMux 的最长前缀匹配。
+// Pattern 使用 gorilla/mux 路径模板（{id} / {key} / {name}）。
+// method 校验由 wrapper 内 spec.Method 完成（返 envelope 40501），
+// 不用 r.Methods() —— 让 405 也走 envelope，且保证 disabled 也 405。
 type routeSpec struct {
 	Method    string
 	Pattern   string
@@ -59,7 +62,10 @@ func credentialCode(err error) int {
 //
 // AuthZ 失败或 identity==nil 的安全错误映射为 403 Forbidden / 40301，
 // 详细分类只写脱敏日志（v1 暂不接入 AuditLogger，见 docs/auth/authorization.md §7）。
-func (s *Server) registerProtected(mux *http.ServeMux, spec routeSpec, h http.HandlerFunc) {
+func (s *Server) registerProtected(r *mux.Router, spec routeSpec, h http.HandlerFunc) {
+	s.mu.Lock()
+	s.registeredRoutes = append(s.registeredRoutes, spec)
+	s.mu.Unlock()
 	protected := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		s.mu.Lock()
 		enabled := s.authEnabled
@@ -69,6 +75,7 @@ func (s *Server) registerProtected(mux *http.ServeMux, spec routeSpec, h http.Ha
 		s.mu.Unlock()
 
 		// 方法校验在 Auth 判断之前完成：disabled 路径也要返 405 而非 200。
+		// 不用 r.Methods() 以保证 405 也走 envelope 且 disabled 也 405。
 		if spec.Method != "" && req.Method != spec.Method {
 			s.writeError(w, req, http.StatusMethodNotAllowed, 40501, "method not allowed")
 			return
@@ -104,10 +111,14 @@ func (s *Server) registerProtected(mux *http.ServeMux, spec routeSpec, h http.Ha
 		h.ServeHTTP(w, req.WithContext(ctx))
 	})
 
-	mux.HandleFunc(spec.Pattern, protected)
+	// 同时按 spec.Method 注册到 gorilla/mux：让同 Pattern 不同 Method 的多条路由
+	// 能被 method-aware 选中正确 handler；wrapper 内仍保留 spec.Method 校验作为
+	// 安全 sanity（router 外不可达的旁路仍能返 envelope 40501）。
+	r.HandleFunc(spec.Pattern, protected).Methods(spec.Method)
 }
 
-// authIdentityForWebSocket 校验 WS upgrade 是否通过 AuthN/AuthZ
+// 属于 server.go 的 MethodNotAllowedHandler，但放这里便于与 registerProtected 配对。
+// 已在 server.register 设置 router 的 MethodNotAllowedHandler；这里仅保留不被 Method() 默认走。 校验 WS upgrade 是否通过 AuthN/AuthZ
 // （docs/auth/integration.md §5）。
 //
 // 当 auth disabled / public / 非受保护 path 时返回 nil, true（允许 anonymous）。
