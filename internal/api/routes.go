@@ -24,15 +24,15 @@ func (s *Server) registerRoutes(r *mux.Router) {
 
 	// ---- 3.2 Agent (5) ----
 	s.registerProtected(r, routeSpec{Method: http.MethodGet, Pattern: "/api/v1/agents",
-		Action: "read", Resource: "agents", Transport: TransportHTTP}, s.notImplemented)
+		Action: "read", Resource: "agents", Transport: TransportHTTP}, s.handleListAgents)
 	s.registerProtected(r, routeSpec{Method: http.MethodGet, Pattern: "/api/v1/agents/{id}",
-		Action: "read", Resource: "agents", Transport: TransportHTTP}, s.notImplemented)
+		Action: "read", Resource: "agents", Transport: TransportHTTP}, s.handleGetAgent)
 	s.registerProtected(r, routeSpec{Method: http.MethodPost, Pattern: "/api/v1/agents/{id}/start",
-		Action: "write", Resource: "agents", Transport: TransportHTTP}, s.notImplemented)
+		Action: "write", Resource: "agents", Transport: TransportHTTP}, s.handleStartAgent)
 	s.registerProtected(r, routeSpec{Method: http.MethodPost, Pattern: "/api/v1/agents/{id}/pause",
-		Action: "write", Resource: "agents", Transport: TransportHTTP}, s.notImplemented)
+		Action: "write", Resource: "agents", Transport: TransportHTTP}, s.handlePauseAgent)
 	s.registerProtected(r, routeSpec{Method: http.MethodPost, Pattern: "/api/v1/agents/{id}/stop",
-		Action: "write", Resource: "agents", Transport: TransportHTTP}, s.notImplemented)
+		Action: "write", Resource: "agents", Transport: TransportHTTP}, s.handleStopAgent)
 
 	// ---- 3.3 Session (10) ----
 	s.registerProtected(r, routeSpec{Method: http.MethodPost, Pattern: "/api/v1/agents/{id}/sessions",
@@ -66,19 +66,19 @@ func (s *Server) registerRoutes(r *mux.Router) {
 
 	// ---- 3.5 Tool / Skill / Provider (7) ----
 	s.registerProtected(r, routeSpec{Method: http.MethodGet, Pattern: "/api/v1/tools",
-		Action: "read", Resource: "tools", Transport: TransportHTTP}, s.notImplemented)
+		Action: "read", Resource: "tools", Transport: TransportHTTP}, s.handleListTools)
 	s.registerProtected(r, routeSpec{Method: http.MethodGet, Pattern: "/api/v1/tools/{name}",
-		Action: "read", Resource: "tools", Transport: TransportHTTP}, s.notImplemented)
+		Action: "read", Resource: "tools", Transport: TransportHTTP}, s.handleGetTool)
 	s.registerProtected(r, routeSpec{Method: http.MethodGet, Pattern: "/api/v1/skills",
-		Action: "read", Resource: "skills", Transport: TransportHTTP}, s.notImplemented)
+		Action: "read", Resource: "skills", Transport: TransportHTTP}, s.handleListSkills)
 	s.registerProtected(r, routeSpec{Method: http.MethodGet, Pattern: "/api/v1/skills/{name}",
-		Action: "read", Resource: "skills", Transport: TransportHTTP}, s.notImplemented)
+		Action: "read", Resource: "skills", Transport: TransportHTTP}, s.handleGetSkill)
 	s.registerProtected(r, routeSpec{Method: http.MethodGet, Pattern: "/api/v1/providers",
-		Action: "read", Resource: "providers", Transport: TransportHTTP}, s.notImplemented)
+		Action: "read", Resource: "providers", Transport: TransportHTTP}, s.handleListProviders)
 	s.registerProtected(r, routeSpec{Method: http.MethodGet, Pattern: "/api/v1/providers/{id}",
-		Action: "read", Resource: "providers", Transport: TransportHTTP}, s.notImplemented)
+		Action: "read", Resource: "providers", Transport: TransportHTTP}, s.handleGetProvider)
 	s.registerProtected(r, routeSpec{Method: http.MethodGet, Pattern: "/api/v1/providers/{id}/models",
-		Action: "read", Resource: "providers", Transport: TransportHTTP}, s.notImplemented)
+		Action: "read", Resource: "providers", Transport: TransportHTTP}, s.handleGetProviderModels)
 
 	// ---- 3.6 Memory (7) ----
 	s.registerProtected(r, routeSpec{Method: http.MethodGet, Pattern: "/api/v1/agents/{id}/memory",

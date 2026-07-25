@@ -13,7 +13,10 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/imshuai/yaa/internal/auth"
+	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/session"
+	"github.com/imshuai/yaa/internal/skill"
+	"github.com/imshuai/yaa/internal/tool"
 	"golang.org/x/exp/slog"
 )
 
@@ -59,6 +62,9 @@ type Server struct {
 	agentExists   AgentExistsProvider
 	agents        AgentProvider
 	sessionMgr    *session.Manager
+	tools         *tool.Manager
+	skills        *skill.Manager
+	providers     *provider.Manager
 	memoryProvider MemoryProvider
 	memoryResolver MemoryPolicyResolver
 	// v1 Auth：由 Runtime 在 Start 时经 SetAuth 注入；nil 或 disabled 表示
@@ -123,6 +129,27 @@ func (s *Server) SetMemoryProvider(mp MemoryProvider, resolver MemoryPolicyResol
 	s.mu.Lock()
 	s.memoryProvider = mp
 	s.memoryResolver = resolver
+	s.mu.Unlock()
+}
+
+// SetToolManager 注入 Tool Manager 供 Tool Remote API 使用。
+func (s *Server) SetToolManager(tm *tool.Manager) {
+	s.mu.Lock()
+	s.tools = tm
+	s.mu.Unlock()
+}
+
+// SetSkillManager 注入 Skill Manager 供 Skill Remote API 使用。
+func (s *Server) SetSkillManager(sm *skill.Manager) {
+	s.mu.Lock()
+	s.skills = sm
+	s.mu.Unlock()
+}
+
+// SetProviderManager 注入 Provider Manager 供 Provider Remote API 使用。
+func (s *Server) SetProviderManager(pm *provider.Manager) {
+	s.mu.Lock()
+	s.providers = pm
 	s.mu.Unlock()
 }
 

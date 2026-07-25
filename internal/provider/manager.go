@@ -32,6 +32,9 @@ func factoryOf(typeName string) (factory, bool) {
 	return f, ok
 }
 
+// ErrProviderNotFound 是 Provider 不存在的 sentinel error，供 Remote API 映射 40401。
+var ErrProviderNotFound = errors.New("provider not found")
+
 func init() {
 	RegisterFactory("openai", func(cfg config.ProviderConfig) (Provider, error) {
 		return newOpenAI(cfg)
@@ -77,7 +80,7 @@ func NewManager(configs []config.ProviderConfig) (*Manager, error) {
 func (m *Manager) Get(id string) (Provider, error) {
 	p, ok := m.providers[id]
 	if !ok {
-		return nil, fmt.Errorf("provider %q not found", id)
+		return nil, fmt.Errorf("%w: %s", ErrProviderNotFound, id)
 	}
 	return p, nil
 }
@@ -95,6 +98,16 @@ func (m *Manager) List() []ProviderInfo {
 		out = append(out, ProviderInfo{ID: p.ID(), Type: p.Type(), Models: p.Models()})
 	}
 	return out
+}
+
+// Config 返回指定 ID Provider 的原 ProviderConfig 副本（含 timeout/max_retries/retry_interval 等），
+// 供 Remote API 只读视图（docs/remote-api/provider.md ProviderView）使用。不存在返 fmt.Errorf。
+func (m *Manager) Config(id string) (config.ProviderConfig, error) {
+	c, ok := m.configs[id]
+	if !ok {
+		return config.ProviderConfig{}, fmt.Errorf("%w: %s", ErrProviderNotFound, id)
+	}
+	return c, nil
 }
 
 // Close 按 ID 排序关闭所有 Provider，错误用 errors.Join 聚合后返回最早的启动错误。

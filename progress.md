@@ -749,3 +749,86 @@ Agent turn 内按 docs/agent.md §4 + docs/tool/provider.md §3-§5 完整走 To
 - go test -count=1 ./internal/api/：含新 5 路由注册 + WS disabled auth + 原 sessions/conversation/auth/memory/ws 测试，全绿。
 - go test -count=1 ./...：除 `TestWSStreamDisconnectCancelsTurn` 偶发 timing flake（已记录，单跑通过）外全绿。
 - go mod tidy 后 gorilla/mux 从 indirect 转正。
+
+## Phase 3 下一步 #6：Agent / Tool / Provider Remote API 端点实现（commit 待 push）
+
+把上一轮 #5 占位的 12 条 stub 替换为真实 handler：Agent 5 端点 + Tool 2 + Provider 3
+（Tool/Skill/Provider 3 个 Manager 已有 Get/List 等方法，可直接接 API）。
+config + mcp 2 共 3 条仍绑 notImplemented 50101 占位（依赖未实现的 RedactedView/MCP.Manager）。
+按文档契约（INDEX.md §3.2/§3.5 + docs/remote-api/{agent,tool,provider}.md）落地。
+
+### `internal/api/agent_provider.go` 改动
+- `AgentProvider` 接口扩展为 6 方法：HandleTurn/Get/List/Start/Pause/Stop（Deps 命名沿用
+  *agent.Manager 本就实现的方法签名 List/Start/Pause/Stop；status 用 *agent.Status 透传）。
+
+### `internal/api/agent_handler.go`（新文件，~170 行）
+- `agentSummaryDTO`（5 字段：id/name/provider/model/status）+ `agentDetailDTO`（追加 tools/skills
+  slice + memory_enabled/planner_enabled；Tools/Skills 默认 []string{} 空数组 ≠ null）+ `agentStateDTO`
+  （start/pause/stop 返 {id,status}）+ `agentListData`（paged）。
+- `agentStatusFromQuery` 校验 status query；非法 → 40001。
+- `handleListAgents` —— GET /api/v1/agents：parsePage/parsePageSize + 稳定分页；AgentManager.List 已
+  按 ID 升序，handler 仅做 [start:end] 切片。
+- `handleGetAgent` —— GET /api/v1/agents/{id}：Manager.Get（仅 Info）；v1 详情 tools/skills 暂为空数组
+  （AgentProvider 仅暴露 Get；完整 Inspect 留待 Runtime upgrade 时补）。
+- `handleStartAgent/{Pause,Stop}Agent` —— POST：统一走 `agentStateChange` helper（fn → Get → 写 state dto）。
+- `writeAgentError` 按 docs/remote-api/agent.md 映射：NotFound → 40401；
+  InvalidState/Paused/Stopped → 40901；ManagerClosed → 50301；DeadlineExceeded → 50401；
+  Canceled → 不写响应；其他 → 50001。
+
+### `internal/api/tool_handler.go`（新文件）
+- `toolInfoDTO` 映射 tool.ToolInfo（docs/tool.md：parameters 为 JSON Schema，深拷贝）。
+- Server 加 `s.tools *tool.Manager` 字段 + `SetToolManager` setter（runtime.Start 注入）。
+- `handleListTools` / `handleGetTool`：GetErrToolNotFound → 40401。
+
+### `internal/api/skill_handler.go`（新文件）
+- `skillSummaryDTO` + `skillViewDTO`（SkillView：tools/skills 升序，空数组输出 []）+
+  `skillListData`；Server 加 `s.skills *skill.Manager` + `SetSkillManager` setter。
+- `handleListSkills` / `handleGetSkill`：ErrSkillNotFound → 40401；disabled Skill 仍返 200 + status:disabled。
+
+### `internal/api/provider_handler.go`（新文件）
+- `providerSummaryDTO`（id/type/models IDs 升序）+ `providerViewDTO`（追加 timeout/max_retries/
+  retry_interval，省略 api_key/base_url/extra）+ `providerModelsData`；Server 加 `s.providers
+  *provider.Manager` + `SetProviderManager` setter。
+- `handleListProviders` / `handleGetProvider` / `handleGetProviderModels`：Provider 不存在 → 40401。
+- `formatDuration` helper：time.Duration String() 输出 Go duration string。
+
+### `internal/provider/manager.go` 改动
+- 新增 `ErrProviderNotFound` sentinel + `Config(id)` 方法（暴露 ProviderConfig 副本给 ProviderView 用），
+  Get/Config 用 `%w` 包装 ErrProviderNotFound 让 Remote API `errors.Is → 40401` 干净映射（去掉 v1 初版
+  用错误字符串判断的 hack）。
+
+### `internal/api/server.go` 改动
+- Server 增 `tools *tool.Manager` + `skills *skill.Manager` + `providers *provider.Manager` 字段（mu 保护）。
+- 新增 `SetToolManager / SetSkillManager / SetProviderManager` 三个 setter。
+
+### `internal/runtime/runtime.go` 改动
+- Start 段：在 SetSessionManager 后追加 `SetToolManager/SetSkillManager/SetProviderManager(rt.tools/skills/providers)`
+  三处注入；让 Tool/Skill/Provider Remote API 在 Runtime Ready 时可用。
+
+### `internal/api/routes.go` 改动
+- 12 条 stub 改指向真实 handler：Agent 5（list/get/start/pause/stop）+ Tool 2 + Provider 3 + Skill 2。
+- 剩余 3 条 stub：config（依赖 RedactedView 未实现）+ mcp 2（依赖 MCP.Manager 未实现）仍 50101。
+- 路由注册测试不变：registerProtected 把每条 RouteSpec push 到 registeredRoutes，stub 与真实 handler
+  在 RouteSpec 断言上完全等价。
+
+### `internal/api/agent_handler_test.go`（新文件，14 例）
+- `agentToolProviderTestEnv` 复用 conversation_handler_test setup 模式构造含 1 个 agent 的真实
+  Server：Session + Provider + Agent + Tool + builtin 注册，三 Manager 都注入。
+- Agent：list 1 个 + get detail（tools/skills 空数组）+ get unknown 40401 + pause→stop→start 状态迁移 +
+  start unknown 40401。
+- Provider：list summary（models IDs）+ get view（timeout=5s max_retries=2 retry=1s）+ get unknown 40401 +
+  /models 子路由。
+- Tool：list 含 builtin + get item + get unknown 40401。
+- `TestStubEndpointsReturn501NotImplemented` 验证剩 3 个 stub（config + mcp2）返 50101 保护未实现端点契约。
+- 测试 env.Data 用 `env.Data.(map[string]any)` 断言（与 memory_handler_test 风格一致）。
+
+### 验证
+- go vet / go build ./...：通过（含 internal/provider ErrProviderNotFound 改动 + 3 新 manager setter）。
+- go test -count=1 ./internal/api/：含新 14 例全绿；原 sessions/conversation/auth/memory/ws 测试无 regression。
+- go test -count=1 ./internal/provider/ / ./internal/runtime/：全绿。
+- go test -count=1 ./...：全项目 17 包全绿（含 WS flake 这轮未触发）。
+
+### 下一轮方向
+- config 端点：需先实现 `internal/config/redact.go` 的 `RedactedView`（docs/config/overview.md §3.3），
+  把已知 Secret + MCP headers/env + 开放 Map 递归脱敏成 JSON-compatible 深拷贝，最小测试覆盖 nil 不变性。
+- MCP 端点：依赖未实现的 `internal/mcp/` 包（Manager + Client + Server + 3 transport），规模较大，留作后续模块起点。
