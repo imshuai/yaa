@@ -13,8 +13,10 @@ import (
 	"github.com/imshuai/yaa/internal/config"
 	ctxwindow "github.com/imshuai/yaa/internal/context"
 	mm "github.com/imshuai/yaa/internal/memory"
+	"github.com/imshuai/yaa/internal/memory/embedding"
 	"github.com/imshuai/yaa/internal/memory/memstore"
 	"github.com/imshuai/yaa/internal/memory/sqlitestore"
+	"github.com/imshuai/yaa/internal/memory/vector"
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/session"
 	"github.com/imshuai/yaa/internal/skill"
@@ -122,10 +124,37 @@ func (rt *Runtime) Start(ctx context.Context) error {
 				rt.logger.Warn("memory: using in-memory content store backend", "durable", false)
 			}
 		}
+		// vector 启用：构造 HTTP embedder + 提供 exact cosine VectorIndexFactory；
+		// 启动期对每个启用 vector 的 Agent 跑 Reindex 让 IndexStatus=ready（架构 §4）。
+		// Reindex 失败仅 warn（不阻断 Runtime Ready，留 degraded 由后续 Reindex 修复）。
+		var embedder mm.Embedder
+		var indexFactory mm.VectorIndexFactory
+		if rt.cfg.Memory.Vector.Enabled {
+			ed, eErr := embedding.New(rt.cfg.Memory.Embedding)
+			if eErr != nil {
+				rt.rollback()
+				return fmt.Errorf("runtime: memory embedder: %w", eErr)
+			}
+			embedder = ed
+			indexFactory = vector.Factory()
+		}
 		// ponytail: v1 暂不接入 EventEmitter/AuditLogger；事件 sink 为 nil。
-		mmMgr := mm.NewManager(ms, nil, nil, mm.SystemClock{}, nil)
+		mmMgr := mm.NewManager(ms, embedder, indexFactory, mm.SystemClock{}, nil)
 		rt.memory = mmMgr
 		rt.components["memory"] = "ready"
+		// vector 启用时启动期对每个 Agent Reindex; 失败仅 warn 让 health 显 degraded。
+		if rt.cfg.Memory.Vector.Enabled {
+			for _, ag := range rt.cfg.Agents {
+				policy := config.ResolveMemoryPolicy(rt.cfg.Memory, ag.Memory)
+				if !policy.Enabled || !policy.Vector.Enabled {
+					continue
+				}
+				if _, rErr := mmMgr.Reindex(ctx, policy, ag.ID); rErr != nil {
+					rt.logger.Warn("memory: startup reindex failed, leaving agent degraded",
+						"agent", ag.ID, "error", rErr)
+				}
+			}
+		}
 	} else {
 		rt.components["memory"] = "disabled"
 	}

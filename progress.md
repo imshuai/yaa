@@ -558,3 +558,51 @@ Agent turn 内按 docs/agent.md §4 + docs/tool/provider.md §3-§5 完整走 To
 - go test -count=1 -run SQLiteManager ./internal/memory_test/：6 例全绿。
 - go test -count=1 ./internal/runtime/：全绿（含新 2 例）。
 - go test -count=1 ./...：除 `TestWSStreamDisconnectCancelsTurn` 偶发 timing flake（已记录，单跑 5/5 全绿）外全绿。
+
+## Phase 3 下一步 #3：VectorIndex exact cosine + HTTP Embedder + Runtime 启动 Reindex（commit 待 push）
+
+按 `docs/memory/architecture.md §4` + `docs/memory/storage.md §5` 落地 v1 唯一向量栈。
+
+### `internal/memory/vector/index.go`（新包，~130 行）
+- 进程内 exact cosine VectorIndex（v1 唯一实现，docs/architecture.md §4）。
+- `entry{ref memory.ItemRef, vector []float32}` + `sync.RWMutex` 保护内部 slice。
+- `Factory()` 返回 `VectorIndexFactory` 让 Manager `indexFactory` 字段每次返回新空 index，避免跨 Agent 共享或复用当前 index。
+- `Upsert`: 校验 `ref.AgentID/Key` 非空 + vector 非空（零长度返 `ErrMemoryEmbeddingZero`）；深拷贝 vector 切片防外部 mutation；按主键（AgentID+SessionID+Layer+Key，Version 不参与）精确匹配：存在则 in-place 替换 slice 引用，否则 append。
+- `Delete`: idempotent，不存在也返 nil。
+- `Search`: 按 `AgentID+Layer+(SessionID 精确或 IncludeGlobal 时 SessionID+" 并集空 SessionID)` 过滤；`cosine(req.Query, vec)` 计算 → score < threshold 跳过 → 收集 hits → `sort.SliceStable` 按 score DESC, SessionID ASC, Key ASC 排序。**不截 limit**（docs §4：留给 Manager 回查 ContentStore 后再 final limit）。
+- `cosine` 维度不匹配 → `ErrMemoryEmbeddingDimension`，零向量 → `ErrMemoryEmbeddingZero`；Search 内部错误仅跳过该 hit 不外抛（避免整 Search 失败）。
+- 编译期断言 `var _ memory.VectorIndex = (*index)(nil)`。
+
+### `internal/memory/vector/index_test.go`（新文件，4 例）
+- Upsert/Delete/Search 主键替换 + scope 过滤 + score DESC + IncludeGlobal 行为；threshold 过滤；ref 非空与 vector 非空校验；cross-agent 隔离。
+
+### `internal/memory/embedding/embedder.go`（新包，~140 行）
+- `HTTPEmbedder` OpenAI-compatible HTTP Embedder（v1 唯一 provider）。
+- `New(cfg MemoryEmbeddingConfig)`: base_url `TrimRight("/")`, dimension>0, timeout<=0 fallback 30s；构造 `&http.Client{Timeout:...}`。
+- `Embed(ctx, inputs)`: 空 inputs 返 nil, nil 不调 server; 否则 `POST {base_url}/embeddings`，请求 body `{model, input []string}`，Bearer api_key 头。用 `context.WithTimeout(ctx, h.timeout)` 限响应时长。错误映射：构造/IO/非 2xx/malformed body/data count mismatch → `ErrMemoryEmbeddingFailed`；维度不匹配 → `ErrMemoryEmbeddingDimension`；全 0 向量或零长度 vector → `ErrMemoryEmbeddingZero`（docs/storage.md §5: "响应正文与输入内容不写入日志"——本实现不 log body）。
+- 解析 OpenAI 响应 `{data: [{embedding: [float64...]}]}`；float64→float32 转换。
+- 编译期断言 `var _ memory.Embedder = (*HTTPEmbedder)(nil)`。
+
+### `internal/memory/embedding/embedder_test.go`（新文件，8 例）
+- happy 2D token "a"/"b" 返 [1,0]/[0,1] 验证 + Bearer header + path /embeddings + model + input 长度匹配；non-2xx → ErrMemoryEmbeddingFailed；dimension mismatch → ErrMemoryEmbeddingDimension；zero vector → ErrMemoryEmbeddingZero；malformed json → ErrMemoryEmbeddingFailed；data count mismatch → ErrMemoryEmbeddingFailed；empty inputs 返 nil no call；New 拒绝 empty base_url/zero dimension；timeout<=0 fallback 30s 通过构造（New 成功）。
+
+### `internal/runtime/runtime.go` Vector 启动注入
+- import 加 `"github.com/imshuai/yaa/internal/memory/embedding"` + `"github.com/imshuai/yaa/internal/memory/vector"`。
+- Memory Manager 构造段：`if rt.cfg.Memory.Vector.Enabled { embedding.New(rt.cfg.Memory.Embedding) + vector.Factory() }`；embedder 构造失败 → `rt.rollback()` + `return fmt.Errorf(...)` 让 Runtime Not Ready（cfg 由 validation 保证合法，正常路径不会失败）。
+- `mm.NewManager(ms, embedder, indexFactory, mm.SystemClock{}, nil)` 把 embedder/indexFactory 注入，让 Manager 走 vector 路径用真实 embedder。
+- 启动期对每个 `policy.Vector.Enabled && policy.Enabled` 的 Agent `mmMgr.Reindex(ctx, policy, ag.ID)`；失败仅 `rt.logger.Warn` 让 health 表示 degraded 但 Runtime 不阻断（docs/architecture.md §4: Reindex 失败留 degraded 由后续 Reindex 修复）。**架构 §4 §4「普通操作成功不会清除历史 degraded，只有完整 Reindex 才置 ready」**：putIndex 不再顺手清 status，让 Reindex 成为唯一 ready 来源；本步严格遵守这一契约。
+
+### `internal/memory_test/vector_integration_test.go`（新文件，3 例）
+- `newVectorManager` 用 HTTP embedder + 真实 vector.Factory；mock server 按输入 content 返预定义 dim=4 向量。
+- `TestManagerVectorReindexAndSearch`: Put 3 个不同 axis 的 item + 显式 Reindex 让 IndexStatus=ready，Search query 命中最近邻居 cosine=1.0 score=1.0；依次查 dogs/cats content 命中 k1/k2 验证 score。
+- `TestManagerVectorFallbackToKeywordWhenEmbedderDown`: server close 后 Search 走 fallback_to_keyword 路径，命中 keyword 子串 but Score=0；IndexStatus→degraded。
+- `TestManagerVectorNoFallbackErrorsWhenEmbedderDown`: FallbackToKeyword=false 时 embedder 错误透传 sentinel（ErrMemoryEmbeddingFailed/IndexDegraded/IndexUnavailable 其中之一）阻断 turn。
+
+### `internal/runtime/runtime_test.go` 增 1 例
+- `TestRuntimeMemoryVectorStartupReindex`: cfg.Memory.Vector.Enabled + httptest mock embeddings server + dim=2 → Start 成功 + memory component ready + rt.memory 非 nil；证明 Runtime vector 启动路径不离 Integer 错。
+
+### 验证
+- go vet / go build ./...：通过。
+- go test -count=1 ./internal/memory/vector/ + ./internal/memory/embedding/ + ./internal/memory_test/：全绿（含 4+8+3 例）。
+- go test -count=1 ./internal/runtime/：含新 1 例全绿。
+- go test -count=1 ./...：除 `TestWSStreamDisconnectCancelsTurn` 偶发 timing flake（已记录）外全绿。

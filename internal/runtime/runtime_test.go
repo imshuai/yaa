@@ -3,8 +3,10 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -188,5 +190,63 @@ func TestRuntimeMemorySQLiteBackendStartFailsOnBadPath(t *testing.T) {
 	if err := rt.Start(context.Background()); err == nil {
 		t.Fatal("Start should fail when sqlite backend cannot create dir")
 		_ = rt.Shutdown(context.Background())
+	}
+}
+
+// TestRuntimeMemoryVectorStartupReindex 启动期 vector enabled + mock embedder server，
+// 验证 Runtime Reindex 在每个 vector-enabled Agent 上跑通且 memory component 保持 ready。
+func TestRuntimeMemoryVectorStartupReindex(t *testing.T) {
+	// mock OpenAI-compatible embeddings server: 对所有 inputs 都返固定 dim=2 向量 [0.1, 0.2]。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Input []string `json:"input"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		out := struct {
+			Data []map[string]any `json:"data"`
+		}{}
+		for range req.Input {
+			out.Data = append(out.Data, map[string]any{"embedding": []float64{0.1, 0.2}})
+		}
+		_ = json.NewEncoder(w).Encode(out)
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := newTestConfig()
+	cfg.Memory.Enabled = true
+	cfg.Memory.Storage.Type = "memory"
+	cfg.Memory.Vector.Enabled = true
+	cfg.Memory.Vector.SimilarityThreshold = 0.5
+	cfg.Memory.Vector.TopK = 5
+	cfg.Memory.Embedding.Provider = "openai-compatible"
+	cfg.Memory.Embedding.Model = "any"
+	cfg.Memory.Embedding.BaseURL = srv.URL
+	cfg.Memory.Embedding.Dimension = 2
+	cfg.Memory.Embedding.Timeout = 2 * time.Second
+
+	rt, err := New(cfg, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rt.cfg.Skills.Dir = t.TempDir()
+	ctx := context.Background()
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = rt.Shutdown(shutdownCtx)
+	})
+
+	if comp := rt.Health().Components["memory"]; comp != "ready" {
+		t.Fatalf("memory component = %q, want ready", comp)
+	}
+	if rt.memory == nil {
+		t.Fatal("rt.memory is nil")
 	}
 }
