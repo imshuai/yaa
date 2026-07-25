@@ -12,6 +12,8 @@ import (
 	"github.com/imshuai/yaa/internal/api"
 	"github.com/imshuai/yaa/internal/config"
 	ctxwindow "github.com/imshuai/yaa/internal/context"
+	mm "github.com/imshuai/yaa/internal/memory"
+	"github.com/imshuai/yaa/internal/memory/memstore"
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/session"
 	"github.com/imshuai/yaa/internal/skill"
@@ -33,6 +35,7 @@ type Runtime struct {
 	agents     *agent.Manager
 	tools      *tool.Manager
 	skills     *skill.Manager
+	memory     *mm.Manager
 	api        *api.Server
 	logger     *slog.Logger
 
@@ -88,6 +91,24 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	}
 	rt.providers = pm
 	rt.components["provider"] = "ready"
+
+	// Memory Manager：架构 §3.1 顺序 Provider → Memory。v1 仅启用根配置的 enabled
+	// 时构造；关闭时为 nil，Runtime 不向 Agent/Remote 注入检索能力。
+	// v1 阶段默认使用 in-memory ContentStore 后端（SQLite 后端后续 commit）；
+	// 向量/Reindex 暂不接入（policy.Vector.Enabled=false 时 Manager.IndexStatus 永远 ready，
+	// 启动无需 Reindex）。
+	if rt.cfg.Memory.Enabled {
+		ms := memstore.New()
+		// ponytail: v1 暂不接入 EventEmitter/AuditLogger；事件 sink 为 nil。
+		mmMgr := mm.NewManager(ms, nil, nil, mm.SystemClock{}, nil)
+		rt.memory = mmMgr
+		rt.components["memory"] = "ready"
+		if rt.cfg.Memory.Storage.Type == "memory" {
+			rt.logger.Warn("memory: using in-memory content store backend", "durable", false)
+		}
+	} else {
+		rt.components["memory"] = "disabled"
+	}
 
 	// Tool Manager：注册 builtin → 每 Agent 空历史 projection binding 校验（docs/tool/manager.md §2.2）。
 	tm, terr := tool.NewManager(tool.Dependencies{Config: rt.cfg, Providers: pm, Logger: rt.logger})
@@ -241,6 +262,13 @@ func (rt *Runtime) Shutdown(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
+	// 关闭顺序按 architecture.md §3.1：Agent → Memory → Provider → 根 Storage。
+	if rt.memory != nil {
+		if err := rt.memory.Close(ctx); err != nil {
+			errs = append(errs, err)
+		}
+		rt.memory = nil
+	}
 	if rt.providers != nil {
 		if err := rt.providers.Close(); err != nil {
 			errs = append(errs, err)
@@ -268,6 +296,10 @@ func (rt *Runtime) rollback() {
 	rt.skills = nil
 	if rt.sessions != nil {
 		_ = rt.sessions.Shutdown(context.Background())
+	}
+	if rt.memory != nil {
+		_ = rt.memory.Close(context.Background())
+		rt.memory = nil
 	}
 	if rt.providers != nil {
 		_ = rt.providers.Close()
