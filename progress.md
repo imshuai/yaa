@@ -436,3 +436,51 @@ Agent turn 内按 docs/agent.md §4 + docs/tool/provider.md §3-§5 完整走 To
 - `internal/api/route_auth.go`（新增）：`Transport`/`TransportHTTP`/`TransportWebSocket` 常量 + `routeSpec{Method,Pattern,Action,Resource,Transport}` + `bearerToken` (Cut + EqualFold Bearer + token 非空且无空白/tab) + `credentialCode` (errors.Is(ErrJWTInvalid)->40102 否则 40101，按 sentinel 不按字符串判断) + `registerProtected` 唯一 wrapper：method 校验在前→disabled/public bypass→extract Bearer→Authenticator.Authenticate→Authorizer.Authorize→ContextWithIdentity 注入；失败 401/403 对 envelope，AuthZ 拒绝写脱敏日志。另含 `authIdentityForWebSocket` 给 WS handler 复用。
 - `internal/api/route_auth_test.go`（新增 13 例）：PublicBypass / DisabledBypass / MissingBearer 40101 / StaticValid / StaticInvalid 40101 / BearerBadFormat 40101 / RBACDeny 40301 / JWTValid / JWTBadIssuerCode 40102 / MethodCheckStill40501WithAuth（含 disabled 路径仍 405）/ IdentityInjectedIntoContext 端到端断言；全 api 测试无 regression。
 - 注意：`agents/sessions/sse/ws` 子树与 WS handler 接入 wrapper 的精细 per-sub-path RouteSpec 绑定（含 37 路由注册全量测试）为后续 commit，本轮先把基础设施端到端跑通。
+
+## Phase 3 Memory 系统第一阶段（commit `45fe5ca`/`7acee98`，已推送 gitea/main）
+
+按 `docs/memory/{README,architecture,storage,lifecycle,errors,observability,decisions,config-ref,checklist,integration}` 实现 v1 Memory 系统第一阶段：types/errors/Manager + memstore 后端 + Runtime 启动/关闭接入。
+
+### 文档现状
+- Config 层 MemoryConfig/MemoryOverride/MemoryPolicy/ResolveMemoryPolicy/validateMemoryConfig/validateMemoryPolicy/DefaultMemoryConfig 在前期已落地（`internal/config/{types,policy,validation,defaults}.go`）；测试已绿。
+- Auth 文档修复对应勘察 W1-W10 之后的 W3/W5/W6/W7/W8/W9/W10 已统一（commit `4067f9d`）。
+- 对 Memory 子系统的文档审查（Ohm 勘察）：10 个文档交叉引用闭合，无架构性矛盾，10 点问题清单为表述澄清级别；本轮先按契约落地代码，文档项保留待后续 commit 微调。
+
+### `internal/memory`（新包，5 文件）
+- `errors.go`：17 个 sentinel（ErrMemoryDisabled/ErrMemoryClosed/ErrMemoryNotFound/ErrMemoryInvalidScope/ErrMemoryInvalidItem/ErrMemoryManagedField/ErrMemoryUnsupportedLayer/ErrMemoryExpiredInput/ErrMemoryQuota/ErrMemoryStoreUnavailable/ErrMemoryCorrupt/ErrMemoryEmbeddingFailed/ErrMemoryEmbeddingDimension/ErrMemoryEmbeddingZero/ErrMemoryIndexUnavailable/ErrMemoryIndexDegraded/ErrMemoryReindexFailed）。
+- `types.go`：Layer/Scope/MemoryItem/SearchRequest/SearchResult/IndexStatus(PutResult)/ItemRef/CommitPutResult/VectorHit/VectorSearchRequest + 输入固定上限常量（MaxAgentIDLen=128/MaxSessionIDLen=128/MaxKeyLen=256/MaxContentLen=65536/MaxMetadataLen=16384/MaxSearchLimit=100/MaxDeleteExpiredLimit=10000）。
+- `interfaces.go`：ContentStore (CommitPut/Get/Search/List/Delete/Clear/DeleteExpired/Count/Ping/Close) + Embedder/VectorIndex/VectorIndexFactory + Clock/SystemClock。
+- `manager.go` (~1000 行)：
+  - Manager 字段：store/embedder/indexFactory/indexes/indexMu/mutationGate/agentLocks(keyedMutex)/clock/events/workerCancel/workerDone/lifecycleMu/inFlight/closing/closeOnce/closeDone。
+  - 8 个 canonical 事件类型 (EventAdded/Updated/Deleted/Promoted/Expired/Evicted/Degraded/Error) + Event + EventEmitter 接口。
+  - beginOp (lifecycleMu 内原子检查 closing + inFlight.Add(1)) + Close (幂等, closeOnce.Do: 等 workerDone -> inFlight.Wait -> 一次 store.Close; ctx 到期返回 ctx.Cause)。
+  - Put: 校验 item/policy/层 + 深拷贝 + normalizeExpiresAt (3 态: nil+default_ttl / zero time=永不过期 / 非零 <=now=ErrMemoryExpiredInput) + 锁序 mutationGate.RLock -> Agent keyed lock + 计算 delta + Count live + 选 victims (fifo/ttl) + ContentStore.CommitPut 单一 commit + emit added/updated/evicted + putIndex (向量失败标 degraded 但 Put 仍成功)。
+  - putLocked: 从 Put 提炼，供 Promote 在已持锁路径下复用避免 self-deadlock。
+  - selectVictims: 按 fifo (CreatedAt ASC) / ttl (ExpiresAt ASC, 永不排最后) + tie-break (SessionID/Key ASC) 选 victimCount 个排除 target；不足返回 ErrMemoryQuota。
+  - Get: 完整 Scope + 已过期返 ErrMemoryNotFound。
+  - Search: 关键词路径 (substring on Key/Content lowercase + metadata 深度相等 + UpdatedAt DESC/SessionID ASC/Key ASC 排序 + Score=0)；向量路径完整骨架 (Embed -> VectorIndex.Search -> 击中回查 ContentStore 校验 Version/TTL/scope/metadata -> threshold 后置过滤)；fallback_to_keyword 一次性降级。
+  - Delete/Clear/DeleteExpired: 持 mutationGate.RLock + Agent keyed lock (DeleteExpired 单独持 mutationGate.Lock 不取 Agent lock 以与 mutation 不交错)。
+  - Promote: 带 SessionID 源复制为目标全局 item (SessionID 空), 源不删, 目标 ExpiresAt=nil 重应用 default_ttl; 复用 putLocked 在同 Agent keyed lock 内避免重入。
+  - Reindex: 仅按 agentID 全量 List -> Embed -> 临时 VectorIndex swap；任一失败保留旧 pointer 标 IndexDegraded emit memory.degraded{reason:reindex} 与 ErrMemoryReindexFailed 包装底层错误；成功置 IndexReady。
+  - IndexStatus: 唯一不调 beginOp 的只读方法 (indexMu.RLock 快照)，关闭后仍可读，未启用 vector 或未知 agent 返回 IndexReady。
+  - ClockForTest() 暴露内部 Clock 给测试场景（仅 monorepo 测试使用，正式调用不应使用）。
+- `internal/memory/memstore/store.go`（in-process ContentStore v1 默认后端）：map[PrimaryKey]MemoryItem + sync.RWMutex；CommitPut 单一原子 (校验 victim Version + victim != target + 删 victim + upsert target Version+1 保留 CreatedAt)；Get/Search/List/Delete/Clear/DeleteExpired/Count/Ping/Close 全部契约；返回值 deepcopy Metadata/ExpiresAt 隔离内部缓存。`matchesScopeGlobalSession`（空 SessionID=Agent 全部来源，非空=精确）+ `matchesMetadata`（顶层 JSON 值深度相等）+ `notExpiredAt`（nil/zero=永不过期，否则 Before/After 检查）。
+
+### `internal/memory_test/manager_test.go`（跨包测试 package `memory_test` 避免 import cycle）
+16 例全部绿：PutCreatesAndGets (version 保留 / CreatedAt 保留) / PutRejectsInvalidLayer / PutRejectsEmpty / PutRejectsManagedField / PutTTLThreeStates (nil+ttl/nil 0/zero time/<=now) / GetNotFound / GetExpiredReturnsNotFound / SearchKeywordSubstring (Score=0) / SearchLimitValidation (负数/>Max/IncludeGlobal 与空 SessionID) / DisabledPolicy (Put/Get/Search 全部 ErrMemoryDisabled) / QuotaFifoEvict (k1 选最早驱逐后 NotFound) / QuotaExceedsCapacity (100 次写后仅剩最新 2 个, k0 早已 NotFound) / DeleteClear / DeleteExpired (limit 校验 + 仅删过期) / Promote (目标 SessionID 置空, 源保留, 空源 SessionID 拒绝) / PromoteExpiredSource (过期源返 NotFound) / IndexStatusNoVector (未知 agent=ready) / EventsEmitted (added/deleted 顺序断言) / CloseIdempotent (二次关闭 + 关闭后即将 AnyOp 返回 ErrMemoryClosed)。
+
+### Runtime 接入（commit `7acee98`）
+- `internal/runtime/runtime.go`：Runtime struct 加 `memory *mm.Manager`（`mm` alias of internal/memory）；import 内部 memory 与 memstore 包。
+- `Start` 在 Provider ready 后、Tool Manager 之前：若 `rt.cfg.Memory.Enabled=true` 则构造 `memstore.New()` + `mm.NewManager`（无 embedder/indexFactory/events v1）；否则 `components["memory"]="disabled"`。In-memory 后端为 v1 默认，SQLite 后端待后续 commit；Type=memory 时 warn 日志提示非持久。
+- `Shutdown` 加 Memory.Close 在 Provider.Close 之前，组件字段置 nil；`rollback` 同序回滚。
+
+### 验证
+- go vet / go build / go test 全部 ./...：通过（除已记录的 WS flake 测试 TestWSStreamDisconnectCancelsTurn timing 偶发外）。
+- 全包 build/vet/test 无 regression（agent/api/config/context/logging/provider/runtime/session/skill/storage/tool/tool/builtin + memory/memory_test/memstore）。
+
+### 下一步（按优先级）
+1. Agent turn Memory 检索注入 Context（docs/memory/integration.md §2 step 2）：Dependencies 加 Memory / AgentBinding 加 MemoryPolicy snapshot / runDirectTurn 第一轮 base+skill 后插入 32 KiB 上限的 memory system message / Search 错误传递策略（除 ErrMemoryDisabled 外阻断 turn）。
+2. SQLite ContentStore 后端（modernc.org/sqlite 已在依赖中）：DDL + schema_version + ON CONFLICT + RFC3339Nano + JSON metadata + 索引创建；与内存后端互测对比。
+3. VectorIndex exact cosine + Embedder HTTP（OpenAI-compatible `/embeddings`）；启动期 Reindex。
+4. Memory Remote API 8 端点（GET/search + GET/:key + POST + DELETE + DELETE-clear + POST/promote + POST/reindex），handler 入口 snapshot + policy，错误映射按 errors §7。
+5. 文档：补 W1-W10 剩余表述澄清项（W1 时间戳 / W2 / W4 tokens[].roles 默认）。
