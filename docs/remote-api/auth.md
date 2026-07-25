@@ -17,6 +17,8 @@ Runtime 支持两种互斥模式：
 
 `runtime.auth.enabled=false` 时 Remote route wrapper 同时跳过 AuthN/AuthZ，所有路由仍按业务层校验；非回环监听时配置校验必须拒绝该不安全组合。`public_paths` 只在认证启用时有意义。
 
+> v1 没有 refresh / token TTL 常量：Runtime 不持有 refresh window 配置，JWT 过期由外部 issuer 通过 `exp` claim 决定，检验时以 `exp`（含 `clock_skew`）为准。轮换/撤销只能通过改 `runtime.auth.tokens`/`runtime.auth.jwt.secret` 后重启生效（`runtime.auth.*` 全部为 restart-required）。
+
 认证成功后得到 `auth.Identity`，原始 Token 不进入 request context、日志或事件。
 
 ## 2. 失败响应

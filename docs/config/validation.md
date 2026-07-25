@@ -717,6 +717,9 @@ func validateAuthConfig(errs *ValidationErrors, field string, c AuthConfig, loop
         add(errs, field+".token_type", "enum", "must be static or jwt")
     }
 
+    // 权限 action 枚举：read | write | delete | *
+    // 权限 resource 枚举（= Remote API RouteSpec 资源集合 + 通配 *）：
+    //   agents | sessions | tools | skills | providers | memory | mcp | config | system | *
     roles := make(map[string]bool, len(c.Roles))
     validActions := map[string]bool{"read": true, "write": true, "delete": true, "*": true}
     validResources := map[string]bool{

@@ -307,6 +307,8 @@ type AuditLogger interface {
 
 v1 的角色只由启动 Config 提供；`runtime.auth.*` 变更需要重启，不提供动态角色管理 API。
 
+> v1 范围说明：上表所列 `AuditLogger` 为**可选扩展点，v1 不强制实现**。Runtime 不内置 AuditLogger，也不在生产启动时 noop 注入；接入审计需要由下游使用方自行实现并注入（v1 无注入 API）。`Authorizer` 的 v1 唯一实现即 `RBACAuthorizer`。其他扩展点（ABAC/ACL、自定义 Authorizer）均为 v1 之外的预留接口，不在 v1 实施范围。
+
 ---
 
 ## 8. 安全注意事项

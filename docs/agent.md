@@ -16,6 +16,8 @@ Agent 负责：
 
 Session 仍是消息、`turn_id`、FIFO、持久化和 cancel handle 的 owner。Agent 不保存第二份历史；Provider 不聚合流；Remote 只做认证、DTO、事件映射和错误映射。
 
+> 鉴权与身份归属：v1 不为 Agent 层引入独立的鉴权模型。Agent 不持有或读取 `auth.Identity`，也不实现 `Authenticator`/`Authorizer`；完整的 AuthN/AuthZ 由 Remote API Server 的唯一 route wrapper 完成并将 Identity 注入 request context（详见 [`docs/auth/integration.md`](auth/integration.md)）。Agent 内部仅做"校验 Agent/Session 归属"（前面 §1 列出），即同一 Runtime 内 Agent ID 与 Session ID 的合法配对，这是运行期校验而非 RBAC 权限判定。
+
 ## 2. 类型与 Manager API
 
 ```go

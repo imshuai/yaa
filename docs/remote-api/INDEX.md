@@ -179,6 +179,8 @@ Authorization: Bearer <static-token-or-jwt>
 
 Router 注册每个端点时必须同时绑定上表的 `(action, resource)`；Remote API 的唯一 route wrapper 使用已匹配的 metadata 完成 AuthN/AuthZ。不得从 URL 第一段或 HTTP 方法猜测权限，否则嵌套的 Memory/Session 路由会被错误归类。
 
+> 路由总表中的 `read:agents` / `write:sessions` 等记号仅为可读展示，表示 `action:resource` 组合；`RouteSpec` 注册时拆分为 `Action="read"` 与 `Resource="agents"` 两个字段，wrapper 调用 `Authorize(identity, spec.Action, spec.Resource)` 时传两个独立字符串而非 `"read:agents"`。
+
 Health 与 version 的 `RouteSpec` 始终分别绑定 `Action="read", Resource="system"`；默认 `public_paths` 命中时 wrapper 才 bypass。管理员从 public paths 删除它们后，同一 metadata 立即用于授权。
 
 ## 6. 超时与连接

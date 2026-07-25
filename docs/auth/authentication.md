@@ -96,12 +96,15 @@ func IdentityFromContext(ctx context.Context) (*Identity, bool) {
 
 ```go
 var (
-    ErrInvalidToken = errors.New("invalid static token")
-    ErrJWTInvalid   = errors.New("invalid jwt")
+    ErrInvalidToken    = errors.New("invalid static token")
+    ErrJWTInvalid      = errors.New("invalid jwt")
+    ErrUnauthenticated = errors.New("identity is required")
 )
 ```
 
-两个 sentinel 用于 Remote API 的稳定错误码映射；Authenticator 可以包装它们，但不得把底层解析错误写入响应。
+三个 sentinel 用于 Remote API 的稳定错误码映射；Authenticator 可以包装它们，但不得把底层解析错误写入响应。`ErrInvalidToken` / `ErrJWTInvalid` 表示认证层 Token/JWT 校验失败；`ErrUnauthenticated` 由 `RBACAuthorizer.Authorize` 在 `identity == nil` 时返回（即 Remote API 已跳过 AuthN 或匿名进入 AuthZ，详见 [集成契约 §4](integration.md) 与 [授权 §6.1](authorization.md)）。
+
+> AuthZ 层 `identity == nil` 在 Remote API 唯一 wrapper 的正常路径下不会出现：要么 AuthN 已成功注入 Identity，要么 disabled/public 已直接跳过 AuthZ。`ErrUnauthenticated` 保留为防御性错误码，与 `ErrInvalidToken`/`ErrJWTInvalid` 一起构成 Auth 包的 sentinel 集合。
 
 ### 3.1 静态 Token
 
@@ -201,6 +204,9 @@ type JWTAuthenticator struct {
 }
 
 func NewJWTAuthenticator(cfg config.JWTConfig) (*JWTAuthenticator, error) {
+    // 前置：仅当 `runtime.auth.enabled=true` 且 `token_type=jwt` 时由 Runtime 构造。
+    // 若 `token_type=static`，Runtime 不实例化此构造器；此时即使 yaml 中填了 `jwt.secret`
+    // 也不会被强校验（除非运行期切到 jwt），见 `docs/config/validation.md`。
     if len(cfg.Secret) < 32 || cfg.Issuer == "" || cfg.Audience == "" ||
         cfg.ClockSkew < 0 || cfg.ClockSkew > 5*time.Minute {
         return nil, fmt.Errorf("invalid jwt configuration")
