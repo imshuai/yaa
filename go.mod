@@ -9,6 +9,7 @@ require (
 )
 
 require (
+	github.com/golang-jwt/jwt/v5 v5.2.2
 	github.com/gorilla/websocket v1.5.3
 	github.com/oklog/ulid/v2 v2.1.2
 	golang.org/x/exp v0.0.0-20230202154922-04ff78cf6831
