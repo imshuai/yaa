@@ -98,9 +98,9 @@ func (s *Server) registerRoutes(r *mux.Router) {
 
 	// ---- 3.7 MCP (2) ----
 	s.registerProtected(r, routeSpec{Method: http.MethodGet, Pattern: "/api/v1/mcp/servers",
-		Action: "read", Resource: "mcp", Transport: TransportHTTP}, s.notImplemented)
+		Action: "read", Resource: "mcp", Transport: TransportHTTP}, s.handleListMCPServers)
 	s.registerProtected(r, routeSpec{Method: http.MethodGet, Pattern: "/api/v1/mcp/servers/{name}",
-		Action: "read", Resource: "mcp", Transport: TransportHTTP}, s.notImplemented)
+		Action: "read", Resource: "mcp", Transport: TransportHTTP}, s.handleGetMCPServer)
 }
 
 // pathVar 取 gorilla/mux 路径参数；不存在返 ""。

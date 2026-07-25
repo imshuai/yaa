@@ -14,6 +14,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/imshuai/yaa/internal/auth"
 	"github.com/imshuai/yaa/internal/config"
+	"github.com/imshuai/yaa/internal/mcp"
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/session"
 	"github.com/imshuai/yaa/internal/skill"
@@ -53,28 +54,29 @@ type HealthProvider interface {
 
 // Server 是 Remote API 的 HTTP 服务。
 type Server struct {
-	addr        string
-	logger      *slog.Logger
-	server      *http.Server
-	router      *mux.Router
+	addr             string
+	logger           *slog.Logger
+	server           *http.Server
+	router           *mux.Router
 	registeredRoutes []routeSpec
-	health      HealthProvider
-	sessions    SessionProvider
-	agentExists   AgentExistsProvider
-	agents        AgentProvider
-	sessionMgr    *session.Manager
-	tools         *tool.Manager
-	skills        *skill.Manager
-	cfgSnapshot   *config.Config
-	providers     *provider.Manager
-	memoryProvider MemoryProvider
-	memoryResolver MemoryPolicyResolver
+	health           HealthProvider
+	sessions         SessionProvider
+	agentExists      AgentExistsProvider
+	agents           AgentProvider
+	sessionMgr       *session.Manager
+	tools            *tool.Manager
+	skills           *skill.Manager
+	cfgSnapshot      *config.Config
+	providers        *provider.Manager
+	mcpServers       MCPServerProvider
+	memoryProvider   MemoryProvider
+	memoryResolver   MemoryPolicyResolver
 	// v1 Auth：由 Runtime 在 Start 时经 SetAuth 注入；nil 或 disabled 表示
 	// 整体绕过 AuthN/AuthZ（仅 loopback 或已强校验的回环监听场景下）。
-	authz         auth.Authorizer
-	authn         auth.Authenticator
-	authEnabled   bool
-	publicPaths   map[string]bool // 规范化后只读
+	authz       auth.Authorizer
+	authn       auth.Authenticator
+	authEnabled bool
+	publicPaths map[string]bool // 规范化后只读
 	started     time.Time
 	mu          sync.Mutex
 	listener    *http.Server
@@ -124,6 +126,14 @@ func (s *Server) SetSessionManager(sm *session.Manager) {
 	s.mu.Unlock()
 }
 
+// MCPServerProvider 由 Runtime 注入，提供 MCP server 只读状态投影给 Remote API。
+// 与 Provider/Tool 等具体 *Manager 注入不同：MCP 作为新模块通过接口隔离，
+// 便于 API 包 handler 测试 mock（详见 docs/mcp/README.md §2 List/Get 契约）。
+type MCPServerProvider interface {
+	List() []mcp.ServerStatus
+	Get(name string) (mcp.ServerStatus, bool)
+}
+
 // SetMemoryProvider 注入 Memory Manager + policy resolver（docs/remote-api/memory.md §1）。
 // Runtime 在 Memory Manager 构造完成 + 配置 snapshot 可得时调用。
 // nil mp 表示 Memory subsystem 未启用，Memory 8 端点统一 50301。
@@ -160,6 +170,14 @@ func (s *Server) SetProviderManager(pm *provider.Manager) {
 func (s *Server) SetConfigSnapshot(cfg *config.Config) {
 	s.mu.Lock()
 	s.cfgSnapshot = cfg
+	s.mu.Unlock()
+}
+
+// SetMCPServerProvider 注入 MCP Manager 给 Remote API mcp/servers 端点使用。
+// 未注入时端点返 50301；运维不应在未启用 MCP 子系统时调用只读状态端点。
+func (s *Server) SetMCPServerProvider(mp MCPServerProvider) {
+	s.mu.Lock()
+	s.mcpServers = mp
 	s.mu.Unlock()
 }
 

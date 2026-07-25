@@ -9,8 +9,9 @@ import (
 	"time"
 
 	"github.com/imshuai/yaa/internal/agent"
-	ctxwindow "github.com/imshuai/yaa/internal/context"
 	"github.com/imshuai/yaa/internal/config"
+	ctxwindow "github.com/imshuai/yaa/internal/context"
+	"github.com/imshuai/yaa/internal/mcp"
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/session"
 	"github.com/imshuai/yaa/internal/storage"
@@ -82,7 +83,31 @@ func agentToolProviderTestEnv(t *testing.T) (*Server, *agent.Manager, *session.M
 	srv.SetSessionManager(sm)
 	srv.SetToolManager(tm)
 	srv.SetProviderManager(pm)
+	srv.SetMCPServerProvider(mockMCPServerProvider{items: []mcp.ServerStatus{
+		{Name: "fs", Status: mcp.StatusDisconnected, Transport: "stdio", ToolCount: 0},
+	}})
 	return srv, am, sm
+}
+
+// mockMCPServerProvider 给 API handler 测试用：实现 MCPServerProvider 接口
+// 返回固定 List/Get 投影，避免依赖 internal/mcp.Manager 的 lifecycle。
+type mockMCPServerProvider struct {
+	items []mcp.ServerStatus
+}
+
+func (m mockMCPServerProvider) List() []mcp.ServerStatus {
+	out := make([]mcp.ServerStatus, len(m.items))
+	copy(out, m.items)
+	return out
+}
+
+func (m mockMCPServerProvider) Get(name string) (mcp.ServerStatus, bool) {
+	for _, it := range m.items {
+		if it.Name == name {
+			return it, true
+		}
+	}
+	return mcp.ServerStatus{}, false
 }
 
 func doAgentReq(t *testing.T, s *Server, method, path string) (*httptest.ResponseRecorder, Envelope) {
@@ -248,14 +273,52 @@ func TestToolGetNotFound(t *testing.T) {
 	}
 }
 
-// Sanity: 剩余 MCP 2 stub 仍返 50101（MCP.Manager 未实现）。
-// Config 端点已绑定真实 handler 走 RedactedView（见 TestConfigEndpoint*）。
-func TestStubEndpointsReturn501NotImplemented(t *testing.T) {
+// MCP Remote API 端点已替换 501 stub：
+//   - GET /api/v1/mcp/servers → 200 + items 投影（含 ServerStatus，无敏感字段）
+//   - GET /api/v1/mcp/servers/{name} 命中 → 200；未命中 → 40401
+//
+// agentToolProviderTestEnv 注入 mockMCPServerProvider 含 1 个 server "fs"（disconnected）。
+func TestMCPEndpointsReturn200And404(t *testing.T) {
 	s, _, _ := agentToolProviderTestEnv(t)
-	for _, p := range []string{"/api/v1/mcp/servers", "/api/v1/mcp/servers/foo"} {
-		rr, env := doAgentReq(t, s, http.MethodGet, p)
-		if rr.Code != http.StatusNotImplemented || env.Code != 50101 {
-			t.Errorf("%s: status=%d code=%d, want 501/50101", p, rr.Code, env.Code)
+
+	// List 投影：返 fs 一个 server，状态 disconnected。
+	rr, env := doAgentReq(t, s, http.MethodGet, "/api/v1/mcp/servers")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("List status=%d body=%s", rr.Code, rr.Body)
+	}
+	itemsObj, _ := env.Data.(map[string]any)["items"]
+	items, _ := itemsObj.([]any)
+	if len(items) != 1 {
+		t.Fatalf("items len=%d, want 1", len(items))
+	}
+	item := items[0].(map[string]any)
+	if item["name"] != "fs" || item["status"] != string(mcp.StatusDisconnected) || item["tool_count"] != float64(0) {
+		t.Errorf("item=%+v", item)
+	}
+
+	// Get 命中。
+	rr2, env2 := doAgentReq(t, s, http.MethodGet, "/api/v1/mcp/servers/fs")
+	if rr2.Code != http.StatusOK || env2.Code != 0 {
+		t.Fatalf("Get(fs) status=%d env=%+v", rr2.Code, env2)
+	}
+	if env2.Data.(map[string]any)["name"] != "fs" {
+		t.Errorf("Get(fs).name=%v", env2.Data)
+	}
+
+	// Get 未命中返 40401。
+	rr3, env3 := doAgentReq(t, s, http.MethodGet, "/api/v1/mcp/servers/does-not-exist")
+	if rr3.Code != http.StatusNotFound || env3.Code != 40401 {
+		t.Errorf("Get(miss): status=%d code=%d, want 404/40401", rr3.Code, env3.Code)
+	}
+}
+
+// MCP 端点未注入 Manager 时返 50301（运维不应调用未启用子系统）。
+func TestMCPEndpointsReturn503WhenNoManager(t *testing.T) {
+	srv := NewServer("127.0.0.1:0", nil, nil) // 不注入 MCP
+	for _, p := range []string{"/api/v1/mcp/servers", "/api/v1/mcp/servers/any"} {
+		rr, env := doAgentReq(t, srv, http.MethodGet, p)
+		if rr.Code != http.StatusServiceUnavailable || env.Code != 50301 {
+			t.Errorf("%s: status=%d code=%d, want 503/50301", p, rr.Code, env.Code)
 		}
 	}
 }
@@ -267,7 +330,7 @@ func TestConfigEndpointReturnsRedactedView(t *testing.T) {
 	// Test env built api server; 注入一个测试 cfg
 	cfg := &config.Config{
 		ConfigVersion: "1.0",
-		Providers:    []config.ProviderConfig{{ID: "p1", Type: "openai", APIKey: "super-secret-123"}},
+		Providers:     []config.ProviderConfig{{ID: "p1", Type: "openai", APIKey: "super-secret-123"}},
 	}
 	s.SetConfigSnapshot(cfg)
 

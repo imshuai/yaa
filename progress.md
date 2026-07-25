@@ -890,3 +890,131 @@ config + mcp 2 共 3 条仍绑 notImplemented 50101 占位（依赖未实现的 
 
 ### 下一轮方向
 - MCP Manager 起点（docs/mcp/README.md §2 + checklist）：先落地 Manager 结构 + ServerStatus + List/Get/Prepare/Activate/Stop lifecycle 框架（先 stub transport + 不实现 catalog reconciliation），让 Remote API mcp/servers 端点返空列表也能联调；后续 commit 渐进补 Client/transport。
+
+## Phase 3 下一步 #8：MCP Manager 起点 + Remote API mcp/servers 端点实现（commit 待 push）
+
+### 范围
+落地 `internal/mcp/` 包骨架（types + Manager v1 起点），让 Remote API 37 路由的最后 2 条 MCP
+stub 替换为真实 handler 返 ServerStatus 投影。**Manager lifecycle（上游 Client 连接 / heartbeat /
+重连 / 本地 Serve）暂不实现** — 留后续 multi-commit 按 docs/mcp/checklist.md §1-7 渐进补全。
+v1 起 Manager 构造即处于 "teardown-done" 状态：未连接、List 投影 disconnected、ToolCount=0。
+**所有 37 路由现已绑定真实 handler，无 501 stub 残留**。
+
+### 文档依据
+- `docs/mcp/README.md` §1 范围、§2 Manager API + ServerStatus、§3-5 Client/Server/Transport 概览
+- `docs/mcp/errors.md` §1 13 sentinel、§3 状态机
+- `docs/mcp/client.md` §1 ConnectionStatus 4 态
+- `docs/mcp/checklist.md` §1 Manager / §9 集成
+- `docs/mcp/config-ref.md` §1/§2 配置字段
+- `docs/mcp/integration.md` §9 Runtime Stop 顺序
+
+### `internal/mcp/types.go`（新）
+- `ConnectionStatus` 字符串类型 + 4 sentinel：`Status{Disconnected,Connecting,Connected,Error}`
+- `ServerStatus` 结构：Name/Status/Transport/ProtocolVersion(*string)/ToolCount/ConnectedAt(*time.Time)/LastError(omitempty)
+  —— 敏感连接配置（command/args/env/headers/tls）**不进入**该类型，避免 Remote API / 健康端点泄露
+- 13 个错误 sentinel 全部按 docs/mcp/errors.md §1 落地（ErrMCPConfig/ConnRefused/ConnTimeout/
+  AuthFailed/TransportClosed/TransportWrite/ProtocolError/InvalidParams/ToolNotFound/ToolExecFailed/
+  ToolTimeout/UnsupportedContent/Unavailable）。typed-error `Error()` 只返稳定文本，详细字段路径由
+  config 校验阶段携带，不再扩展零散 sentinel。
+
+### `internal/mcp/manager.go`（新）
+- `Manager` 结构：cfg/logger/entries（配置 server 投影源，只存非敏感 name+transport）/runCtx+cancelRun/
+  doneOnce+done（teardown 信号）/stopOnce+cacheErr（幂等 Stop + 缓存最终错误）/readyMu+ready（本地 Serve
+  状态）/mu。**所有公开方法**：`Prepare`/`Activate`/`Stop(ctx)`/`Done()`/`Ready()`/`Get(name)`/
+  `List()`/`Tools(name)`/`NewManager(cfg, tm, logger)` —— 完整对齐 docs/mcp/README.md §2 签名。
+- v1 语义：
+  - `NewManager` 缓存配置 server 名字 + transport（空 transport 默认 `stdio`）作 List/Get 投影源；
+    nil cfg 返 `ErrMCPConfig`；nil logger 走 `slog.Default()`。
+  - `Prepare()` v1 无 transport 要 prepare → 返 nil。
+  - `Activate()` 若 `cfg.Server.Enabled=true` 返 `ErrMCPConfig`（本地 Server 实现未交付，**不静默
+    启用**避免空 Server 接受请求产生语义错乱）；disabled 时返 nil。
+  - `Stop(ctx)` 用 stopOnce 保证幂等；取消 runCtx + 关闭 done + 置 ready=false；返 cacheErr。
+  - `Done()` 返 done channel。v1 起构造即 done 未关闭，Stop 后关闭。
+  - `Ready()` v1 恒 true（无本地 Serve），Stop 后置 false。
+  - `List()` 返 ServerStatus 切片，**深拷贝**（修改不影响 Manager 内部 entries）；v1 全 disconnected。
+  - `Get(name)` 命中返 (ServerStatus, true)，未命中返 (zero, false)。
+  - `Tools(name)` v1 未连接 → 返 (nil, false)。
+
+### `internal/mcp/manager_test.go`（新，13 例）
+- 空 / 多 server / 默认 transport / Get 命中未命中 / List 深拷贝不变性 / Tools empty /
+  Ready + Stop 状态转换 / Stop 幂等 / Done 在 Stop 后可读 / Prepare no-op / Activate
+  enabled 拒绝 + disabled nil / NewManager nil cfg 拒绝
+
+### `internal/api/server.go` 改动
+- Server 增 `mcpServers MCPServerProvider` 字段（接口，非具体 *mcp.Manager）—— 与
+  Provider/Tool 等具体指针注入风格不同的取舍：MCP 作为新模块通过接口隔离便于 API 包 handler 测试 mock
+- 新增 `MCPServerProvider` 接口：`List() []mcp.ServerStatus` + `Get(name) (mcp.ServerStatus, bool)`
+  （与 docs/mcp/README.md §2 签名对齐）
+- 新增 `SetMCPServerProvider(mp)` setter；未注入时端点返 50301
+
+### `internal/api/mcp_handler.go`（新）
+- `mcpServerListData{Items []mcp.ServerStatus}` DTO
+- `mcpProvider(w, r)` 解引用 + nil 检查 → 50301
+- `handleListMCPServers` — GET /api/v1/mcp/servers：投影 List()；items nil → [] 防 null
+- `handleGetMCPServer` — GET /api/v1/mcp/servers/{name}：40401 未找到 / 200 OK + ServerStatus DTO
+
+### `internal/api/routes.go` 改动
+- 2 个 MCP stub (`s.notImplemented` 50101) 替换为 `s.handleListMCPServers` / `s.handleGetMCPServer`
+- **`s.notImplemented` handler 保留**（不再有端点引用，但作为通用未实现占位留作模板）
+
+### `internal/runtime/runtime.go` 改动
+- 加 `internal/mcp` import + `mcpMgr *mcp.Manager` 字段
+- Start 段在 SetConfigSnapshot 之后：构造 `mcp.NewManager(&rt.cfg.MCP, rt.tools, rt.logger)` →
+  `Prepare()` → `Activate()`（任一失败 `rt.rollback()` + 返 fmt.Errorf 包装）→ 设字段 +
+  `rt.api.SetMCPServerProvider(mcpMgr)` + `rt.components["mcp"] = "ready"`
+- Shutdown 段在 `rt.api.Shutdown` 之后 `rt.sessions.Shutdown` 之前插入 MCP teardown：
+  按 docs/mcp/integration.md §9 "调 Stop(ctx) → 等 Done → 再以 fresh ctx 调 Stop 取最终错误"
+- rollback 段在 providers 之前插入：fresh ctx Stop + Done + 置 nil
+
+### `internal/api/agent_handler_test.go` 改动
+- 加 `internal/mcp` import；分组 import 顺序 gofmt 规整（带动文件 ival 中已有 import 块的 1 行调换，
+  非本项目 commit vol1 引入的杂项清理）
+- `agentToolProviderTestEnv` 末尾注入 `mockMCPServerProvider{items: [{fs, disconnected, stdio, 0}]}`
+- 新 `mockMCPServerProvider` 类型 + List/Get 实现（深拷贝 List 防测试间共享状态）
+- 删 `TestStubEndpointsReturn501NotImplemented`（无 501 stub 残留）
+- 新 `TestMCPEndpointsReturn200And404`：list 200 + items 投影 + Get(fs) 200 + Get(miss) 40401
+- 新 `TestMCPEndpointsReturn503WhenNoManager`：未注入 Manager 的 Server hit 2 端点均返 50301
+
+### 验证
+- `go vet ./...`：通过
+- `go build ./...`：通过
+- `go test -count=1 -timeout 250s ./...`：18 包全绿（mcp/api/runtime 新增 + 原有 15 包无 regression）
+- `go mod tidy`：无新依赖
+- `TestWSStreamDisconnectCancelsTurn` 单包并发 run 触发本会话一次 timing flake（已知 200ms time.Sleep
+  问题，progress 早前已记录），单跑 / -count=3 全绿；非本 commit 引入
+- `go test -count=3 ./internal/api/ -run TestWSStreamDisconnectCancelsTurn` 全绿
+
+### 当前状态：37 路由 100% 已实现 + 0 个 501 stub
+- 之前 35 条已实现 + 2 条 MCP stub 50101 占位
+- 本 commit：MCP 2 stub 替换为真实 handler。`notImplemented` helper 保留无引用。
+
+### 副债清单 / v1 已知限制（与 docs/mcp/checklist.md 对照）
+| 文档项 | v1 实际 | 触发 |
+|---|---|---|
+| Manager lifecycle Prepare/Activate | stub 返 nil / disabled | docs §2、checklist §1 |
+| runUpstream heartbeat / 重连 | 未实现 | docs §2、checklist §1 |
+| Client Connect/Initialize/DiscoverTools/CallTool/Ping | 未实现 | docs §3、checklist §2 |
+| 本地 MCPServer Serve/handleInitialize/handleListTools/... | 未实现；cfg.Server.Enabled=true 时 Activate 拒绝 | docs §4、checklist §3 |
+| Transport stdio/sse/streamable_http | 未实现 | docs §5、checklist §4-6 |
+| Tool 映射 `mcp.<server>.<tool>` + Proxy | 未实现 | docs §1、checklist §7 |
+| 内置 Tool `mcp_list` | 未实现 | checklist §9 |
+| 指标 / span | 未实现 | checklist §9 |
+| 修复 W1 时间戳 / W2 README 导览 / W4 tokens[].roles | 仍保留 | progress 早前记录 |
+
+### 下一轮方向
+按 docs/mcp/checklist.md § 排序，建议下述渐进路径（每个独立 commit）：
+
+1. **Client v1 起点**：`Client` 结构骨架 + `ConnectionStatus` 状态机 + `Connect/Close/Initialize/
+   DiscoverTools/CallTool/Ping/Done/Err` 签名 + 错误 sentinel 映射（checklist §2；不接 transport）。
+   目标：完成"Client 一代连接"类型契约 + 单测覆盖状态转换，不接真实 stdio/sse/streamable_http。
+2. **stdio Client transport**：`StdioClient` + exec.Command + stdin/stdout JSON-RPC 行协议 + stderr
+   日志捕获 + 优雅关闭（checklist §4）。目标：能连本地 npx @modelcontextprotocol/server-filesystem。
+3. **Manager.Start / runUpstream 雏形**：构造 Client + 启动 + 状态转换 + DiscoverTools 把 Tool 注册到
+   ToolManager 稳定 Proxy（checklist §1 §7 §9）。目标：Runtime 启动 auto-start=true server 能真连上
+   本地 stdio MCP server 并显示 ToolCount>0、Status=connected。
+4. **streamable_http / SSE**: network transport。
+5. **本地 MCP Server + 工具暴露**：完整 binding 校验 + Serve ctx 生命周期 + handleInitialize/...
+6. **重连 + heartbeat + 指标**：完成 lifecycle + observability。
+
+注：本 commit 已让 Manager Stop/Done 幂等、状态字段就位，后续 commit 只需往 Manager 里加 entries
+client 字段与其 lifecycle 而非改 API/handler 投影契约 —— Manager 与 Runtime 启停边界已固定。

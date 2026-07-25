@@ -12,6 +12,7 @@ import (
 	"github.com/imshuai/yaa/internal/api"
 	"github.com/imshuai/yaa/internal/config"
 	ctxwindow "github.com/imshuai/yaa/internal/context"
+	"github.com/imshuai/yaa/internal/mcp"
 	mm "github.com/imshuai/yaa/internal/memory"
 	"github.com/imshuai/yaa/internal/memory/embedding"
 	"github.com/imshuai/yaa/internal/memory/memstore"
@@ -39,6 +40,7 @@ type Runtime struct {
 	tools      *tool.Manager
 	skills     *skill.Manager
 	memory     *mm.Manager
+	mcpMgr     *mcp.Manager
 	api        *api.Server
 	logger     *slog.Logger
 
@@ -246,6 +248,28 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	rt.api.SetProviderManager(rt.providers)
 	// 注入 Config snapshot 供 GET /api/v1/config 使用 config.RedactedView。
 	rt.api.SetConfigSnapshot(rt.cfg)
+
+	// MCP Manager 构造并注入 Remote API mcp/servers 端点。
+	// v1 起：仅缓存配置以供 List/Get 投影；尚不启动任何上游 Client / 本地 Serve
+	// （docs/mcp/checklist.md §1 lifecycle / transport 留后续 multi-commit）。
+	// 构造失败时启动失败（不应发生在 config 已 Validate 通过的前提下，仅 ErrMCPConfig 兜底）。
+	mcpMgr, mcpErr := mcp.NewManager(&rt.cfg.MCP, rt.tools, rt.logger)
+	if mcpErr != nil {
+		rt.rollback()
+		return fmt.Errorf("runtime: mcp manager: %w", mcpErr)
+	}
+	if pErr := mcpMgr.Prepare(); pErr != nil {
+		rt.rollback()
+		return fmt.Errorf("runtime: mcp prepare: %w", pErr)
+	}
+	if aErr := mcpMgr.Activate(); aErr != nil {
+		rt.rollback()
+		return fmt.Errorf("runtime: mcp activate: %w", aErr)
+	}
+	rt.mcpMgr = mcpMgr
+	rt.api.SetMCPServerProvider(mcpMgr)
+	rt.components["mcp"] = "ready"
+
 	// 注入 Memory Remote API：仅当 Memory Manager 已构造（Memory.Enabled=true）。
 	// resolver 从当前 config snapshot 计算 effective policy；Memory 全局 disabled 时
 	// rt.memory == nil，handler 统一返 50301（子系统未启用），operator 不应调用 disabled 子系统。
@@ -314,6 +338,17 @@ func (rt *Runtime) Shutdown(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
+	// MCP Manager teardown：Stop 后等 Done，再用 fresh ctx 调 Stop 取得最终错误
+	// （docs/mcp/README.md §2、docs/mcp/integration.md §9）。API 已收请求能力后再停 MCP，
+	// 之后才关闭 Tool Manager 等依赖。v1 起 Manager 无 lifecycle，Stop 立即完成并 Done 可读。
+	if rt.mcpMgr != nil {
+		_ = rt.mcpMgr.Stop(ctx)
+		<-rt.mcpMgr.Done()
+		if ferr := rt.mcpMgr.Stop(context.Background()); ferr != nil {
+			errs = append(errs, ferr)
+		}
+		rt.mcpMgr = nil
+	}
 	if rt.sessions != nil {
 		if err := rt.sessions.Shutdown(ctx); err != nil {
 			errs = append(errs, err)
@@ -362,6 +397,11 @@ func (rt *Runtime) rollback() {
 	if rt.memory != nil {
 		_ = rt.memory.Close(context.Background())
 		rt.memory = nil
+	}
+	if rt.mcpMgr != nil {
+		_ = rt.mcpMgr.Stop(context.Background())
+		<-rt.mcpMgr.Done()
+		rt.mcpMgr = nil
 	}
 	if rt.providers != nil {
 		_ = rt.providers.Close()
