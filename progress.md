@@ -1018,3 +1018,153 @@ v1 起 Manager 构造即处于 "teardown-done" 状态：未连接、List 投影 
 
 注：本 commit 已让 Manager Stop/Done 幂等、状态字段就位，后续 commit 只需往 Manager 里加 entries
 client 字段与其 lifecycle 而非改 API/handler 投影契约 —— Manager 与 Runtime 启停边界已固定。
+
+## Phase 3 下一步 #9：MCP Client v1 起点（types 扩充 + ClientTransport 接口 + Client 完整实现 + 集成测试）（commit 待 push）
+
+### 范围
+落地 `internal/mcp/` 包 §2 MCP Client 完整骨架（docs/mcp/checklist.md §2、client.md §1-5）。
+单代 Client 的请求/响应/状态机/fail/Close/握手/工具发现/调用全部就绪 — Manager 与 stdio transport
+**依旧未接**（留后续 commit）。Client 通过 `ClientTransport` interface 完成所有 I/O；本 commit 用
+`fakeTransport` 完整端到端集成测试（Initialize/Ping/DiscoverTools/CallTool/Close/状态/fail等）验证。
+
+同时：先按用户约束修文档 `docs/mcp/checklist.md §1` Manager — 勾选 v1 已落地项 (`Manager` 骨架 /
+`Get` / `Tools` / `List` / `Prepare` / `Activate` / `Ready` / `Stop`+`Done`) + 明确未交付项措辞
+（`runUpstream` heartbeat / 重连 / 后台 teardown with `errors.Join` 仍 `[ ]`）。
+
+### 文档依据
+- `docs/mcp/checklist.md` §1（修文档）+ §2（Client 实现目标）
+- `docs/mcp/client.md` §1 状态结构 + §2 Initialize/Ping + §3 DiscoverTools + §4 CallTool + §5 重连语义
+- `docs/mcp/transport.md` §2 JSON-RPC 协议 + Message/RPCError wire DTO + 上限表 + validateEnvelope 规则；
+  §3 ClientTransport 接口；preferredVersion/acceptsVersion 矩阵
+- `docs/mcp/errors.md` §2 JSON-RPC code → sentinel 映射 (-32602 → ErrMCPInvalidParams,
+  server-defined -32000..-32099 → ErrMCPToolExecFailed)
+
+### `docs/mcp/checklist.md` 改动
+§1 MCP Manager 项全部对齐 v1 实际：7 项勾选（含 v1 副债清单备注），1 项 keep `[ ]`（runUpstream 仍待
+lifecycle commit 落地）。无 §2-9 改动。
+
+### `internal/mcp/types.go` 扩充
+- `Message` / `RPCError` (Error → 稳定 "mcp rpc error" 不含 message/data；docs/mcp/transport.md §2) /
+  `Implementation` / `InitializeParams` / `InitializeResult` / `MCPTool` / `ListToolsParams` /
+  `ListToolsResult` / `CallToolParams` / `Content` / `CallToolResult` / `ProtocolVersion` / 
+  `LegacyProtocolVersion` / `TransportInfo` 常量与结构
+- 用 json.RawMessage 严格 wire 透传（不干预 wire shape）
+
+### `internal/mcp/transport.go`（新）
+- `ClientTransport` 接口：Start / Send / Recv / Close / Info（docs/mcp/transport.md §3）
+- `validateEnvelope(msg) (messageKind, error)`：严格 5 类校验（jsonrpc=2.0 / method 互斥 result/error /
+  result 互斥 error / notification 无 ID / response 无 method 等等），任一违反返 ErrMCPProtocolError
+- `messageKind` 枚举：request/notification/response/invalid + String() 诊断用
+- `isNullJSON(b)`：识别 wire "null" 字面量 / 字符串 "null"
+- `preferredVersion(transportType) string` + `acceptsVersion(transportType, serverVersion) bool`：
+  按 docs/mcp/client.md §2 矩阵 (streamable_http → 2025-03-26 strict / sse → 2024-11-05 strict /
+  stdio → 兼容两个版本)
+- `parseID(json.RawMessage) (uint64, bool)`：仅接受 Client 自己签发的正整数 ID；string ID / 空 / 0 皆
+  拒（避免 late response 误识别）
+
+### `internal/mcp/transport_test.go`（新，9 例）
+- validateEnvelope 各路径覆盖：request / notification / notification+id→request (语义升级) /
+  response / response+method 拒 / result+error 互斥拒 / 空 version 拒 / empty envelope 拒 / nil 拒
+- preferredVersion/acceptsVersion 矩阵覆盖 + parseID 正数/0/字符串/空 拒绝
+
+### `internal/mcp/client.go`（新，560 行）
+`Client` 结构详对齐 docs/mcp/client.md §1：
+- 字段：name / runCtx / transport / status / mu / cancel / closeOnce / failOnce / closing / closeErr /
+  closedErr / pendingMu / pending / wg / cntroll / recvDone (新: 无 recvLoop chan / 无 controlDone /
+  无 lateCount，删 YAGNI 字段) / nextID / issuedHighWater
+- `NewClient(name, runCtx, transport)`：未连接（status=disconnected）；调用方需 Connect→Initialize
+- `Status()` mu.RLock 返当前快照
+- `Done() <-chan struct{}`：failOnce 关闭；Manager 在此 wait torn-down
+- `Err() error`：pendingMu.Lock 返 closedErr（stable sentinel 不带 wire 原 message/data）
+- `Connect(startupCtx)`：disconnected→connecting→Start transport；失败 Close 并返错
+- `request(ctx, method, params, out)`：marhalParams→pending 注册→Send→等 call.ch 或 ctx 取消
+  + bestEffortCancel；stream 上限保护：nextID == MaxUint64 或 pending ≥ 1024 → fail(ErrMCPProtocolError)
+- `marshalParams(params) (json.RawMessage, error)`：nil→ omitted / object / array 否则 ErrMCPInvalidParams
+- `mapRPCError(err)`：-32601 → ErrMCPToolNotFound / -32602 → ErrMCPInvalidParams / 其他 →
+  ErrMCPToolExecFailed（不假设 -32001 固定含义；docs/mcp/errors.md §2）
+- `fail(err)`：failOnce；标记 closedErr / 摘 all pending 投递 / 置 status=Error / cancel / transport.Close
+  / 关 c.recvDone 信号
+- `retire(id, call)`：pendingMap identity check 仅删同指针 entry（防 fail 后误删新 entry）
+- `bestEffortCancel(id, cause)`：100ms 超时发 notifications/cancelled，reason 限 128 bytes；
+  不进 pending / 不重试 / 不可回放
+- `Close()`：closeOnce + 关闭顺序 closing=true → fail(ErrMCPTransportClosed) → wg.Wait → status=Disconnected
+- `runRecvLoop(ctx)`：唯一调用 transport.Recv；按 validateEnvelope 分类；response → dispatchResponse；
+  request 入容量 32 control channel；notification 仅 tolerated tools/list_changed；
+  control 满 / Recv 失败 / envelope 错 → fail
+- `dispatchResponse(msg)`：parseID 失败/0 → protocol error / id > issuedHighWater → protocol error /
+  未匹配 pending (已 retire late/duplicate) → 丢 (不毒化连接)
+- `runControlLoop(ctx)`：处理 server ping → 返 ping 不带 result payload；其他 server method → -32601
+- `handleServerRequest(ctx, msg)`：返响应 Message
+- `notify(ctx, method, params)`：发 notification（无 ID，无 response）
+- `Initialize(ctx)`：initialize → 校验 protocolVersion + capabilities.tools → notifications/initialized →
+  status=Connected；任一步失败返错（caller 应 Close）
+- `Ping(ctx)`：ping 验证当前代可用，不启动重连
+- `DiscoverTools(ctx)`：128 pages / 4096 tools / 4 KiB cursor 上限；重复 cursor / 重复 name / wire shape 
+  非法 → fail(ErrMCPProtocolError)；sorted by name 升序返回
+- `normalizeTool(serverName, raw)`：远端 name 1..128 bytes、无控制字符、desc ≤ 4 KiB、schema ≤ 256 KiB；
+  canonical `mcp.<server>.<remote>` ≤ 256 bytes、无控制字符
+- `canonicalToolName` + `isValidName` helper
+- `CallTool(ctx, name, arguments)`：未 connected 返 ErrMCPUnavailable；ctx 取消返 context.Cause(ctx)
+  不重映射 caller DeadlineExceeded 为 ErrMCPToolTimeout（hard cap 由 Proxy 设置）
+- 常量限制：maxPendingRequests=1024 / maxListToolsPages=128 / maxTotalTools=4096 / maxCursorBytes=4096 /
+  maxToolNameBytes=128 / maxCanonicalNameBytes=256 / maxDescriptionBytes=4096 / maxInputSchemaBytes=256KiB /
+  bestEffortCancelTimeout=100ms / controlBufferSize=32
+
+### `internal/mcp/client_test.go`（新，15 例）
+用 `fakeTransport` 实现 ClientTransport + channel 驱动 Recv / Send 捕获；端到端覆盖：
+- TestClientInitializeLifecycle：Connect→status=connecting / Initialize 成功→connected / Close→disconnected
+- TestClientCloseIdempotent：两次 Close 同 sentinel
+- TestClientInitializeRejectsIncompatibleVersion：stdio 拒 "1.0.0" → ErrMCPProtocolError
+- TestClientInitializeRejectsServerWithoutTools：没 advertise tools → ErrMCPProtocolError
+- TestClientPingOK：Ping 成功路径
+- TestClientDiscoverToolsSinglePage：1 页 2 工具，按 name 升序，`mcp.fs.<remote>` 命名前缀
+- TestClientDiscoverToolsMultiPage：nextCursor 翻页直到空
+- TestClientDiscoverToolsToolNameTooLong：192 byte name → ErrMCPProtocolError
+- TestClientCallToolOK：result.IsError=false 回传 Content
+- TestClientCallToolNotConnected：未 Connected → ErrMCPUnavailable
+- TestClientRPCErrorMapping：-32602 → ErrMCPInvalidParams
+- TestClientRequestCtxCancelReturnsCause：caller 取消 → context.Cause + bestEffortCancel 发
+  notifications/cancelled
+- TestClientRequestSendFailureFailsClient：transport.Send 拒绝 → wrap(ErrMCPTransportWrite) + Client fail
+- TestClientDoneClosesOnClose：Close 后 Done 可读
+- TestClientHandlesServerPingRequest：server ping request → Client 回 ping 响应
+
+### 验证
+- `go vet ./...`：通过
+- `go build ./...`：通过
+- `go test -count=1 -timeout 250s ./...`：18 包全绿（mcp/api/runtime 无 regression）；
+  mcp 包 37 例 manager + transport + client 全绿
+- `go test -count=3 ./internal/mcp/ -run TestClient`：3 轮重复 Client 测试全绿（无 timing flake）
+- `go mod tidy`：无新依赖
+- 注意：`go test -race` 在本 sandbox arm64 上返 ThreadSanitizer: unsupported VMA range，环境问题
+  非代码问题；后续 commit 不在本沙箱跑 -race 检验
+
+### 副债清单 / v1 已知限制
+- Manager 与 Client 尚未集成（auto-start Client、Manager.runUpstream、heartbeat、Proxy 注册到 ToolManager）
+- stdio/sse/streamable_http transport 尚未实现（用 fakeTransport 验证）
+- onListChanged callback 未接（notification 仅 tolerate 但不通知 Manager）
+-ReleasedDate listTools strict wire DTO 解码仍走标准 json.Unmarshal，未用 DisallowUnknownFields
+  + EOF 双保险（后续 commit 接 stdio 后再补 strict 解码）
+- connected_at 未发布到 ServerStatus（lifecycle commit 接入时填）
+- bestEffortCancel reason 简单截断 128 bytes（未做 unicode boundary 处理）
+
+### 下一轮方向 → （按 progress #8 末尾规划第 2 项）
+1. **stdio Client transport**（checklist §4）：`StdioClient` + `exec.Command` + stdin/stdout JSON-RPC
+   行协议 + stderr 日志捕获 + 子进程退出检测 + 优雅关闭。目标：能连本地 npx @modelcontextprotocol/
+   server-filesystem 真实 stdio MCP server。
+2. **Manager.runUpstream 雏形**（checklist §1 §7 §9）：构造 Client + 启动 + DiscoverTools →
+   注册稳定 Proxy 到 ToolManager；Manager.Start 走 auto-start=true 串接 lifecycle，
+   Runtime 启动后 ServerStatus.ToolCount>0、Status=connected。
+3. streamable_http/SSE → 4. 本地 MCPServer → 5. 重连+heartbeat+指标 → 6. Planner step 1-2。
+
+### Ponytail 决策记录
+- 接口注入 ClientTransport 在 Client 层（而非 Client 持有具体 transport ），与上轮
+  MCPServerProvider 在 API 层接口注入思路一致 — 新模块通过接口隔离 + fakeTransport 测试
+  驱动贯通端到端，避免引入 stdio 真实依赖到 Client 单元测试。
+- v1 listTools 实现不要求 DisallowUnknownFields + EOF 双保险（Ponytail YAGNI — 后续 stdio
+  commit 接真实 server 后再补 strict 解码；当前 json.Unmarshal 已 cover schema 字段）。
+- 删 `recvLoop chan`, `controlDone chan`, `lateCount int` 等 YAGNI 字段（无人读）；
+  留 `recvDone` 是 Manager wait 信号，无人读其余两字段。
+- mapRPCError 中 -32601 → ErrMCPToolNotFound（本地 catalog 查找用）；其他统一
+  ErrMCPToolExecFailed（含 -32001 不假设过载语义），与 docs/mcp/errors.md §2 "不能假设 -32001 固定
+  表示过载" 对齐。

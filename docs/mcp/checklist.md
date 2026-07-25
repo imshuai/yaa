@@ -7,14 +7,14 @@
 
 ## 1. MCP Manager
 
-- [ ] `Manager` 结构体定义（entries、Tool Manager、本地 MCPServer、run/stop context、done、logger、mu）
-- [ ] `Get()` / `Tools()` — 返回状态和 Tool 深拷贝，不暴露当前 Client
-- [ ] `List() []ServerStatus` — 列出所有配置的上游连接状态
-- [ ] `Prepare()` — 校验/持有本地 transport，启动 auto-start Client 并注册稳定 Proxy，但不运行本地 Serve
-- [ ] `Activate()` — 仅在 `Config.Activate(binding)` 成功后运行本地 MCP Server
-- [ ] `Ready()` — 本地 Serve 意外退出后返回 false，推动 Runtime unhealthy/Not Ready
-- [ ] `Stop()` / `Done()` — 同步清空 handles，后台用 `errors.Join` 完成 teardown；Done 后再次 Stop 立即返回缓存的最终错误
-- [ ] `runUpstream` — Manager 唯一拥有 heartbeat、catalog reconciliation 和指数退避重连
+- [x] `Manager` 结构体定义（entries、run/stop context、done、logger、mu） — v1 起点已落地；Tool Manager 字段已签名透传，待后续 commit 接 Client / Proxy 后实际使用；本地 MCPServer 字段尚未引入（待 §3 commit）
+- [x] `Get()` / `Tools()` — 返回状态和 Tool 列表深拷贝；v1 起 Tools 返 (nil, false) 无生命周期，Get 返 ServerStatus 副本
+- [x] `List() []ServerStatus` — 列出所有配置的上游连接状态（v1 全 disconnected）
+- [x] `Prepare()` — v1 起骨架返 nil；启动 auto-start Client 并注册稳定 Proxy 部分待后续 lifecycle commit 落地，当前 Prepare 是契约占位
+- [x] `Activate()` — v1：仅当 cfg.Server.Enabled=true 时返 ErrMCPConfig（本地 Serve 实现未交付不静默启用）；disabled 时返 nil
+- [x] `Ready()` — v1 恒 true（无本地 Serve），Stop 后置 false；本地 Serve 意外退出→ unhealthy 待 §3 commit
+- [x] `Stop()` / `Done()` — 同步幂等清空、Done 信号、二次 Stop 返 cache error 已落地；后台用 `errors.Join` 完成 teardown 待 Client / Proxy 引入
+- [ ] `runUpstream` — Manager 唯一拥有 heartbeat、catalog reconciliation 和指数退避重连（未实现，待后续 lifecycle commit）
 
 ## 2. MCP Client
 
