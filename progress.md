@@ -832,3 +832,61 @@ config + mcp 2 共 3 条仍绑 notImplemented 50101 占位（依赖未实现的 
 - config 端点：需先实现 `internal/config/redact.go` 的 `RedactedView`（docs/config/overview.md §3.3），
   把已知 Secret + MCP headers/env + 开放 Map 递归脱敏成 JSON-compatible 深拷贝，最小测试覆盖 nil 不变性。
 - MCP 端点：依赖未实现的 `internal/mcp/` 包（Manager + Client + Server + 3 transport），规模较大，留作后续模块起点。
+
+## Phase 3 下一步 #7：config.RedactedView + GET /api/v1/config 端点（commit 待 push）
+
+按 `docs/config/overview.md §3.3` 实现 Config 模块唯一对外脱敏视图，替换上一轮 #6 config stub；
+自此 37 路由里只剩 MCP 2 stub 仍待依赖未实现的 `internal/mcp/` 包。
+
+### `internal/config/redact.go`（新文件，~170 行）
+- `ErrConfigRedactionFailed` sentinel（docs §3.3）。
+- `RedactedView(cfg *Config) (any, error)`：按 docs 实现顺序固定：
+  1. 拒绝 nil；`json.Marshal cfg` → `Decoder.UseNumber` 解码为 `map[string]any`；失败 wrap ErrConfigRedactionFailed。
+  2. 替换 4 个已知 Secret 路径的 string 值为 "***"：`runtime.auth.tokens[*].token`、`runtime.auth.jwt.secret`、`providers[*].api_key`、`memory.embedding.api_key`。
+  3. 对 MCP servers[*].headers/env + 6 个开放 Map 递归处理：`redactScalarRecursive` —
+     object/array 保持结构，所有 scalar（string/bool/number/json.Number）替为 "***"，`null` 保持 null。
+  - 开放 Map 6 个精确路径：providers[*].extra / tools.builtin.*.options / agents[*].tools_config.*.options /
+    skills.per_skill.*.options / agents[*].skills_config.*.options / plugins.entries[*].config。
+  - fail-closed：开放 Map 全部 scalar 都视为敏感值脱敏，不按 key 猜；新增 Map 必须同时加入该 list。
+  - 输入 cfg 不被修改（先 Marshal 再 decode 深拷贝）。
+
+### `internal/config/redact_test.go`（新文件，7 例）
+- `buildFullConfig` 构造覆盖所有脱敏路径的 Config（含 4 个已知 Secret + MCP headers/env + 6 开放 Map 嵌套 scalar + null）。
+- `TestRedactedViewNilReturnsError`、`TestRedactedViewKnownSecretsReplaced`、
+  `TestRedactedViewMCPHeadersEnvRedactedAsScalars`、`TestRedactedViewOpenMapsRecursiveScalars`、
+  `TestRedactedViewPreservesNonSensitiveFields`、`TestRedactedViewDoesNotMutateInput`、
+  `TestRedactedViewTwoCallsDeepEqual`。
+- helpers `navigatePath` 用文档风格点+数组索引路径在 JSON 上断言（与 RedactedView 实现解耦）。
+
+### `internal/api/config_handler.go`（新文件）
+- `handleGetConfig` — GET /api/v1/config（read:config）：取 `s.cfgSnapshot` → `config.RedactedView` → envelope。
+  snapshot nil → 50301；redact 失败 → 50001；不得 fallback 未脱敏 snapshot。
+
+### `internal/api/server.go` 改动
+- Server 增 `cfgSnapshot *config.Config` 字段（mu 保护）+ `SetConfigSnapshot(cfg)` setter。
+
+### `internal/runtime/runtime.go` 改动
+- Start 段在 SetProviderManager 后调 `rt.api.SetConfigSnapshot(rt.cfg)`，注入当前 Config snapshot。
+  （docs §3.3 提到的 `reload.Current()` 在 ReloadManager 实现前用单次注入替代，热 reload 未来通过替换 snapshot 实现。）
+
+### `internal/api/routes.go` 改动
+- config stub 改指向 `s.handleGetConfig`；剩 MCP 2 stub 仍占位。
+
+### `internal/api/agent_handler_test.go` 增 3 例
+- `TestConfigEndpointReturnsRedactedView`：注入含 1 个 Provider 的 cfg，GET /api/v1/config 返 200；
+  api_key = "***"，id/type 非脱敏保留。
+- `TestConfigEndpointNilSnapshotReturns503`：未注入 snapshot 返 50301。
+- `TestStubEndpointsReturn501NotImplemented` 改成只有 MCP 2 stub（config 已实现）。
+
+### 验证
+- go vet / go build ./...：通过。
+- go test -count=1 ./internal/config/：含新 7 例 redact 测试全绿。
+- go test -count=1 ./internal/api/：含新 3 例 config 端点测试 + 原 14 + sessions/conversation/auth/memory/ws 测试无 regression，全绿。
+- go test -count=1 ./...：全项目 17 包全绿（WS flake 这轮未触发）。
+- go mod tidy：无新依赖。
+
+### 当前 stub 剩余（37 路由里 2 条）
+- MCP servers list / get：依赖未实现的 `internal/mcp/` 包（Manager + Client + Server + 3 transport；规模大独立模块）。
+
+### 下一轮方向
+- MCP Manager 起点（docs/mcp/README.md §2 + checklist）：先落地 Manager 结构 + ServerStatus + List/Get/Prepare/Activate/Stop lifecycle 框架（先 stub transport + 不实现 catalog reconciliation），让 Remote API mcp/servers 端点返空列表也能联调；后续 commit 渐进补 Client/transport。

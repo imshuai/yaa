@@ -20,7 +20,7 @@ func (s *Server) registerRoutes(r *mux.Router) {
 	s.registerProtected(r, routeSpec{Method: http.MethodGet, Pattern: "/api/v1/version",
 		Action: "read", Resource: "system", Transport: TransportHTTP}, s.handleVersion)
 	s.registerProtected(r, routeSpec{Method: http.MethodGet, Pattern: "/api/v1/config",
-		Action: "read", Resource: "config", Transport: TransportHTTP}, s.notImplemented)
+		Action: "read", Resource: "config", Transport: TransportHTTP}, s.handleGetConfig)
 
 	// ---- 3.2 Agent (5) ----
 	s.registerProtected(r, routeSpec{Method: http.MethodGet, Pattern: "/api/v1/agents",

@@ -244,6 +244,8 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	rt.api.SetToolManager(rt.tools)
 	rt.api.SetSkillManager(rt.skills)
 	rt.api.SetProviderManager(rt.providers)
+	// 注入 Config snapshot 供 GET /api/v1/config 使用 config.RedactedView。
+	rt.api.SetConfigSnapshot(rt.cfg)
 	// 注入 Memory Remote API：仅当 Memory Manager 已构造（Memory.Enabled=true）。
 	// resolver 从当前 config snapshot 计算 effective policy；Memory 全局 disabled 时
 	// rt.memory == nil，handler 统一返 50301（子系统未启用），operator 不应调用 disabled 子系统。

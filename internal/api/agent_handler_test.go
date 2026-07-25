@@ -248,13 +248,56 @@ func TestToolGetNotFound(t *testing.T) {
 	}
 }
 
-// Sanity: 仍含 3 个 stub（config + mcp2）返 50101。
+// Sanity: 剩余 MCP 2 stub 仍返 50101（MCP.Manager 未实现）。
+// Config 端点已绑定真实 handler 走 RedactedView（见 TestConfigEndpoint*）。
 func TestStubEndpointsReturn501NotImplemented(t *testing.T) {
 	s, _, _ := agentToolProviderTestEnv(t)
-	for _, p := range []string{"/api/v1/config", "/api/v1/mcp/servers", "/api/v1/mcp/servers/foo"} {
+	for _, p := range []string{"/api/v1/mcp/servers", "/api/v1/mcp/servers/foo"} {
 		rr, env := doAgentReq(t, s, http.MethodGet, p)
 		if rr.Code != http.StatusNotImplemented || env.Code != 50101 {
 			t.Errorf("%s: status=%d code=%d, want 501/50101", p, rr.Code, env.Code)
 		}
+	}
+}
+
+// TestConfigEndpointReturnsRedactedView 验证 GET /api/v1/config：注入 cfg 后端点调 RedactedView，
+// api_key 被脱敏成 ***，非敏感字段保留。50301 当 snapshot nil。
+func TestConfigEndpointReturnsRedactedView(t *testing.T) {
+	s, _, _ := agentToolProviderTestEnv(t)
+	// Test env built api server; 注入一个测试 cfg
+	cfg := &config.Config{
+		ConfigVersion: "1.0",
+		Providers:    []config.ProviderConfig{{ID: "p1", Type: "openai", APIKey: "super-secret-123"}},
+	}
+	s.SetConfigSnapshot(cfg)
+
+	rr, env := doAgentReq(t, s, http.MethodGet, "/api/v1/config")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body)
+	}
+	d, ok := env.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("data not object: %+v", env.Data)
+	}
+	providers, _ := d["providers"].([]any)
+	if len(providers) != 1 {
+		t.Fatalf("providers: %+v", providers)
+	}
+	pm := providers[0].(map[string]any)
+	if pm["api_key"] != "***" {
+		t.Fatalf("api_key should be redacted: %v", pm["api_key"])
+	}
+	if pm["id"] != "p1" || pm["type"] != "openai" {
+		t.Fatalf("non-sensitive fields should be preserved: %+v", pm)
+	}
+}
+
+// TestConfigEndpointNilSnapshotReturns503 验证 cfg 未注入时返 50301。
+func TestConfigEndpointNilSnapshotReturns503(t *testing.T) {
+	s, _, _ := agentToolProviderTestEnv(t)
+	// 不 SetConfigSnapshot
+	rr, env := doAgentReq(t, s, http.MethodGet, "/api/v1/config")
+	if rr.Code != http.StatusServiceUnavailable || env.Code != 50301 {
+		t.Fatalf("nil snapshot status=%d code=%d, want 503/50301", rr.Code, env.Code)
 	}
 }

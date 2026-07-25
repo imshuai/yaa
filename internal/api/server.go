@@ -13,6 +13,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/imshuai/yaa/internal/auth"
+	"github.com/imshuai/yaa/internal/config"
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/session"
 	"github.com/imshuai/yaa/internal/skill"
@@ -64,6 +65,7 @@ type Server struct {
 	sessionMgr    *session.Manager
 	tools         *tool.Manager
 	skills        *skill.Manager
+	cfgSnapshot   *config.Config
 	providers     *provider.Manager
 	memoryProvider MemoryProvider
 	memoryResolver MemoryPolicyResolver
@@ -150,6 +152,14 @@ func (s *Server) SetSkillManager(sm *skill.Manager) {
 func (s *Server) SetProviderManager(pm *provider.Manager) {
 	s.mu.Lock()
 	s.providers = pm
+	s.mu.Unlock()
+}
+
+// SetConfigSnapshot 注入当前 Config 快照供 GET /api/v1/config 调用 config.RedactedView。
+// 热更新未来通过 ReloadManager 替换同 snapshot 实现；v1 单次注入。
+func (s *Server) SetConfigSnapshot(cfg *config.Config) {
+	s.mu.Lock()
+	s.cfgSnapshot = cfg
 	s.mu.Unlock()
 }
 
