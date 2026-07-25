@@ -403,3 +403,36 @@ Agent turn 内按 docs/agent.md §4 + docs/tool/provider.md §3-§5 完整走 To
 ### 下一步
 
 - Phase 3 后续：Memory 系统 / Planner / Auth 认证（按 roadmap 顺序）。
+
+## Phase 3 Auth 系统（进行中）
+
+### 文档修复（commit `4067f9d`，已推送 gitea/main）
+
+按 Auth v1 实施前勘察（W 系列文档审查）修关键表述：
+- W9 统一 Auth 包 sentinel 集合：`docs/auth/authentication.md §3` 补 `ErrUnauthenticated`（由 RBACAuthorizer 在 identity==nil 时返回），消除与 `authorization.md §6.1` 的 sentinel 不一致。
+- W7 JWT 构造器前置注释：`authentication.md §3.2 NewJWTAuthenticator` 注明 secret≥32 仅在 `Enabled && token_type==jwt` 时由 Runtime 构造器强校验，与 `config/validation.md` 条件化校验对齐。
+- W3 明确 AuditLogger 为可选扩展点，v1 不强制实现、不注入、无注入 API；Authorizer v1 唯一实现即 RBACAuthorizer。
+- W5 补 `remote-api/INDEX.md §5` 路由表记号说明：`read:agents` 仅为可读展示，注册时拆分为 `Action`/`Resource` 两个字段。
+- W6 `config/validation.md validateAuthConfig` 在 `validResources`/`validActions` 旁补中文注释列出枚举清单。
+- W10 `remote-api/auth.md §1` 明确 v1 无 refresh/token TTL 常量，JWT 过期由外部 issuer 通过 exp claim 决定，`runtime.auth.*` 全部 restart-required。
+- W8 `agent.md §1` 补 Agent 层鉴权/身份归属声明：v1 不为 Agent 层引入独立 Auth；AuthN/AuthZ 由 Remote API Server 唯一 route wrapper 完成，Agent 仅做 Agent ID/Session ID 归属校验。
+
+### Auth 包核心（commit `f1fc294`，已推送 gitea/main）
+
+按 `docs/auth/authentication.md §2-§3` + `authorization.md §6` 实现 v1 Auth 包核心：
+- `internal/auth/identity.go`：Identity{id,name,roles,claims} + `cloneIdentity` 深拷贝 + `identityContextKey{}` 唯一 context key + `ContextWithIdentity`/`IdentityFromContext` 双向 clone + `String` 脱敏日志 + `HasRole`。
+- `internal/auth/errors.go`：三个 sentinel `ErrInvalidToken` / `ErrJWTInvalid` / `ErrUnauthenticated`。
+- `internal/auth/authenticator.go`：`Authenticator.Authenticate(token) (*Identity,error)` + `Authorizer.Authorize(identity,action,resource) (bool,error)` 接口。
+- `internal/auth/static.go`：`StaticAuthenticator` (sha256(token)->Identity 索引)，构造器防御兜底 name/token/roles 非空 + token value sha256 唯一，`Authenticate` 返回 clone，失败 `ErrInvalidToken`。
+- `internal/auth/jwt.go`：`JWTAuthenticator` (golang-jwt/jwt/v5 **v5.2.2** 即 Go 1.20 兼容上限；v5.3.x 依赖 Go 1.21 `slices` 包)，强制 HS256 (`WithValidMethods`+keyfunc Alg 校验)，`WithIssuer/WithAudience/WithLeeway/WithExpirationRequired`，失败包 `ErrJWTInvalid`，成功要求 `Subject!="" && len(Roles)>0`，Identity.Claims 只含 issuer/expires_at；构造器 secret>=32/issuer/audience 非空/clock_skew in [0,5m]。
+- `internal/auth/rbac.go`：`RBACAuthorizer` (Role->Permissions 深拷贝)，`Authorize` identity==nil→`ErrUnauthenticated`，遍历 Roles 全部权限累加 allowed/denied，**deny 优先于 allow**，未匹配默认拒绝，未知 Effect 返回 error，`matchPattern` 仅整字段 `*`（无前缀通配）。
+- 依赖：`github.com/golang-jwt/jwt/v5 v5.2.2`（v5.3.x 依赖 Go 1.21 `slices` 包，选 v5.2.2 为 Go 1.20 兼容上限）。
+- 测试 `auth_test.go`：Identity/clone/context roundtrip + Static 命中/未命中/构造兜底 + JWT happy/bad alg/坏 issuer/过期/空 subject/空 roles/缺 exp/构造兜底 + RBAC allow/deny 优先/wildcard/admin vs viewer/operator 矩阵/未匹配/nil identity/未知 effect/构造兜底，18+ 例全绿。
+
+### Remote API Auth wrapper 基础（commit `968d9a0`，已推送 gitea/main）
+
+按 `docs/auth/integration.md §1-§5` 落地 AuthN/AuthZ 在 Remote API 的入口基础设施；首批把 `/api/v1/health` 与 `/api/v1/version` 通过唯一 wrapper 注册并绑定 `RouteSpec(Action=read, Resource=system)`：
+- `internal/api/server.go`：Server 新增 `authz/authn/authEnabled/publicPaths` 字段（mutex 保护），`SetAuth(enabled, authn, authz, publicPaths)` setter 把 publicPaths 规范化成 `map[string]bool` 便于 O(1) 精确匹配；`register` 把 health/version 用 `registerProtected` 替代 `mux.HandleFunc + methodGet`，绑定 RouteSpec read:system。
+- `internal/api/route_auth.go`（新增）：`Transport`/`TransportHTTP`/`TransportWebSocket` 常量 + `routeSpec{Method,Pattern,Action,Resource,Transport}` + `bearerToken` (Cut + EqualFold Bearer + token 非空且无空白/tab) + `credentialCode` (errors.Is(ErrJWTInvalid)->40102 否则 40101，按 sentinel 不按字符串判断) + `registerProtected` 唯一 wrapper：method 校验在前→disabled/public bypass→extract Bearer→Authenticator.Authenticate→Authorizer.Authorize→ContextWithIdentity 注入；失败 401/403 对 envelope，AuthZ 拒绝写脱敏日志。另含 `authIdentityForWebSocket` 给 WS handler 复用。
+- `internal/api/route_auth_test.go`（新增 13 例）：PublicBypass / DisabledBypass / MissingBearer 40101 / StaticValid / StaticInvalid 40101 / BearerBadFormat 40101 / RBACDeny 40301 / JWTValid / JWTBadIssuerCode 40102 / MethodCheckStill40501WithAuth（含 disabled 路径仍 405）/ IdentityInjectedIntoContext 端到端断言；全 api 测试无 regression。
+- 注意：`agents/sessions/sse/ws` 子树与 WS handler 接入 wrapper 的精细 per-sub-path RouteSpec 绑定（含 37 路由注册全量测试）为后续 commit，本轮先把基础设施端到端跑通。
