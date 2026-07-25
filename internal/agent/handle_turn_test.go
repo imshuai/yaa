@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +18,7 @@ import (
 	ctxwindow "github.com/imshuai/yaa/internal/context"
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/session"
+	"github.com/imshuai/yaa/internal/skill"
 	"github.com/imshuai/yaa/internal/storage"
 	"github.com/imshuai/yaa/internal/tool"
 )
@@ -294,4 +299,182 @@ func itoa(i int) string {
 		b[pos] = '-'
 	}
 	return string(b[pos:])
+}
+
+// newSkillTestEnv 构造一个带 Skill 集成的最小环境：单 provider mock（happy final）+
+// 注册空 Tool Manager + Skill Manager 加载指定 skillsDir。Provider 最后一次请求 body 通过
+// capturedProviderBody 返回，便于测试断言 Skill system message 已注入候选 ChatRequest。
+func newSkillTestEnv(t *testing.T, skillsDir string, agentSkills []string, sysPrompt string, capturedProviderBody *string) (*Manager, *session.Manager) {
+	t.Helper()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf, _ := io.ReadAll(r.Body)
+		if capturedProviderBody != nil && *capturedProviderBody == "" {
+			*capturedProviderBody = string(buf)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":    "r",
+			"model": "m",
+			"choices": []map[string]any{{
+				"message":       map[string]any{"role": "assistant", "content": "done"},
+				"finish_reason": "stop",
+			}},
+			"usage": map[string]any{},
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	provCfg := config.ProviderConfig{
+		ID: "p1", Type: "openai", APIKey: "k", BaseURL: srv.URL,
+		Models: []config.ModelConfig{{ID: "m", Name: "M", ContextWindow: 4096, MaxOutput: 2048}},
+	}
+	pm, err := provider.NewManager([]config.ProviderConfig{provCfg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pm.Close() })
+
+	store, _ := storage.NewMemory(nil)
+	sessCfg := config.SessionConfig{
+		MaxMessages: 100, MaxMessageBytes: 1024 * 1024, TTL: 24 * time.Hour,
+		MaxLifetime: 720 * time.Hour, Persist: true, MaxSessionsPerAgent: 5, CleanupInterval: time.Minute,
+	}
+
+	cfg := &config.Config{
+		Providers: []config.ProviderConfig{provCfg},
+		Agents: []config.AgentConfig{{
+			ID: "agent-sk", Name: "SK Agent", Provider: "p1", Model: "m", MaxTokens: 1000,
+			SystemPrompt: sysPrompt, Skills: agentSkills,
+		}},
+		Context: config.ContextConfig{MaxTokens: 0, ReservedTokens: 3500, Strategy: "truncate"},
+		Session: sessCfg,
+		Skills:  config.SkillsConfig{Dir: skillsDir, PerSkill: map[string]config.SkillItemConfig{}},
+	}
+
+	// Tool Manager（Agent.Skill 无 Tool 依赖时也需存在以便 Agent.Deps 字段类型匹配，可空注册）。
+	tm, err := tool.NewManager(tool.Dependencies{Config: cfg, Providers: pm})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	skm, err := skill.Load(cfg.Skills, cfg.Agents, tm, "")
+	if err != nil {
+		t.Fatalf("skill.Load: %v", err)
+	}
+
+	agm, err := NewManager(Dependencies{
+		Config: cfg, Providers: pm, Context: ctxwindow.NewManager(), Tools: tm, Skills: skm,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = agm.Shutdown(context.Background()) })
+
+	// 补 Session Manager：Agent Manager 在构造时需要 Sessions 后注入。
+	sm := session.NewManager(sessCfg, store, nil, session.ManagerOptions{
+		AgentExists:   func(id string) bool { return id == "agent-sk" },
+		AgentOverride: func(id string) *config.SessionOverride { return nil },
+	})
+	if err := sm.Restore(context.Background(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := sm.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sm.Shutdown(context.Background()) })
+	agm.SetSessions(sm)
+	return agm, sm
+}
+
+func TestAgentHandleTurnInjectsSkillSystemMessages(t *testing.T) {
+	dir := t.TempDir()
+	writeSkillFile(t, dir, "alpha", "alpha", "Alpha body")
+	writeSkillFile(t, dir, "beta", "beta", "Beta body")
+
+	var captured string
+	agm, sm := newSkillTestEnv(t, dir, []string{"alpha", "beta"}, "base-sys", &captured)
+
+	ctx := context.Background()
+	s, _ := sm.Create(ctx, session.CreateRequest{AgentID: "agent-sk"})
+	result, err := agm.HandleTurn(ctx, "agent-sk", TurnRequest{
+		SessionID: s.ID, TurnID: "turn_sk1", Content: "hi",
+	})
+	if err != nil {
+		t.Fatalf("HandleTurn: %v", err)
+	}
+	if result.Message.Payload.Content != "done" {
+		t.Fatalf("result content = %q", result.Message.Payload.Content)
+	}
+	// Provider 请求 body 应含 base system + alpha + beta 三个 system message。
+	if captured == "" {
+		t.Fatal("no provider request body captured")
+	}
+	var wire map[string]any
+	if err := json.Unmarshal([]byte(captured), &wire); err != nil {
+		t.Fatalf("unmarshal provider body: %v", err)
+	}
+	msgs, _ := wire["messages"].([]any)
+	if len(msgs) < 4 {
+		t.Fatalf("provider body messages len = %d, want at least 4 (base+2 skill+user), body=%s", len(msgs), captured)
+	}
+	// 顺序：base,(alpha|beta),(...),user —— alpha/beta 同层按 name 升序。
+	var roles []string
+	var contents []string
+	for _, m := range msgs {
+		mm, _ := m.(map[string]any)
+		role, _ := mm["role"].(string)
+		content, _ := mm["content"].(string)
+		roles = append(roles, role)
+		contents = append(contents, content)
+	}
+	// base sysPrompt 在第 0
+	if contents[0] != "base-sys" || roles[0] != "system" {
+		t.Fatalf("msg[0] = %q/%q, want base-sys/system", contents[0], roles[0])
+	}
+	// Skill system messages 含 "## Skill:" 前缀
+	alphaIdx := indexOf(contents, func(s string) bool { return strings.HasPrefix(s, "## Skill: alpha") })
+	betaIdx := indexOf(contents, func(s string) bool { return strings.HasPrefix(s, "## Skill: beta") })
+	if alphaIdx < 0 || betaIdx < 0 {
+		t.Fatalf("Skill system messages missing; contents=%v", contents)
+	}
+	if alphaIdx > betaIdx {
+		t.Fatalf("Skill order wrong: alpha idx=%d > beta idx=%d", alphaIdx, betaIdx)
+	}
+	// body 必须出现在请求 message（说明注入了 Skill body）
+	if !strings.Contains(contents[alphaIdx], "Alpha body") {
+		t.Fatalf("alpha content = %q, missing body", contents[alphaIdx])
+	}
+	// 最后一条是 user
+	last := contents[len(contents)-1]
+	if roles[len(roles)-1] != "user" || last != "hi" {
+		t.Fatalf("last message = %q/%q, want user/hi", roles[len(roles)-1], last)
+	}
+
+	// Skill 不写入 Session snapshot
+	got, _ := sm.Get(ctx, s.ID)
+	for _, m := range got.Messages {
+		if strings.Contains(m.Payload.Content, "## Skill:") {
+			t.Fatalf("Skill prompt leaked into Session: %+v", m.Payload)
+		}
+	}
+	if len(got.Messages) != 2 {
+		t.Fatalf("session messages = %d, want 2 (user + final assistant)", len(got.Messages))
+	}
+}
+
+func writeSkillFile(t *testing.T, dir, name, fsName, bodyLine string) {
+	t.Helper()
+	skillDir := filepath.Join(dir, fsName)
+	_ = os.MkdirAll(skillDir, 0o755)
+	_ = os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: "+name+"\ndescription: "+name+" skill\n---\n"+bodyLine+"\n"), 0o644)
+}
+
+func indexOf(items []string, pred func(string) bool) int {
+	for i, s := range items {
+		if pred(s) {
+			return i
+		}
+	}
+	return -1
 }

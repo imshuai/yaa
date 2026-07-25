@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sync/atomic"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	ctxwindow "github.com/imshuai/yaa/internal/context"
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/session"
+	"github.com/imshuai/yaa/internal/skill"
 	"github.com/imshuai/yaa/internal/storage"
 	"github.com/imshuai/yaa/internal/tool"
 	"github.com/imshuai/yaa/internal/tool/builtin"
@@ -22,15 +24,17 @@ import (
 // Runtime 是系统根容器，负责启动/停止子系统与提供健康检查。
 // Phase 1 阶段已接 Config + Storage + API；后续阶段逐步接入 Provider/Tool 等组件。
 type Runtime struct {
-	cfg       *config.Config
-	store     storage.Storage
-	providers *provider.Manager
-	sessions  *session.Manager
-	contextM  *ctxwindow.Manager
-	agents    *agent.Manager
-	tools     *tool.Manager
-	api       *api.Server
-	logger    *slog.Logger
+	cfg        *config.Config
+	configPath string
+	store      storage.Storage
+	providers  *provider.Manager
+	sessions   *session.Manager
+	contextM   *ctxwindow.Manager
+	agents     *agent.Manager
+	tools      *tool.Manager
+	skills     *skill.Manager
+	api        *api.Server
+	logger     *slog.Logger
 
 	ready      atomic.Bool
 	startedAt  time.Time
@@ -50,6 +54,12 @@ func New(cfg *config.Config, logger *slog.Logger) (*Runtime, error) {
 		logger:     logger,
 		components: map[string]string{},
 	}, nil
+}
+
+// SetConfigPath 记录主配置文件路径；启动时用于解析 skill dir 等相对主配置文件目录的字段。
+// 未调用时 skill dir 相对当前工作目录解析（与 storage path 一致）。
+func (rt *Runtime) SetConfigPath(configPath string) {
+	rt.configPath = configPath
 }
 
 // Start 按初始化顺序启动子系统并标记 Ready。
@@ -100,6 +110,22 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	rt.tools = tm
 	rt.components["tool"] = "ready"
 
+	// Skill Manager：启动期 all-or-nothing 加载 SKILL.md + Agent binding 校验
+	// （docs/skill/manager.md §3）。baseDir 取自主配置文件目录；未设置时相对 cwd。
+	baseDir := ""
+	if rt.configPath != "" {
+		if abs, aerr := filepath.Abs(rt.configPath); aerr == nil {
+			baseDir = filepath.Dir(abs)
+		}
+	}
+	skm, serr := skill.Load(rt.cfg.Skills, rt.cfg.Agents, tm, baseDir)
+	if serr != nil {
+		rt.rollback()
+		return fmt.Errorf("runtime: load skills: %w", serr)
+	}
+	rt.skills = skm
+	rt.components["skill"] = "ready"
+
 	// Context 窗口管理器
 	rt.contextM = ctxwindow.NewManager()
 
@@ -132,9 +158,10 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	rt.sessions = sm
 	rt.components["session_restore"] = "ready"
 
-	// 将 Session Manager 和 Tool Manager 注入 Agent（先前构造时为 nil，此处补全指针）
+	// 将 Session Manager / Tool Manager / Skill Manager 注入 Agent（先前构造时为 nil，此处补全指针）
 	am.SetSessions(sm)
 	am.SetTools(rt.tools)
+	am.SetSkills(rt.skills)
 	rt.agents = am
 	rt.components["agent"] = "ready"
 
@@ -238,6 +265,7 @@ func (rt *Runtime) rollback() {
 		_ = rt.agents.Shutdown(context.Background())
 	}
 	rt.tools = nil
+	rt.skills = nil
 	if rt.sessions != nil {
 		_ = rt.sessions.Shutdown(context.Background())
 	}
@@ -248,6 +276,7 @@ func (rt *Runtime) rollback() {
 		_ = rt.store.Close()
 	}
 	rt.api = nil
+	rt.skills = nil
 	rt.tools = nil
 	rt.agents = nil
 	rt.sessions = nil

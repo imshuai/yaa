@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	ctxwindow "github.com/imshuai/yaa/internal/context"
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/session"
+	"github.com/imshuai/yaa/internal/skill"
 	"github.com/imshuai/yaa/internal/tool"
 )
 
@@ -105,10 +107,26 @@ func (m *Manager) runDirectTurn(
 		if err != nil {
 			return TurnResult{Usage: totalUsage}, err
 		}
-		// canonical messages：system prompt + snapshot.Messages.Payload。
+		// canonical messages：base system prompt + Skill system messages + snapshot.Messages.Payload。
+		// 文档 docs/skill/invocation.md §2 step4：Skill system messages 位于 Agent base system
+		// prompt 之后、Memory system message 之前/Session user/history 之前。Skill 不写入 Session
+		// （每次 turn 从 Manager 不可变 snapshot 重新投影）。
 		var canonicalMsgs []provider.Message
 		if a.sysPrompt != "" {
 			canonicalMsgs = append(canonicalMsgs, provider.Message{Role: "system", Content: a.sysPrompt})
+		}
+		if m.deps.Skills != nil {
+			resolved, rerr := m.deps.Skills.ResolveForAgent(a.id)
+			if rerr != nil {
+				// 已提交 user 保留；Runtime binding 一般已校验，未知 Agent 视为运行期路由错误。
+				return TurnResult{Usage: totalUsage}, rerr
+			}
+			for _, r := range resolved {
+				canonicalMsgs = append(canonicalMsgs, provider.Message{
+					Role:    "system",
+					Content: renderSkillSystemMessage(r),
+				})
+			}
 		}
 		for _, sm := range snap.Messages {
 			canonicalMsgs = append(canonicalMsgs, sm.Payload)
@@ -274,7 +292,32 @@ func (m *Manager) runDirectTurn(
 	}
 }
 
-// resolveToolCalls 反查 Provider 返回的 wire alias 到 canonical name。
+// renderSkillSystemMessage 把 ResolvedSkill 投影为 Context 的 protected system message
+// （docs/skill/invocation.md §2）。options 用 encoding/json 编码且 HTML escaping 关闭；
+// 空 options 输出 \`{}\`。body 只保留原 UTF-8，不做模板替换或 Markdown 重写。
+func renderSkillSystemMessage(r skill.ResolvedSkill) string {
+	var b strings.Builder
+	b.WriteString("## Skill: ")
+	b.WriteString(r.Name)
+	b.WriteString("\n\nOptions:\n")
+	opts := r.Options
+	if opts == nil {
+		opts = map[string]any{}
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(opts); err != nil {
+		// options 已经过 validateOptionsJSON 校验，编码失败理论上不可达；fallback {}。
+		buf.WriteString("{}")
+	}
+	encStr := strings.TrimRight(buf.String(), "\n")
+	b.WriteString(encStr)
+	b.WriteString("\n\nInstructions:\n")
+	b.WriteString(r.Prompt)
+	return b.String()
+}
+
 // 校验：每个 Arguments 是单个合法 JSON object 且无 trailing token；alias 通过
 // projection.ResolveExecutable 精确反查；任一失败返回 ErrAgentProviderProtocol，
 // 整批 not executed、不提交 partial（docs/agent.md §5）。

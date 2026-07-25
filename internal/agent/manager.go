@@ -13,18 +13,20 @@ import (
 	ctxwindow "github.com/imshuai/yaa/internal/context"
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/session"
+	"github.com/imshuai/yaa/internal/skill"
 	"github.com/imshuai/yaa/internal/tool"
 	"golang.org/x/exp/slog"
 )
 
 // Dependencies 是 Runtime 持有并借给 Agent Manager 的对象。
-// ponytail: v1 不含 Memory/Skill；Tool 已注入；使用 nil 兼容。
+// ponytail: v1 不含 Memory；Tool/Skill 已注入；使用 nil 兼容。
 type Dependencies struct {
 	Config    *config.Config
 	Sessions  *session.Manager
 	Context   *ctxwindow.Manager
 	Providers *provider.Manager
 	Tools     *tool.Manager
+	Skills    *skill.Manager
 	Logger    *slog.Logger
 }
 
@@ -253,5 +255,12 @@ func (m *Manager) SetSessions(sm *session.Manager) {
 func (m *Manager) SetTools(tm *tool.Manager) {
 	m.mu.Lock()
 	m.deps.Tools = tm
+	m.mu.Unlock()
+}
+
+// SetSkills 延迟注入 Skill Manager（Runtime 在 Tool Manager 之后才创建 Skill Manager 并完成 Agent binding）。
+func (m *Manager) SetSkills(sm *skill.Manager) {
+	m.mu.Lock()
+	m.deps.Skills = sm
 	m.mu.Unlock()
 }

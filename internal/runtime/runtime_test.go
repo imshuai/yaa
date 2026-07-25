@@ -30,6 +30,7 @@ func TestRuntimeStartMarksReadyAndHealth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	rt.cfg.Skills.Dir = t.TempDir()
 	ctx := context.Background()
 	if err := rt.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -62,6 +63,7 @@ func TestRuntimeStartMarksReadyAndHealth(t *testing.T) {
 
 func TestRuntimeShutdownClearsReady(t *testing.T) {
 	rt, _ := New(newTestConfig(), nil)
+	rt.cfg.Skills.Dir = t.TempDir()
 	ctx := context.Background()
 	if err := rt.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -98,6 +100,7 @@ func TestRuntimeE2EHealthHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	rt.cfg.Skills.Dir = t.TempDir()
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
