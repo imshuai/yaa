@@ -250,3 +250,43 @@ func TestRuntimeMemoryVectorStartupReindex(t *testing.T) {
 		t.Fatal("rt.memory is nil")
 	}
 }
+
+// TestRuntimeMemoryRemoteAPIProviderInjected 证明 Runtime.Start 在 Memory.Enabled=true
+// 时把 memory provider + resolver 注入到 API Server：HTTP 调 memory 端点对未知 agent
+// 应返 40401（resolver 返 ok=false），而不是 50301（provider 未注入）。
+func TestRuntimeMemoryRemoteAPIProviderInjected(t *testing.T) {
+	cfg := newTestConfig()
+	cfg.Memory.Enabled = true
+	cfg.Memory.Storage.Type = "memory"
+	cfg.Memory.Vector.Enabled = false
+
+	rt, err := New(cfg, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rt.cfg.Skills.Dir = t.TempDir()
+	ctx := context.Background()
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = rt.Shutdown(shutdownCtx)
+	})
+
+	addr := rt.APIAddr()
+	// GET /api/v1/agents/unknown/memory：resolver 对未知 agent 返 (policy, false) → 40401。
+	resp, err := http.Get("http://" + addr + "/api/v1/agents/unknown/memory")
+	if err != nil {
+		t.Fatalf("http get: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s, want 404 (resolver injected, agent unknown)", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"code":40401`)) {
+		t.Fatalf("body missing code=40401: %s", body)
+	}
+}

@@ -240,6 +240,12 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	rt.api.SetSessionProvider(sm, rt.agentAPIShim())
 	rt.api.SetAgentProvider(am)
 	rt.api.SetSessionManager(sm)
+	// 注入 Memory Remote API：仅当 Memory Manager 已构造（Memory.Enabled=true）。
+	// resolver 从当前 config snapshot 计算 effective policy；Memory 全局 disabled 时
+	// rt.memory == nil，handler 统一返 50301（子系统未启用），operator 不应调用 disabled 子系统。
+	if rt.memory != nil {
+		rt.api.SetMemoryProvider(rt.memory, rt.memoryPolicyResolver())
+	}
 	if err := rt.api.Start(ctx); err != nil {
 		rt.rollback()
 		return err
@@ -386,6 +392,30 @@ func (rt *Runtime) agentSessionOverride(agentID string) *config.SessionOverride 
 		}
 	}
 	return nil
+}
+
+// agentMemoryOverride 返回某 Agent 的 Memory override（可为 nil）。
+func (rt *Runtime) agentMemoryOverride(agentID string) *config.MemoryOverride {
+	for _, a := range rt.cfg.Agents {
+		if a.ID == agentID {
+			return a.Memory
+		}
+	}
+	return nil
+}
+
+// memoryPolicyResolver 构造 Memory Remote API 用的 policy 解析闭包。
+// 仅当对应 agentID 存在于 config 时返 (policy, true)；
+// runtime 已保证调用前 rt.memory != nil（即 root Memory.Enabled=true）。
+// 单个 agent 的 effective policy.Enabled 可被 agent override 关闭，此时 Manager
+// 方法返 ErrMemoryDisabled，handler 映射 40901。
+func (rt *Runtime) memoryPolicyResolver() api.MemoryPolicyResolver {
+	return func(agentID string) (config.MemoryPolicy, bool) {
+		if !rt.agentExists(agentID) {
+			return config.MemoryPolicy{}, false
+		}
+		return config.ResolveMemoryPolicy(rt.cfg.Memory, rt.agentMemoryOverride(agentID)), true
+	}
 }
 
 // agentAPIShim 实现 api.AgentExistsProvider，供 Session REST 端点校验 Agent。

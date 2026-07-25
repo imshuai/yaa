@@ -20,27 +20,43 @@ func (s *Server) registerSessionRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/sessions/", s.handleSessions)     // :id...sub-resource
 }
 
-// handleAgentsSessions 处理 /api/v1/agents/:id/sessions 的 POST/GET。
+// handleAgentsSessions 处理 /api/v1/agents/:id/sessions POST/GET 与
+// /api/v1/agents/:id/memory/... 子资源 8 端点（docs/remote-api/memory.md）。
+// Auth wrapping 的 registerProtected 精细化 spec 绑定留待后续 wrap-only 接入
+// （progress #6 决策记录：现有 sessions 同样未走 wrapper，与 memory 保持一致）。
 func (s *Server) handleAgentsSessions(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	sp := s.sessions
-	ae := s.agentExists
-	s.mu.Unlock()
-	if sp == nil {
-		s.writeError(w, r, http.StatusServiceUnavailable, 50301, "runtime not ready")
-		return
-	}
-
-	// 路径: /api/v1/agents/:id/sessions
+	// 路径: /api/v1/agents/:id/<sub>
 	rest := strings.TrimPrefix(r.URL.Path, "/api/v1/agents/")
 	parts := strings.SplitN(rest, "/", 2)
-	if len(parts) < 2 || parts[1] != "sessions" {
+	if len(parts) < 2 || parts[1] == "" {
 		s.writeError(w, r, http.StatusNotFound, 40401, "resource not found")
 		return
 	}
 	agentID, err := url.PathUnescape(parts[0])
 	if err != nil || agentID == "" {
 		s.writeError(w, r, http.StatusBadRequest, 40001, "invalid agent id")
+		return
+	}
+	sub := parts[1]
+
+	// /api/v1/agents/:id/memory[/:key | /promote | /reindex]
+	if sub == "memory" || strings.HasPrefix(sub, "memory/") {
+		s.handleMemorySubtree(w, r, agentID, sub)
+		return
+	}
+
+	if sub != "sessions" {
+		s.writeError(w, r, http.StatusNotFound, 40401, "resource not found")
+		return
+	}
+
+	// sessions 子资源：需要 SessionProvider
+	s.mu.Lock()
+	sp := s.sessions
+	ae := s.agentExists
+	s.mu.Unlock()
+	if sp == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, 50301, "runtime not ready")
 		return
 	}
 

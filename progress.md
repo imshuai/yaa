@@ -606,3 +606,68 @@ Agent turn 内按 docs/agent.md §4 + docs/tool/provider.md §3-§5 完整走 To
 - go test -count=1 ./internal/memory/vector/ + ./internal/memory/embedding/ + ./internal/memory_test/：全绿（含 4+8+3 例）。
 - go test -count=1 ./internal/runtime/：含新 1 例全绿。
 - go test -count=1 ./...：除 `TestWSStreamDisconnectCancelsTurn` 偶发 timing flake（已记录）外全绿。
+
+## Phase 3 下一步 #4：Memory Remote API 8 端点 + Runtime 注入（commit 待 push）
+
+按 `docs/remote-api/memory.md` §1-§8 + `docs/memory/errors.md §7` 落地 Memory 的 Remote API。
+
+### `internal/api/memory_provider.go`（新文件）
+- `MemoryProvider` 接口 8 方法（Search/Get/Put/Delete/Clear/Promote/Reindex + IndexStatus），除 IndexStatus 外每方法接 `config.MemoryPolicy`（architecture.md §2：Manager 不缓存 policy）。
+- `MemoryPolicyResolver func(agentID string) (config.MemoryPolicy, bool)`：从 config snapshot 解 effective policy；ok=false 表示 agent 不存在。
+
+### `internal/api/server.go` 改动
+- Server 加 `memoryProvider MemoryProvider` + `memoryResolver MemoryPolicyResolver` 字段（mu 保护）。
+- `SetMemoryProvider(mp, resolver)` setter；nil mp → Memory 8 端点统一返 50301 "memory subsystem unavailable"。
+
+### `internal/api/session_handler.go` dispatcher 改动
+- `handleAgentsSessions` 拓展为 `/api/v1/agents/:id/<sub>` 全 dispatcher：先 TrimPrefix + SplitN 解 out `agentID` 与 `sub`。
+- `sub == "memory" || HasPrefix("memory/")` → `s.handleMemorySubtree(w, r, agentID, sub)`；否则 `sub == "sessions"` 走原 sessions handler；其余 → 40401。
+- Memory 8 端点与 sessions 共用同 prefix dispatcher，都未走 Auth wrapper（progress #6 决策记录：Go 1.20 ServeMux 不支持 path template，同 prefix 不能重复 registerProtected；精细化 spec 绑定留待后续 wrap-only 接入）。
+
+### `internal/api/memory_handler.go`（新文件，~490 行）
+- DTO（docs §DTO）：`memoryDTO`（单 item + index_status）、`memorySearchItemDTO`（带 score）、`memorySearchData{items, limit, index_status}`、`memoryPostBody`、`memoryDeleteOneData`、`memoryClearData`、`memoryPromoteBody`、`memoryReindexData`。时间统一 RFC3339Nano UTC，zero time ExpiresAt → nil。
+- `handleMemorySubtree` 按 sub（"memory" 或 "memory/<suffix>"）+ Method dispatch：
+  - `GET /memory` → Search；`GET /memory/:key` → Get；`GET /memory/(promote|reindex)` → 40501。
+  - `POST /memory` → Put；`POST /memory/promote` → Promote；`POST /memory/reindex` → Reindex；其他 suffix → 40501。
+  - `DELETE /memory` → Clear；`DELETE /memory/:key` → DeleteOne；`DELETE /memory/(promote|reindex)` → 40501。
+  - 其他 method → 40501。
+- 8 sub-handler：
+  - `handleMemorySearch`：解析 `q/session_id/limit/include_global/metadata`(JSON) query；`include_global` 必须配非空 `session_id`（否则 40001）；limit 范围 `[0, MaxSearchLimit]`；构造 `SearchRequest{Scope, Query, Limit, Metadata, IncludeGlobal}` 调 `mp.Search`；resp 带 `index_status`（调 `mp.IndexStatus(agentID)`）。
+  - `handleMemoryGet`：`requireSessionIDQuery`（session_id 必填 query，显式空表 global item）；调 `mp.Get`。
+  - `handleMemoryPut`：`io.LimitReader(1MiB)` 读 body + `json.Unmarshal memoryPostBody`；key/content/metadata/expires_at 校验（key 长度 `[1, MaxKeyLen]`、content `[1, MaxContentLen]`、metadata marshal 后 `<= MaxMetadataLen`、expires_at RFC3339Nano）；构造 `MemoryItem{Layer:LayerLongTerm, ...}` 调 `mp.Put`；created → 201，update → 200。
+  - `handleMemoryDeleteOne`：`requireSessionIDQuery` + 调 `mp.Delete`；resp `memoryDeleteOneData{deleted:true,...}`。
+  - `handleMemoryClear`：session_id 可省（agent 全范围）；调 `mp.Clear`；resp `memoryClearData{deleted_count, ...}`。
+  - `handleMemoryPromote`：读 body + DisallowUnknownFields 风格 json；`SessionID` 和 `Key` 必填（40001）；调 `mp.Promote`；created → 201 else 200。
+  - `handleMemoryReindex`：`!policy.Vector.Enabled` → 40001；调 `mp.Reindex`；resp `memoryReindexData{indexed, status, ...}`。
+- `requireSessionIDQuery`: 区分"未传 session_id query"（→ 40001）vs "显式 `?session_id=`"（表 global item，合法）；docs §1/§2 明示 session_id 是必填 query 即使空串。
+- `writeMemoryError` 按 `docs/memory/errors.md §7` 映射全 sentinel：
+  - `context.Canceled`（err 或 request ctx.Err()）→ 不写响应（客户端已断开）。
+  - `context.DeadlineExceeded` → 504 / 50401。
+  - `ErrMemoryNotFound` → 404 / 40401。
+  - `ErrMemoryDisabled` → 409 / 40901。
+  - `ErrMemoryQuota` → 429 / 42901。
+  - `ErrMemoryInvalidScope/InvalidItem/ManagedField/UnsupportedLayer/ExpiredInput` → 400 / 40001。
+  - 其他（含 closed / store unavailable / corrupt / embedding / index unavailable / index degraded / ReindexFailed）→ 503 / 50301。
+- helper：`toMemoryDTO` / `toSearchItemDTO` / `formatMemoryTime`（zero → ""）/ `formatMemoryExpiresAt`（nil 或 zero → nil；否则 RFC3339Nano UTC）。
+
+### `internal/api/memory_handler_test.go`（新文件，~25 例）
+- `fakeMemoryProvider` 实现 8 方法 + lastXxx 捕获；`fakeMemoryResolver(policy)` closure；`enabledMemoryPolicy()` 默认 Enabled=true/Vector=false。
+- `newMemoryTestServer` 构造 Server + `SetMemoryProvider`；`doMem` body 支持 `io.Reader`（原样透传，用于非法 JSON 测试）/ nil / 其他（json.Marshal）。
+- happy path：Search（含 index_status）/ Get / Get global empty session_id / Put created 201 / Put update 200 / DeleteOne / Clear 带 session_id / Clear 不带 session_id / Promote / Reindex（vector enabled）。
+- 边界：Search include_global 无 session_id → 40001；Get 缺 session_id 参数 → 40001；Put 空 key → 40001；Put 非法 JSON body → 400；Promote 缺 session_id/key → 40001；Reindex vector disabled → 40001；Method 不允许（PUT）→ 40501；unknown agent → 40401。
+- error mapping：NotFound 40401 / Disabled 40901 / Quota 42901 / InvalidItem 40001 / StoreUnavailable 50301 / ReindexFailed 50301；mp=nil（未注入）→ 50301。
+- `TestMemoryGetNoSessionsPathUnchanged`：用真实 session.Manager + storage.NewMemory + fakeAgentProvider 验证 memory dispatcher 没吃掉 sessions 子路径（GET /agents/a/sessions ≠ 404）。
+
+### `internal/runtime/runtime.go` 注入
+- `agentMemoryOverride(agentID)` helper 从 cfg.Agents 找 Memory override。
+- `memoryPolicyResolver()` 构造 closure：`agentExists` 返 false → `(MemoryPolicy{}, false)` → handler 40401；否则 `config.ResolveMemoryPolicy(rt.cfg.Memory, override)`。
+- Start 段：Memory.Manager 构造成功（`rt.memory != nil`）后 `rt.api.SetMemoryProvider(rt.memory, rt.memoryPolicyResolver())`；Memory 全局 disabled 时 rt.memory==nil，handler 统一 50301（进度记录：operator 不应调用 disabled 子系统；严格 40901 留待后续 wrap-only spec 绑定时再补 disabled stub）。
+
+### `internal/runtime/runtime_test.go` 增 1 例
+- `TestRuntimeMemoryRemoteAPIProviderInjected`：`cfg.Memory.Enabled=true` + Storage=memory（无 agent）→ Start 成功 → HTTP GET `/api/v1/agents/unknown/memory` → 期望 40401（resolver 对未知 agent 返 ok=false，证明 provider+resolver 被注入；若未注入则 50301）。
+
+### 验证
+- go vet / go build ./...：通过。
+- go test -count=1 ./internal/api/：含新 ~25 例全绿，原 sessions/conversation/ws/auth 测试无 regression。
+- go test -count=1 ./internal/runtime/：含新 1 例全绿。
+- go test -count=1 ./...：除 `TestWSStreamDisconnectCancelsTurn` 偶发 timing flake（已记录）外全绿。

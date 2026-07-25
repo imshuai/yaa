@@ -53,9 +53,11 @@ type Server struct {
 	server      *http.Server
 	health      HealthProvider
 	sessions    SessionProvider
-	agentExists AgentExistsProvider
-	agents      AgentProvider
-	sessionMgr  *session.Manager
+	agentExists   AgentExistsProvider
+	agents        AgentProvider
+	sessionMgr    *session.Manager
+	memoryProvider MemoryProvider
+	memoryResolver MemoryPolicyResolver
 	// v1 Auth：由 Runtime 在 Start 时经 SetAuth 注入；nil 或 disabled 表示
 	// 整体绕过 AuthN/AuthZ（仅 loopback 或已强校验的回环监听场景下）。
 	authz         auth.Authorizer
@@ -107,6 +109,16 @@ func (s *Server) SetAgentProvider(ap AgentProvider) {
 func (s *Server) SetSessionManager(sm *session.Manager) {
 	s.mu.Lock()
 	s.sessionMgr = sm
+	s.mu.Unlock()
+}
+
+// SetMemoryProvider 注入 Memory Manager + policy resolver（docs/remote-api/memory.md §1）。
+// Runtime 在 Memory Manager 构造完成 + 配置 snapshot 可得时调用。
+// nil mp 表示 Memory subsystem 未启用，Memory 8 端点统一 50301。
+func (s *Server) SetMemoryProvider(mp MemoryProvider, resolver MemoryPolicyResolver) {
+	s.mu.Lock()
+	s.memoryProvider = mp
+	s.memoryResolver = resolver
 	s.mu.Unlock()
 }
 
