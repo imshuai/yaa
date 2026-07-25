@@ -352,3 +352,54 @@ Agent turn 内按 docs/agent.md §4 + docs/tool/provider.md §3-§5 完整走 To
 - `go vet ./...` / `go build ./...`：0 issue / 0 error。
 - `go test -count=1 -timeout 120s ./...`：全部 ok（agent/api/config/context/logging/provider/runtime/session/storage/tool/tool/builtin）。
 - WS 取消延迟 race 一度在混合时间窗观察到 transient fail（测试内 `time.Sleep 200ms` 固有计时误差），重测单测 + count=20 稳定绿。
+
+## 环境正规化（2026-07-25）
+
+- Go 1.20 工具链从 `/tmp/go1.20.14` 搬到 `/usr/local/go`（Go 官方标准位置），包布局保留。
+- 系统级符号链接：`/usr/local/bin/go` → `/usr/local/go/bin/go`、`/usr/local/bin/gofmt` → `/usr/local/go/bin/gofmt`。`/usr/local/bin` 已在系统默认 PATH，任何 shell（含 codex sandbox/非登录）直接 `go` 即用，无需 export PATH。
+- `~/.bashrc` 删除临时的 `export PATH=/tmp/go1.20.14/bin:$PATH` 块；保留代理设置（`HTTP_PROXY/HTTPS_PROXY=http://192.168.4.1:7890`、`GOPROXY=https://goproxy.cn,direct`、`GOSUMDB=sum.golang.org`）。
+- 验证：直接 `go version` → go1.20.14 linux/arm64；`go build ./...` 通过；env 变量覆盖生效（`GOPROXY=https://goproxy.cn,direct`）。
+
+## Phase 3 Skill 系统（commit `947ac61`，已推送 gitea/main）
+
+### 范围
+
+按 `docs/skill/`：v1 Skill Manager（静态配置注入 + graph 校验 + per agent 投影）+ Agent turn 系统消息注入。
+
+### internal/skill（新包，4 文件）
+
+- `errors.go`：11 sentinel（`ErrSkillDirectoryUnavailable`/`ErrSkillNotFound`/`ErrSkillInvalid`/`ErrSkillDuplicate`/`ErrSkillDependencyMissing`/`ErrSkillDependencyCycle`/`ErrSkillDisabled`/`ErrSkillToolUnavailable`/`ErrSkillPermissionDenied`/`ErrSkillAgentNotFound`/`ErrSkillOptionsInvalid`）。
+- `types.go`：`Status="loaded"|"disabled"`、`Skill{Name,Description,Version,Author,Tools,Skills,Options,Prompt}`、`Entry`、`ResolvedSkill{Name,Options,Prompt}`、`Manager`。常量上限：`maxSkillFile=1MB`、`maxDescription=4096`、`maxPromptBody=256KB`、`maxOptionsBytes=64KB`、`maxDepsPerCategory=64`。`skillNameRE=^[a-z0-9][a-z0-9-]{0,63}$`。`DefaultSkillDir="./skills"`。
+- `frontmatter.go`：`parseSkillFile` 严格解析 SKILL.md（文件上限→splitFrontmatter→yaml Decoder KnownFields→name==dir→description/版本/SemVer[prepend v]→列表去重上限/JSON options/空 body）。helper：`normalizeCRLF`、`validateDepsList`、`validateOptionsJSON`。
+- `manager.go`：`Load(skillsCfg, agents, tm, baseDir)` all-or-nothing——dir 解析 + ReadDir + Lstat 拒 symlink（`ModeSymlink` 显式 `ErrSkillInvalid`）+ 按目录名升序 + `parseSkillFile` + 索引唯一 + `validateSkillGraph`（DFS 环检测含 chain）+ per_skill 存在性 + entries map（含 status）+ 每 Agent `resolveForAgent`（allowlist 空不用、dep 必须在 allowlist、Tool 必须存在 + enabled + CheckPermission、options shallow merge、拓扑序去重）。`Get/List/ResolveForAgent` 深拷贝。
+
+### Runtime 接入（`internal/runtime/runtime.go`）
+
+- 加 `configPath`/`skills *skill.Manager` 字段、`SetConfigPath` setter。`cmd/yaa/main.go` 调用注入配置文件路径。
+- `Start` 在 Tool Manager ready 后 `skill.Load(rt.cfg.Skills, rt.cfg.Agents, tm, baseDir)`（baseDir = configPath Dir 或 cwd）+ components["skill"]="ready"。Shutdown 逆序 `rt.skills=nil`。`am.SetSkills(rt.skills)`。
+- 默认 `./skills` 目录缺失 = 启动失败（docs 强约束）；仓根建 `skills/.gitkeep` 让默认 cwd 启动可跑；`internal/runtime/runtime_test.go` 3 处 Start test 用 `t.TempDir()` 作为 skill dir。
+
+### Agent 接入（`internal/agent/{manager,handle_turn,handle_turn_test}.go`）
+
+- `manager.go`：`Dependencies` 加 `Skills *skill.Manager`；`SetSkills(sm)` 方法。
+- `handle_turn.go` `runDirectTurn`：每轮 base sysPrompt 之后按拓扑序注入 Skill 系统消息（`Skills.ResolveForAgent(a.id)` → 每个 `renderSkillSystemMessage(r)`）。helper：`renderSkillSystemMessage` 渲染 `## Skill: <name>\n\nOptions:\n<json HTMLescape 关闭>\n\nInstructions:\n<body>`。Skill 不进 Session，每轮从 Manager 不可变 snapshot 重新投影。
+- 测试：`newSkillTestEnv` + `TestAgentHandleTurnInjectsSkillSystemMessages` + `writeSkillFile`/`indexOf` helper。验证 base + alpha + beta + user 顺序、alpha<beta、body 注入、Skill 不进 Session。
+
+### 决策
+
+- **Skill dir 解析基准**：docs 说"相对主配置文件目录"。Runtime 无 configPath → 加 `SetConfigPath` setter，有 configPath 时 baseDir=Dir(Abs(configPath))，否则 cwd（与 storage path 一致）。
+- **Symlink 拒绝**：os.ReadDir 的 `DirEntry.IsDir()` 对 symlink-to-dir 在 Unix 返回 false（默默跳过）；改用 `os.Lstat` 检 `ModeSymlink` 显式 `ErrSkillInvalid`。
+- **Dup name 跨 dir 不可达**：frontmatter.name 必须==dir，两个不同 dir 同名 Skill 必触发 `ErrSkillInvalid`（name/dir mismatch）而非 `ErrSkillDuplicate`。
+- **YAML SemVer**：`x/mod/semver.IsValid` 需 `v` 前缀；frontmatter.Version 支持 `1.0.0` 与 `v1.0.0`（prepend v 校验）。
+- **Options 合并**：SK-007 顶层 shallow merge（frontmatter→root per_skill→agent skills_config），不递归/不 append array。
+- **tool.Manager 空 allowlist = AllowAll**：skill test 测"agent 不允许 http"时不能传 `[]string{}`，改用 `["zzz-stub-tool-example"]`（非空但不含 http）。
+
+### 验证
+
+- `go vet ./...` / `go build ./...`：0 issue / 0 error。
+- `go test`：internal/skill 18 例全绿；internal/agent (含 skill 注入测试) 绿；runtime/session/tool/api 包全 ok，无 regression。
+- WS TestWSStreamDisconnectCancelsTurn count=30 全绿；先前 count=20 偶发 `turn id already used` 是测试内 `time.Sleep(200ms)` 固有 timing flake，并非 `runturn.go` `cancel(err)` 改动引入（`errorFrameFromTurnError` 用 `errors.Is(err, context.Canceled)`，`ProviderError.Unwrap()` 透出 `context.Canceled` 仍可命中）。
+
+### 下一步
+
+- Phase 3 后续：Memory 系统 / Planner / Auth 认证（按 roadmap 顺序）。
