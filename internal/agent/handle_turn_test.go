@@ -97,6 +97,9 @@ func newToolLoopEnv(t *testing.T, handler func(callIdx int) map[string]any, tota
 		}},
 		Context: config.ContextConfig{MaxTokens: 0, ReservedTokens: 1500, Strategy: "truncate"},
 		Session: sessCfg,
+		// 修复 test env flake：DefaultTimeout=0 会导致 time.AfterFunc(0) 立即 fire cancel
+		// 让 echo Execute 在 goroutine 调度下偶发被判超时（生产 cfg 经 validation 必 >0）。
+		Tools:   config.DefaultToolsConfig(),
 	}
 
 	tm, err := tool.NewManager(tool.Dependencies{Config: cfg, Providers: pm})
@@ -350,6 +353,8 @@ func newSkillTestEnv(t *testing.T, skillsDir string, agentSkills []string, sysPr
 		Context: config.ContextConfig{MaxTokens: 0, ReservedTokens: 3500, Strategy: "truncate"},
 		Session: sessCfg,
 		Skills:  config.SkillsConfig{Dir: skillsDir, PerSkill: map[string]config.SkillItemConfig{}},
+		// 同 newToolLoopEnv：补合法 tools.timeout 避免 zero-timeout flake。
+		Tools:   config.DefaultToolsConfig(),
 	}
 
 	// Tool Manager（Agent.Skill 无 Tool 依赖时也需存在以便 Agent.Deps 字段类型匹配，可空注册）。

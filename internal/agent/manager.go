@@ -1,5 +1,5 @@
 // Package agent 是 Provider、Session、Context、Memory、Tool、Skill 和 Planner 的唯一编排 owner。
-// Phase 2 最小实现：Status 生命周期 + direct turn（无 Tool/Memory/Skill）。
+// Phase 3 实现：Status 生命周期 + direct turn（含 Tool/Skill/Memory 注入；Planner 待后续）。
 package agent
 
 import (
@@ -11,6 +11,7 @@ import (
 
 	"github.com/imshuai/yaa/internal/config"
 	ctxwindow "github.com/imshuai/yaa/internal/context"
+	mm "github.com/imshuai/yaa/internal/memory"
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/session"
 	"github.com/imshuai/yaa/internal/skill"
@@ -19,7 +20,7 @@ import (
 )
 
 // Dependencies 是 Runtime 持有并借给 Agent Manager 的对象。
-// ponytail: v1 不含 Memory；Tool/Skill 已注入；使用 nil 兼容。
+// Memory 为 nil 表示该 Agent 未启用 Memory（runDirectTurn 跳过检索注入）。
 type Dependencies struct {
 	Config    *config.Config
 	Sessions  *session.Manager
@@ -27,6 +28,7 @@ type Dependencies struct {
 	Providers *provider.Manager
 	Tools     *tool.Manager
 	Skills    *skill.Manager
+	Memory    *mm.Manager
 	Logger    *slog.Logger
 }
 
@@ -132,14 +134,18 @@ func (m *Manager) Inspect(id string) (Detail, error) {
 	if !ok {
 		return Detail{}, fmt.Errorf("%w: %s", ErrAgentNotFound, id)
 	}
-	// ponytail: v1 无 Tools/Skills/Memory/Planner 冻结
+	// MemoryEnabled：Memory deps 注入 + effective policy.Enabled。
+	memEn := false
+	if m.deps.Memory != nil {
+		memEn = m.resolveMemoryPolicy(a).Enabled
+	}
 	return Detail{
 		Info: Info{
 			ID: a.id, Name: a.name, Provider: a.provider, Model: a.model, Status: a.status,
 		},
 		Tools:          []string{},
 		Skills:         []string{},
-		MemoryEnabled:  false,
+		MemoryEnabled:  memEn,
 		PlannerEnabled: false,
 	}, nil
 }
@@ -262,5 +268,13 @@ func (m *Manager) SetTools(tm *tool.Manager) {
 func (m *Manager) SetSkills(sm *skill.Manager) {
 	m.mu.Lock()
 	m.deps.Skills = sm
+	m.mu.Unlock()
+}
+
+// SetMemory 延迟注入 Memory Manager（Runtime 在 Memory Manager 构造完成后调用）。
+// nil 表示禁用 Memory 检索注入。
+func (m *Manager) SetMemory(mem *mm.Manager) {
+	m.mu.Lock()
+	m.deps.Memory = mem
 	m.mu.Unlock()
 }

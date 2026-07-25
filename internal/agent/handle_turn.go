@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/imshuai/yaa/internal/config"
 	ctxwindow "github.com/imshuai/yaa/internal/context"
+	mm "github.com/imshuai/yaa/internal/memory"
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/session"
 	"github.com/imshuai/yaa/internal/skill"
@@ -126,6 +128,33 @@ func (m *Manager) runDirectTurn(
 					Role:    "system",
 					Content: renderSkillSystemMessage(r),
 				})
+			}
+		}
+		// Memory system message：仅第一轮注入（docs/memory/integration.md §2 step1-2）。
+		// 用本轮 user content (req.Content) 作 SearchRequest.Query，scope 为 Agent + 当前 Session + LayerLongTerm，IncludeGlobal=true。
+		// Limit=0 让 Manager 使用 effective vector.top_k。除 ErrMemoryDisabled 外，读取失败一律阻断 turn。
+		// memory system message 不写入 Session（docs/memory/integration.md §3 + §8.3）。
+		if rounds == 0 && m.deps.Memory != nil {
+			policy := m.resolveMemoryPolicy(a)
+			results, merr := m.deps.Memory.Search(ctx, policy, mm.SearchRequest{
+				Scope: mm.Scope{AgentID: a.id, SessionID: req.SessionID, Layer: mm.LayerLongTerm},
+				Query:           req.Content,
+				Limit:           0,
+				IncludeGlobal:   true,
+			})
+			if merr != nil {
+				if !errors.Is(merr, mm.ErrMemoryDisabled) {
+					return TurnResult{Usage: totalUsage}, fmt.Errorf("recall memory: %w", merr)
+				}
+			} else {
+				memContent, dropped := formatMemoryResults(results)
+				if memContent != "" {
+					canonicalMsgs = append(canonicalMsgs, provider.Message{Role: "system", Content: memContent})
+					if dropped > 0 && m.deps.Logger != nil {
+						m.deps.Logger.Warn("memory inject dropped results over 32KiB cap",
+							"agent", a.id, "session", req.SessionID, "dropped", dropped)
+					}
+				}
 			}
 		}
 		for _, sm := range snap.Messages {

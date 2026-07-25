@@ -484,3 +484,33 @@ Agent turn 内按 docs/agent.md §4 + docs/tool/provider.md §3-§5 完整走 To
 3. VectorIndex exact cosine + Embedder HTTP（OpenAI-compatible `/embeddings`）；启动期 Reindex。
 4. Memory Remote API 8 端点（GET/search + GET/:key + POST + DELETE + DELETE-clear + POST/promote + POST/reindex），handler 入口 snapshot + policy，错误映射按 errors §7。
 5. 文档：补 W1-W10 剩余表述澄清项（W1 时间戳 / W2 / W4 tokens[].roles 默认）。
+
+## Phase 3 下一步 #1：Agent turn Memory 检索注入 Context（commit 待 push）
+
+按 `docs/memory/integration.md §2-§3` 落地 Agent 在 direct turn 第一轮注入 Memory system message：
+- `internal/agent/manager.go`：`Dependencies` 加 `Memory *mm.Manager` 字段（mm alias of internal/memory）；新增 `SetMemory(mem)` 延迟注入 setter；`Inspect` 的 `MemoryEnabled` 改为反映 deps.Memory 非 nil 且 `resolveMemoryPolicy(a).Enabled`；包注释更新到 Phase 3。
+- `internal/agent/memoryinject.go`（新文件）：
+  - `resolveMemoryPolicy(a)`：从 root `cfg.Memory` + Agent override `cfg.Agents[id].Memory` 解析 effective `config.MemoryPolicy`（v1 不依赖 ReloadManager，每轮从 deps.Config 重新解析，与 `resolveAgentContextConfig` 同惯例）。
+  - `const memoryInjectMaxBytes = 32 * 1024`（文档 §3 固定上限，非 MemoryConfig 字段）。
+  - `formatMemoryResults(results) (content string, dropped int)`：按 Search 返回顺序输出（不重新排序），只读 Content + Key，不输出 Score 与 Metadata（v1 白名单未定避免泄露敏感字段）；`escapeMemoryText` 固定转义 `\n` `\t` `\r` 删除其他 0x00-0x1F ASCII 控制字符防伪造 role/Tool protocol；32 KiB UTF-8 上限，超限丢弃最末未追加项并返回 dropped 计数（仅用于日志，不修改 Session）。
+  - `indexOfResult` 删去（直接 `for i, r := range` 用 i 算 dropped）。
+- `internal/agent/handle_turn.go`：import 加 `errors` + `mm "github.com/imshuai/yaa/internal/memory"`；在 `runDirectTurn` 每轮 canonical messages 组装中、Skill system messages 之后、`for _, sm := range snap.Messages` 之前插入 memory 注入块（仅 `rounds==0 && m.deps.Memory != nil`）：
+  - `policy := m.resolveMemoryPolicy(a)`
+  - `Search(ctx, policy, mm.SearchRequest{Scope: {AgentID, SessionID: req.SessionID, Layer: LayerLongTerm}, Query: req.Content, Limit: 0, IncludeGlobal: true})`
+  - `merr != nil && !errors.Is(merr, mm.ErrMemoryDisabled)` → `return TurnResult{Usage: totalUsage}, fmt.Errorf("recall memory: %w", merr)` 阻断 turn（除 ErrMemoryDisabled 外一律阻断，符合 §2 step1 "不返回伪造空结果"）
+  - 命中则 `formatMemoryResults` → 非空 content 追加一条 system message；dropped>0 时 `m.deps.Logger.Warn` 记录。
+  - Memory system message 不写入 Session（不进 `snap.Messages.Payload`）。
+- `internal/runtime/runtime.go`：`am.SetSkills(rt.skills)` 之后加 `am.SetMemory(rt.memory)`（与 SetTools/SetSkills 同期注入）。
+- `internal/agent/memory_inject_test.go`（新文件，4 例）：
+  - `newMemoryInjectEnv`：复用 skill 测试模式构造环境，注入真实 `mm.NewManager(memstore.New(), nil, nil, SystemClock{}, nil)` + `cfg.Memory.Enabled=true/vector.Enabled=false/Storage.Type=memory`；捕获 provider 请求 body。
+  - `TestAgentHandleTurnInjectsMemorySystemMessage`：Put 2 个 Session-scoped item（k1 "preference.answer_style" / k2 "topic.last"），user content="user" 命中两条 content substring；断言 provider body 是 base+memory+user 三条，memory message 含 "The following are recalled memory entries" 头 + 两个 item content + 不含 "Score"；不写入 Session snapshot（session 仍只有 user+final assistant 2 条）。
+  - `TestAgentHandleTurnMemoryDisabledSkipsInject`：cfg.Memory.Enabled=false → Search 返 ErrMemoryDisabled → 静默降级，turn 正常返回 "done"，body 不含 memory message。
+  - `TestAgentHandleTurnMemoryNilSkipsInject`：`SetMemory(nil)` → 整段注入逻辑跳过，body 不含 memory message。
+  - `TestAgentHandleTurnMemoryNonDisabledErrorBlocksTurn`：先 `memMgr.Close(ctx)` 让后续 Search 返 `ErrMemoryClosed`（非 disabled）；HandleTurn 返回 `errors.Is(err, mm.ErrMemoryClosed)`，Session 仅含 user（turn 阻断）。
+- 顺手修复已有 `TestAgentHandleTurnWithToolLoop` flake：`newToolLoopEnv`/`newSkillTestEnv` 的 `cfg.Tools` 原 zero value（`DefaultTimeout=0`）违反 `docs/config/validation.md §461`，导致 `time.AfterFunc(0)` 立即 fire cancel，echo Execute 在 goroutine 调度压力下偶发被判超时。改两处 `cfg.Tools = config.DefaultToolsConfig()`（生产 cfg 经 validation 必 DefaultTimeout>0，测试 env 补齐即可），5 次全绿。
+- 已知非我方引入的 `TestWSStreamDisconnectCancelsTurn` timing flake（count 大时偶发）不在本轮修复范围，单跑 5/5 全绿。
+
+### 验证
+- go vet / go build ./...：通过。
+- go test -count=2 ./internal/{agent,memory_test,config,runtime}/：全绿。
+- go test -count=1 ./...：除 `TestWSStreamDisconnectCancelsTurn` 偶发 timing flake（已记录）外全绿。

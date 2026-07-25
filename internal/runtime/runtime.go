@@ -183,6 +183,7 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	am.SetSessions(sm)
 	am.SetTools(rt.tools)
 	am.SetSkills(rt.skills)
+	am.SetMemory(rt.memory)
 	rt.agents = am
 	rt.components["agent"] = "ready"
 
