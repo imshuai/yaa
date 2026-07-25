@@ -514,3 +514,47 @@ Agent turn 内按 docs/agent.md §4 + docs/tool/provider.md §3-§5 完整走 To
 - go vet / go build ./...：通过。
 - go test -count=2 ./internal/{agent,memory_test,config,runtime}/：全绿。
 - go test -count=1 ./...：除 `TestWSStreamDisconnectCancelsTurn` 偶发 timing flake（已记录）外全绿。
+
+## Phase 3 下一步 #2：SQLite ContentStore 后端 + Runtime 按 storage.type 分发（commit 待 push）
+
+按 `docs/memory/storage.md §2` 落地 SQLite ContentStore 后端 + Runtime 启动按 `cfg.Memory.Storage.Type` 选 backend。
+
+### `internal/memory/sqlitestore/store.go`（新包，~700 行）
+- modernc.org/sqlite 纯 Go 驱动（已在依赖），schema 与文档 §2 完全一致：`memory_items` 复合主键 `(agent_id, layer, session_id, item_key)` + `memory_items_agent_updated` 索引 + `memory_items_expiry` 部分索引；时间 `RFC3339Nano` UTC 文本保存；metadata 为 JSON 文本字段。
+- `New(path)`：目录不存在自动创建；`SetMaxOpenConns(1)` + `PRAGMA journal_mode=WAL; busy_timeout=5000` 防 SQLite 写并发；`migrate()` 执行 4 个 DDL（CREATE TABLE IF NOT EXISTS + 两个 CREATE INDEX IF NOT EXISTS + schema_version 记录表）+ 写入 `schema_version=1` + 读 MAX(version) `> schemaVersion` 即拒绝（未知更高版本则启动失败，docs §6）。
+- `CommitPut` 单事务：先校验每个 victim (Version 仍匹配且非 target；缺失/Version 不符 → `ErrMemoryQuota`，事务回滚);  写锁内按顺序 SELECT victim row（深拷贝）+ DELETE + INSERT/UPDATE target（保留 created_at、version 递增；INSERT 走完整列，UPDATE 走单条 UPDATE RETURN-less）。`tx.Commit()` 失败回滚 return `storeErr`。返回 `CommitPutResult{Stored, Created, Evicted}` 全 deep copy 隔离缓存。注意：`victim.Equals(target` 直接 `errors.New("victim cannot equal target")` 不走事务。
+- `Get`：主键 SELECT 一次 + `scanItem`；与 memstore 契约一致**不过滤 expired**（Manager 决策）；`sql.ErrNoRows` → `ErrMemoryNotFound`；scanItem 的 JSON 解码错走 `corruptOrStoreErr` 包成 `ErrMemoryCorrupt` 透传。
+- `Search`：扫描 `agent_id+layer` 全量 rows（候选 <= max_items=10000），在 Go 内按 SessionID/IncludeGlobal、`notExpiredAt`、metadata 顶层 JSON 深度相等、`strings.ToLower(Key/Content).substring(q)` 过滤，`sort.SliceStable` 按 `UpdatedAt DESC / SessionID ASC / Key ASC` 排序；List 同语义但不过滤 metadata、不做 substring。
+- `Delete`：事务内 SELECT row → DELETE → 返 deleted item 副本；`ErrMemoryNotFound` 未命中。
+- `Clear`：事务内 SELECT 全 `agent_id+layer` 行 + 在 Go 内按 SessionID 全范围/精确匹配筛 → 逐行 DELETE → 返 cleared items 副本。
+- `DeleteExpired`：事务内按 `expires_at <= ? AND expires_at IS NOT NULL AND expires_at != ''` 过滤 + `ORDER BY expires_at ASC, agent_id ASC, session_id ASC, item_key ASC`（与 memstore 一致）SELECT 出过期 rows + `if limit > 0 && limit < len(all) { all = all[:limit] }` truncate + 逐行 DELETE + Commit 返回。
+- `Count`：扫描全 agent rows + 在 Go 内 `notExpiredAt` 过滤；返回未过期 item 数。
+- `Ping`：`SELECT 1`；`Close`：sync.Once 包 `db.Close()` 幂等。
+- 错误映射：database/sql 错误统一`storeErr` → `fmt.Errorf("%w: %v", ErrMemoryStoreUnavailable, err)`；`scanItem` 的 JSON 解码错走 `corruptOrStoreErr`（若 `errors.Is(err, ErrMemoryCorrupt)` 透传，否则 storeErr），保证 `errors.Is(err, ErrMemoryCorrupt)` 可穿透。
+- `matchesScopeGlobalSession` / `matchesMetadata` / `notExpiredAt` / `cloneItem` / `cloneItems` / `cloneMetadata` / `formatTime` / `parseTime` / `mustParseTime` 全部与 memstore 实现一致语义。
+
+### `internal/memory/sqlitestore/store_test.go`（新文件，16 例）
+- 覆盖 SQLite ContentStore 自身契约：CommitPut creates + CreatedAt/Version/UpdatedAt 保留 / Update preserves CreatedAt Version+1 / GetNotFound / Search metadata filter + UpdatedAt DESC order + keyword substring / SearchExcludesExpired + (修正后) Store.Get 不过期过滤 / Delete + DeleteNotFound / Clear scoped (session精确 + 空 session=Agent 全来源 + 其他 agent 不受影响) / DeleteExpired order + limit / Count excludes expired / List 全 agent 来源 / CommitPut victims Version validation (mismatch → ErrMemoryQuota rollback + victim 仍在) + 正确 victim → 删 + 建 target / victim equals target 拒绝 / Corrupt metadata JSON 错误返 ErrMemoryCorrupt (走 Get 路径) / schema_version unknown higher 拒绝 migrate / Reopen persists content+version / Ping 正常。
+- 修：`Store.Get` 原 `notExpiredAt` 判定与 memstore 契约不符（Manager 决定），删除；测试断言改为"过期仍能读出 row"。
+
+### `internal/memory_test/sqlite_manager_test.go`（新文件，6 例）
+- 用真实 `mm.Manager` + SQLite backend（`newSQLiteManager` 模仿 `manager_test.go` 中 `newTestManager` 同样的 fakeClock + captureEvents + 同一 `defaultPolicy`），覆盖核心 scenarios：Put/Get/Update (CreatedAt 保留 / Version 递增) / GetExpiredReturnsNotFound (clock 推进) / SearchKeywordSubstring session-local + IncludeGlobal / QuotaFifoEvicts (MaxItems=3, k0 选最早驱逐) / PromoteCopiesToGlobalKeepsSource (源 Session 仍可见 + global 也能 Get) / DeleteExpiredExpiresByClock (clock 推进 + 物理删除)。
+- 与 memstore 后端在 Manager 包装层核心语义保持一致（"与内存后端互测对比" docs/storage.md §2 字面要求）。
+
+### `internal/runtime/runtime.go` 分发逻辑
+- `Start` 中 Memory 段重构：按 `rt.cfg.Memory.Storage.Type` 选 backend：
+  - `case "sqlite"`: `sqlitestore.New(rt.cfg.Memory.Storage.Path)`，失败 → `rollback()` + `return fmt.Errorf("runtime: memory sqlite store: %w", sErr)` 让 Runtime Not Ready（docs §2: 启动失败要正确传播）。
+  - `default` (含 "memory" 与未知/空值): `memstore.New()`，未知 type 仅 warn，"memory"/"" warn "durable=false"。
+  - 注释更新去掉"v1 阶段默认 in-memory"（已能配置 SQLite）。
+- import 加 `"github.com/imshuai/yaa/internal/memory/sqlitestore"`。
+
+### `internal/runtime/runtime_test.go` 增 2 例
+- `TestRuntimeMemorySQLiteBackendStart`：`cfg.Memory.Enabled=true` + `Storage.Type=sqlite` + tempdir path → Start 后 `health.Components["memory"]=="ready"` + `rt.memory != nil` + 文件被实际创建。
+- `TestRuntimeMemorySQLiteBackendStartFailsOnBadPath`：构造一个不可能的目录（path 是既存文件而非目录）→ Start 必须返 error（不要 leaking ready Ready 但 memory 不可用）。
+
+### 验证
+- go vet / go build ./...：通过。
+- go test -count=1 ./internal/memory/sqlitestore/：16 例全绿。
+- go test -count=1 -run SQLiteManager ./internal/memory_test/：6 例全绿。
+- go test -count=1 ./internal/runtime/：全绿（含新 2 例）。
+- go test -count=1 ./...：除 `TestWSStreamDisconnectCancelsTurn` 偶发 timing flake（已记录，单跑 5/5 全绿）外全绿。

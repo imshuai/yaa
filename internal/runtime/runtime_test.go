@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -125,5 +126,67 @@ func TestRuntimeE2EHealthHTTP(t *testing.T) {
 	}
 	if resp.Header.Get("X-Request-ID") == "" {
 		t.Fatal("missing X-Request-ID header")
+	}
+}
+
+// TestRuntimeMemorySQLiteBackendStart verifies Memory backend selection by cfg
+// produces "ready" memory component and rt.memory is non-nil.
+func TestRuntimeMemorySQLiteBackendStart(t *testing.T) {
+	cfg := newTestConfig()
+	cfg.Memory.Enabled = true
+	cfg.Memory.Storage.Type = "sqlite"
+	cfg.Memory.Storage.Path = filepath.Join(t.TempDir(), "yaa-mem.db")
+	// 关向量（v1 Embedder 未注入），关闭持久 storage 为 memory（root）保证 health 不被 storage 拖累。
+	cfg.Memory.Vector.Enabled = false
+
+	rt, err := New(cfg, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rt.cfg.Skills.Dir = t.TempDir()
+	ctx := context.Background()
+	if err := rt.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = rt.Shutdown(shutdownCtx)
+	})
+
+	h := rt.Health()
+	if comp := h.Components["memory"]; comp != "ready" {
+		t.Fatalf("memory component = %q, want ready; full health: %#v", comp, h.Components)
+	}
+	if rt.memory == nil {
+		t.Fatal("rt.memory should be non-nil for sqlite backend")
+	}
+	// 文件应被创建（sqlite 启动创建）。
+	if _, statErr := os.Stat(cfg.Memory.Storage.Path); statErr != nil {
+		t.Fatalf("sqlite file not created at %s: %v", cfg.Memory.Storage.Path, statErr)
+	}
+}
+
+// TestRuntimeMemorySQLiteBackendStartFailsOnBadPath 证实 SQLite migration 失败阻断 Start
+// （docs/memory/storage.md §2：无法创建则启动失败）。
+func TestRuntimeMemorySQLiteBackendStartFailsOnBadPath(t *testing.T) {
+	cfg := newTestConfig()
+	cfg.Memory.Enabled = true
+	cfg.Memory.Storage.Type = "sqlite"
+	// 不可能创建的目录路径（已存在为文件而非目录）。
+	badDir := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(badDir, []byte("file not dir"), 0o644); err != nil {
+		t.Fatalf("seed not-a-dir file: %v", err)
+	}
+	cfg.Memory.Storage.Path = filepath.Join(badDir, "yaa-mem.db")
+
+	rt, err := New(cfg, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rt.cfg.Skills.Dir = t.TempDir()
+	if err := rt.Start(context.Background()); err == nil {
+		t.Fatal("Start should fail when sqlite backend cannot create dir")
+		_ = rt.Shutdown(context.Background())
 	}
 }

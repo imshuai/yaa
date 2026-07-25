@@ -14,6 +14,7 @@ import (
 	ctxwindow "github.com/imshuai/yaa/internal/context"
 	mm "github.com/imshuai/yaa/internal/memory"
 	"github.com/imshuai/yaa/internal/memory/memstore"
+	"github.com/imshuai/yaa/internal/memory/sqlitestore"
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/session"
 	"github.com/imshuai/yaa/internal/skill"
@@ -98,14 +99,33 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	// 向量/Reindex 暂不接入（policy.Vector.Enabled=false 时 Manager.IndexStatus 永远 ready，
 	// 启动无需 Reindex）。
 	if rt.cfg.Memory.Enabled {
-		ms := memstore.New()
+		// 按 cfg.Memory.Storage.Type 选 ContentStore backend：
+		//   "sqlite" → sqlitestore.New(path)，目录不存在创建；失败则 Runtime Not Ready
+		//     （docs/memory/storage.md §2: 无法创建或迁移失败则启动失败）。
+		//   "memory"/其它 → in-memory 后端（v1 默认行为；非持久）。
+		var ms mm.ContentStore
+		switch rt.cfg.Memory.Storage.Type {
+		case "sqlite":
+			ss, sErr := sqlitestore.New(rt.cfg.Memory.Storage.Path)
+			if sErr != nil {
+				rt.rollback()
+				return fmt.Errorf("runtime: memory sqlite store: %w", sErr)
+			}
+			ms = ss
+		default:
+			ms = memstore.New()
+			if rt.cfg.Memory.Storage.Type != "memory" && rt.cfg.Memory.Storage.Type != "" {
+				rt.logger.Warn("memory: unknown storage.type, falling back to memory backend",
+					"type", rt.cfg.Memory.Storage.Type)
+			}
+			if rt.cfg.Memory.Storage.Type == "memory" || rt.cfg.Memory.Storage.Type == "" {
+				rt.logger.Warn("memory: using in-memory content store backend", "durable", false)
+			}
+		}
 		// ponytail: v1 暂不接入 EventEmitter/AuditLogger；事件 sink 为 nil。
 		mmMgr := mm.NewManager(ms, nil, nil, mm.SystemClock{}, nil)
 		rt.memory = mmMgr
 		rt.components["memory"] = "ready"
-		if rt.cfg.Memory.Storage.Type == "memory" {
-			rt.logger.Warn("memory: using in-memory content store backend", "durable", false)
-		}
 	} else {
 		rt.components["memory"] = "disabled"
 	}
