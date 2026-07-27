@@ -2006,3 +2006,33 @@ go test -count=1 -timeout 60s ./internal/api/ -run TestMCPEndpoints -v   # 3 例
 - **MCPServerProvider 接口加 Detail 而非 Tools**: handler 只需 ServerDetail 一次拼装的语义; 暴露 Tools(name) 会强迫接口多个语义方法; Detail 命名直接对齐 docs DTO 名.
 - **不暴露 POST/PUT/DELETE 一类 CRUD**: docs §3 明示 "没有 POST .../tools/:tool、PUT 或 DELETE"; handler 只 GET 只读 (现有 routes 注册也只是 GET); 测试不变也不动.
 - **mockMCPServerProvider 加 detailsBy 而非替换 items**: fallback 路径保证现有 "disconnected fs" List 投影 + Get 测试无需改动; 新加 TestMCPEndpointsDetailWithTools 用 detailsBy 注入完整 ServerDetail.
+
+## progress #24 — 本地 MCP Server Agent Tool 白名单 authz 端到端测试落地
+
+**Commit (将提交)**: 本 commit 给 checklist §9 第 126 行补强 authz 端到端测试.
+
+**背景**: 上一轮审查发现 NewMCPServerRaw 构造路径已经实现 docs §6 + §4 完整链路:
+- prepare 阶段 (server.go NewMCPServer §60-78): 调 `tools.ListForAgent(cfg.AgentID)` 取 allowlist 集合, 对每个 ExposedTools 校验是否被该 Agent 允许, 不通过返 ErrMCPConfig;
+- tools/call 路径 (server.go handleCallTool §229-258): 二次走 `s.tools.Execute(ctx, tool.ExecutionScope{AgentID: s.agentID, SessionID: ""}, params.Name, ...)`, Tool Manager 再次真实 CheckPermission.
+- 但**没有针对 NewMCPServerRaw authz 失败路径的负向端到端测试**——checklist 行未勾选的真实原因是验收缺位 (不是代码缺位).
+
+**实现** (新增 `internal/mcp/server_authz_test.go`):
+- `buildRestrictedToolManager(t, allowTools...)`: 构造 `config.AgentConfig{ID: "restricted", Tools: allowTools}` 的 Tool Manager, 不像 buildToolManager 的 AllowAll a1, 这个 agent 真实有有限 allowlist.
+- `TestNewMCPServerRejectsExposedToolNotInAgentAllowlist`: allowlist=["echo"], ExposedTools=["echo","private"] → NewMCPServerRaw 返 ErrMCPConfig; err 文本含 "private" (rejected tool 名) + 含 "restricted" (agent_id).
+- `TestNewMCPServerAcceptsAllExposedToolsInAllowlist`: 正向对照. allowlist=["echo","ls"], ExposedTools=["echo","ls"] + 注册 echo/ls 两 tool → NewMCPServerRaw 成功.
+- `fakeLsTool` (echo 风格 minimal Tool): 给正向测试多 tool 场景.
+
+**验证**:
+```
+go build ./internal/mcp/  # 通过
+go vet ./internal/mcp/    # 无 warning
+go test -count=1 -timeout 60s ./internal/mcp/ -run "TestNewMCPServerRejectsExposedToolNotInAgentAllowlist|TestNewMCPServerAcceptsAllExposedToolsInAllowlist" -v   # 2 例 PASS
+go build ./... && go vet ./... && go test -count=1 -timeout 300s ./...   # 18 包全绿
+```
+
+**决策记录**:
+- **不重复 buildToolManager a1 AllowAll**: 现有 buildToolManager 的 a1 是 AllowAll, 不适合测有限 allowlist; 新建 buildRestrictedToolManager 构造 restricted agent 有限 allowlist. 两个 helper 共存避免改动现有测试.
+- **占位 io.Pipe 不调用 Serve**: NewMCPServerRaw authz 校验发生在构造时; Serve 不启动所以 stdin/stdout 可用任意 io.Pipe 的 half; 释放靠 t.Cleanup 不强求.
+- **正向测试不启动 Serve**: 只验证 NewMCPServerRaw 返 nil err 即证明 authz 路径通过; Serve 是 lifecycle 层 concern 由 server_stdio_test.go E2E 覆盖, 不重复测.
+- **err 文本断言含 "private"+"restricted"**: docs §6 错误内容是 "exposed tool %q is not enabled or not allowed for agent %q", 测试用 strings.Contains 证明 err 信息真名这俩.
+
