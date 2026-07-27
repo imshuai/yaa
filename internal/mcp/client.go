@@ -55,7 +55,10 @@ type Client struct {
 
 	mu     sync.RWMutex
 	status ConnectionStatus
-	cancel context.CancelFunc
+	// protocolVersion 是 Initialize 协商后的 Server 选择版本（docs/transport.md §2）。
+	// 在 mu 下读写：Initialize 成功后只读。Manager 投影到 ServerStatus.ProtocolVersion。
+	protocolVersion string
+	cancel          context.CancelFunc
 
 	closeOnce sync.Once
 	failOnce  sync.Once
@@ -93,6 +96,15 @@ func (c *Client) Status() ConnectionStatus {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.status
+}
+
+// ProtocolVersion 返回 Initialize 协商后 Server 选择的协议版本（docs/transport.md §2）。
+// 未握手成功时返回空串；Manager 据此投影 ServerStatus.ProtocolVersion。
+// 读在 mu 下保证一致快照。
+func (c *Client) ProtocolVersion() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.protocolVersion
 }
 
 // Done 是该代连接的无损关闭信号（docs/mcp/client.md §1）。
@@ -512,6 +524,7 @@ func (c *Client) Initialize(ctx context.Context) error {
 		return err
 	}
 	c.mu.Lock()
+	c.protocolVersion = result.ProtocolVersion // 协商后定格；transport.info 决定客户端候选
 	c.status = StatusConnected
 	c.mu.Unlock()
 	return nil

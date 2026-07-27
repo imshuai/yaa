@@ -600,3 +600,66 @@ func TestClientHandlesServerPingRequest(t *testing.T) {
 	}
 	_ = c.Close()
 }
+
+// ProtocolVersion() 在 Initialize 前返回空串；Initialize 协商成功后返回 Server 选择版本。
+func TestClientProtocolVersionGetter(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c, ft := newStdioFakeClient(ctx)
+	if err := c.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	// 未 Initialize 时返回空串.
+	if pv := c.ProtocolVersion(); pv != "" {
+		t.Fatalf("ProtocolVersion before Init = %q want empty", pv)
+	}
+
+	go func() {
+		var first *Message
+		for i := 0; i < 200; i++ {
+			sent := ft.popSent()
+			if len(sent) > 0 {
+				first = sent[0]
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if first == nil {
+			t.Errorf("no initialize sent")
+			return
+		}
+		// 返 legacy 版本以验证 stdio 也接受 legacy (acceptsVersion stdio 兼容 2024-11-05).
+		respondOK(ft, first.ID, InitializeResult{
+			ProtocolVersion: LegacyProtocolVersion,
+			Capabilities:    map[string]any{"tools": map[string]any{}},
+			ServerInfo:      Implementation{Name: "srv", Version: "1"},
+		})
+		for i := 0; i < 200; i++ {
+			sent := ft.popSent()
+			if len(sent) > 0 && sent[0].Method == "notifications/initialized" {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	initDone := make(chan error, 1)
+	go func() { initDone <- c.Initialize(ctx) }()
+	select {
+	case err := <-initDone:
+		if err != nil {
+			t.Fatalf("Initialize: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Initialize did not return in 2s")
+	}
+	// Initialize 协商后 ProtocolVersion 返回 Server 选择版本.
+	if pv := c.ProtocolVersion(); pv != LegacyProtocolVersion {
+		t.Errorf("ProtocolVersion after Init = %q want %q", pv, LegacyProtocolVersion)
+	}
+	_ = c.Close()
+	// Close 之后 ProtocolVersion 仍返回协商版本快照（不变回空，避免 Manager 投影闪断）.
+	if pv := c.ProtocolVersion(); pv != LegacyProtocolVersion {
+		t.Errorf("ProtocolVersion after Close = %q want %q (snapshot retained)", pv, LegacyProtocolVersion)
+	}
+}

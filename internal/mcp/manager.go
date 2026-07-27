@@ -233,9 +233,9 @@ func (m *Manager) connectStdioServer(e *serverEntry) {
 	e.status.Status = StatusConnected
 	e.status.ConnectedAt = &now
 	e.status.ToolCount = len(tools)
-	// ProtocolVersion: Manager 当前不暴露 Client 协商版本（本轮 Client 未带 getter），
-	// ServerStatus.ProtocolVersion 保持 nil，与 v1 起点一致；SSE / Streamable HTTP 实现后补 ├
-	// 行 transport 类型的版本曝光（docs/README.md §2 把该字段标记为 *string 可选）。
+	// ProtocolVersion: 由 Client.Initialize 协商后保存的版本派生（legacy 兼容版本如 sse 选 2024-11-05 时正确反映）。
+	pv := client.ProtocolVersion()
+	e.status.ProtocolVersion = &pv
 	// ToolInfo 快照深拷贝 → 支持 Manager.Tools(name) 返回.
 	e.tools = make([]tool.ToolInfo, 0, len(tools))
 	for _, mt := range tools {

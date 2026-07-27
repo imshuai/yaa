@@ -1316,3 +1316,38 @@ HTTP_PROXY=... go test -count=1 -timeout 240s ./...
 5. **ServerStatus.ProtocolVersion 暴露**：给 Client 加 protocolVersion getter（Initialize 校验后保存），Manager 投影到 ServerStatus + 实现 SSE 2024-11-05 路径。
 6. **Worker 集成 Agent / Session / Provider**（checklist §9 §2）：MCP Tool 在 Agent turn 投影到 Provider Function 列表；Session 视图按 Agent allowall 投影可用 MCP Tool。
 7. **Planner step 1-10**（docs/planner/）。
+
+---
+
+## #12 Client.ProtocolVersion getter + ServerStatus.ProtocolVersion 暴露 (HEAD 待 push)
+
+### 范围
+上轮 #11 副债「ServerStatus.ProtocolVersion 本轮 nil；Client 未暴露协商版本 getter」。本 commit 收尾：Client 加 `protocolVersion` 字段（mu 保护，Initialize 成功后写入）+ `ProtocolVersion() string` getter；Manager.connectStdioServer 投影到 `status.ProtocolVersion`。Close 后 getter 仍返协商版本快照（避免 Manager 投影闪断）。
+
+### 改动文件
+- `internal/mcp/client.go` (~15 行)：
+  - Client struct 加 `protocolVersion string`（mu 保护）
+  - Initialize 成功路径 `c.protocolVersion = result.ProtocolVersion`
+  - 新 `func (c *Client) ProtocolVersion() string`（mu.RLock）
+- `internal/mcp/manager.go` (~6 行)：connectStdioServer 成功路径 `pv := client.ProtocolVersion(); e.status.ProtocolVersion = &pv`，替换上轮 nil 注释块；头部 comment 更新。
+- `internal/mcp/client_test.go` (+63 行)：新 `TestClientProtocolVersionGetter`：未 Initialize 返 ""；协商后返 Server 选择版本（用 LegacyProtocolVersion="2024-11-05" + stdio transport，验证 stdio 首选 2025-03-26 但接受 legacy）；Close 后仍保留快照。
+- `internal/mcp/manager_integration_test.go` (+6 行)：现有 `TestManagerPrepareAutoStartStdioRegistersTools` 加断言 `st.ProtocolVersion != nil && *st.ProtocolVersion == ProtocolVersion`（fake MCP server 返 2025-03-26）。
+
+### 验证
+- go vet + build ./... 全过
+- mcp 包 56 例全绿 (55 上轮 + 1 新)
+- 全项目 test ./... 仅触发已知 WS flake（TestWSStreamDisconnectCancelsTurn 200ms Sleep，progress #10/早前已记，非本系列 commit 引入；单跑全绿）
+
+### 决策
+- **Close 后 ProtocolVersion 仍返协商值**：Manager 投影 ServerStatus 用快照模型；Close 触发后 Manager 会同步置 status=Disconnected，但 getter 暴露的协商值作为该代连接的「历史版本」保留，避免 List 在 Stop 与 Disconnect 路径竞态下见到一帧 nil。
+- **legacy 测试用 stdio transport**：docs/transport.md §2 明确 stdio 首选 2025-03-26 但接受 legacy 2024-11-05；该测试反向验证 `acceptsVersion("stdio", LegacyProtocolVersion) == true`。
+- **Client 单元测试单独成测**：本轮发现 `TestClientInitializeLifecycle` 复用同一 fake transport 应答 initialize 但用 ProtocolVersion 常量；新测试用 LegacyProtocolVersion 独立隔离 path。
+
+### 下一轮方向
+本 commit 解决上轮副债后，progress #11 末尾的下一轮方向不变：
+1. **重连 + catalog reconciliation + heartbeat**（async runUpstream goroutine + mcp.reconnect 指数退避 + tool 三元一致才 Store 新 handle；docs/mcp/config-ref.md §7.1/§7.2 是权威设计，含 generation + listChanged channel + ticker + lifecycleMu gate）。
+2. WS flake 根因修复（独立 commit）：session.Manager 加 IsTurnActive 公开 API + ws_handler_test polling 替换 200ms Sleep。
+3. SSE / Streamable HTTP transport（checklist §5/§6）。
+4. 本地 MCPServer（checklist §3）。
+5. Agent/Session/Provider 集成（checklist §9 §2）。
+6. Planner step 1-10（docs/planner/）。

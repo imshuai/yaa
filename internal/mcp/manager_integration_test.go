@@ -89,6 +89,12 @@ func TestManagerPrepareAutoStartStdioRegistersTools(t *testing.T) {
 	if st.LastError != "" {
 		t.Errorf("last_error=%q want empty", st.LastError)
 	}
+	// ServerStatus.ProtocolVersion 应来自 Client 协商结果（fake MCP server 返 2025-03-26）.
+	if st.ProtocolVersion == nil {
+		t.Errorf("protocol_version=nil want non-nil")
+	} else if *st.ProtocolVersion != ProtocolVersion {
+		t.Errorf("protocol_version=%q want %q", *st.ProtocolVersion, ProtocolVersion)
+	}
 	tools, ok := m.Tools("fake")
 	if !ok {
 		t.Fatalf("Tools(fake): not found")
