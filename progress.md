@@ -2133,3 +2133,58 @@ go test -count=1 -timeout 60s ./internal/planner/ -v   # 全 11 例 PASS
 3. Runtime 启动 LLMPlanner + Executor 注入 AgentBinding (依赖 provider.Manager + tool.Manager).
 4. Agent turn Pipeline 接 Plan (intelligence integration entry).
 
+
+## progress #27 — Executor.Execute (DAG 调度 + StepRunner + 输入绑定 + 失败即停 + ctx 取消 + PlanResult 状态机)
+
+**Commit (将提交)**: Planner 实现的第二步. 实现 internal/planner/executor.go 完整 DAG 调度 + 输入绑定:
+- 完全对齐 docs/planner/execution.md §3-§5 + errors.md ExecutionError.
+- 不依赖 Provider (StepRunner 是注入函数): 单测纯 mock runner 覆盖全部调度语义.
+
+**实现** `internal/planner/executor.go`:
+- 类型: StepStatus (succeeded/failed/canceled/skipped) + StepResult + StepRunResult + PlanResult (含 PlanID/Status/Steps map/Duration/Usage/ToolCallCount) + PlanStatus (completed/failed/canceled).
+- `StepRunner func(ctx, agentID, sessionID, step Step, boundInput map[string]any) (StepRunResult, error)`: 注入 runner, 内部应完成 Input 引用绑定后用 tool.ExecutionScope 调 ToolManager / 调 Provider.Chat.
+- `NewExecutor(maxConcurrent int, run StepRunner)`: 拒绝 maxConcurrent ≤0 或 nil runner (docs §3, ErrPlanExecution).
+- `Execute(ctx, agentID, sessionID, plan) (PlanResult, error)`:
+  - 校验 agentID/sessionID 非空 (docs §3 "仍校验空 agentID 和 sessionID").
+  - 初始化 results map, 每 Step 默认 StepSkipped.
+  - 依赖图 + 入度 + dependents 表.
+  - planCtx + cancel(context.WithCancelCause(ctx)) — 失败即调 cancel(res.runErr) 触发停止新节点 + 取消运行节点.
+  - resultCh cap=len(plan.Steps), 保证取消后 worker 写入不阻塞 (docs §4 "确保取消后 worker 不会因无人接收而泄漏").
+  - 主调度循环: ①启 ready 节点直到 maxConcurrent 满; ②收 worker -> 累计 Usage/ToolCallCount (docs §4 "先累计 usage 再判断 error/status") -> 区分 canceled (res.runErr 是 ctx.Canceled/DeadlineExceeded) / failed (硬错 + cancel(res.runErr) + 失效新启动) / succeeded (Output 保存 + dependents 入度 -- + ready); 退出条件 running==0.
+  - 结果状态转换: firstErr nil → PlanFailed + *ExecutionError; caller ctx cause 非空 → PlanCanceled + ctx.Cause; 全成功 → PlanCompleted + nil.
+- `bindStepInput(s, outputs) (map[string]any, error)` — 文档 §2 输入绑定:
+  - 调度启动 worker 时抓该 Step 依赖 Step 已 succeeded 的 Output 副本 (avoid worker 持读 results map 触发 race).
+  - `bindValue(stepID, v, outputs, dependsSet)` 递归深拷贝: object 含 {"$step": ID} 替换为依赖 output 完整对象; {"$step": ID, "key": K} 取 output object 直接 key; 被引 Step 必须 succeeded + Output 是 object 且 key 存在, 否则 ErrPlanInvalid 包装错误 (docs §2 "缺少输出 / 输出不是 object / 键不存在时该 Step 失败"); 引用 object 不允许 $step + key 以外字段; 不原地修改.
+- `errShort(err)` 错误字符串截短到 200 字符 (docs/errors.md §1 "错误字符串不得包含完整 prompt / Tool 参数 / Provider body / Step output").
+
+**测试** `internal/planner/executor_test.go` (8 例):
+- `TestExecuteRejectsInvalidArgs`: NewExecutor 拒绝 maxConcurrent≤0 / nil runner; Execute 拒空 agentID/sessionID.
+- `TestExecuteFullyLinearCompleted`: a→b→c 单链全成功 → PlanCompleted + 3 succeeded + Usage 累计 (LLM Step TotalTokens=1 各).
+- `TestExecuteParallelIndependentHitsMaxConcurrent`: 4 独立 step + maxConcurrent=2 → peak ≤ 2 (atomic 实测).
+- `TestExecuteFailsFirstStepSkipsRest`: 首 step 失败 → a=failed, b/c=skipped, err=*ExecutionError stepID=a 含 Cause.
+- `TestExecuteCallerCancelCancelsRunning`: caller cancel turn ctx → running step=canceled, 未启动=skipped, 2s 内返 (无 leak).
+- `TestExecuteStepFailedCancelRunningSiblings`: a 立即失败 + b 在 release channel 阻塞 → a=failed, b=canceled (兄弟节点取消), c=skipped.
+- `TestExecuteInputBindingChainedOutputs`: a 输出 {content:"a_out"}, b 引用 a.content (key="content") → b input 含 a_out; c 引用 b 整体 ({$step:b}) → 拿到 b output object → c.Output = "a_out:b:c" 验证多级绑定接力.
+- `TestExecuteInputBindingMissingKeyInObjectFails`: runtime bind 阶段引用 key 不存在 → b=failed, err 文本含 missing_key, a succeeded.
+
+**验证**:
+```
+go build ./... && go vet ./... && go test -count=1 -timeout 300s ./...   # 19 包全绿
+go test -count=1 -timeout 60s ./internal/planner/ -v   # 19 例 PASS (validate 11 + execute 8)
+```
+
+**checklist 推进** (docs/planner/checklist.md): 执行 § 6 项 (除"同一 Session 的 Planner 位于既有 turn FIFO gate 内"待 Runtime 接入) + 最小测试 § 5 项 勾选完成. 共 9 项新增勾选 (上轮已 9 项).
+
+**决策记录**:
+- **Executor 不依赖 Provider**: StepRunner 注入; 单测纯 mock. 这是 docs §3 的 StepRunner 设计意图; 把 Provider.Chat 与 ToolManager.Execute 在下一 commit 由 runtime 提供 aggregate runner 实例.
+- **canceled 状态判断靠 errors.Is(res.runErr, context.Canceled/DeadlineExceeded)**: cancel(res.runErr) 让 Cause 是自定义 err, planCtx.Err() 是 context.Canceled. 区分: worker 返 ctx.Err (取消路径) vs worker 返业务硬错 (failed 路径). context.Cause 区分 caller cancel vs firstErr 触发取消 (PlanStatus 转换外不区分, 状态判定只看 firstErr 链).
+- **bindStepInput 在 worker 内执行, 不主调度内**: docs §4 "worker 只执行输入绑定和 StepRunner, 不共享修改 node 或结果 map". worker 接调度时已 succeeded 依赖的 Output 副本, 内 bind, send 单次结果.
+- **planCtx = context.WithCancelCause(ctx)** + `cancel(res.runErr)`: Go 1.20 API, 直接传 cause 让 context.Cause 拿到首错. 但 step canceled 判断不靠 Cause (cause 是自定义错误), 而靠 worker 返的 ctx.Err 类型; 这是 cleaner path.
+- **bindValue 不原地修改 Step.Input**: docs §2 明示 "解析器递归复制 Input 后替换引用, 不得原地修改 Plan". 每层新建 map / slice 共享基本类型字面值, 保持 Plan immutable.
+- **未引入 retry/缓存的 coordinator**: docs §5 "Executor 不自动重试 Step"; 现在 — 无 retry/per-step 缓存. PL-007 一致.
+
+**未完成下一步 commit**:
+1. LLMPlanner.Plan (依赖 provider.Provider.Chat): prompt 构造 + DisallowUnknownFields 严格 Plan JSON 解码 + Plan{ID/Task} 可信构造 + ErrPlanGenerate/ErrPlanParse 错误路径.
+2. Runtime 接入 LLMPlanner + Executor (注入依赖 Planner := 真 provider + AgentBinding 加 Planner 字段; Agent turn head → Plan/ValidatePlan/Execute → 结果入 Context).
+3. StepRunner aggregate (tool: ExecutionScope + tool.Manager; llm: Provider.Chat + system message + instruction).
+
