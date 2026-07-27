@@ -47,7 +47,7 @@ v1 副债：listTools 严格 DTO 的 DisallowUnknownFields（当前 request Unma
 - [x] Resource / Prompt request 返回 JSON-RPC `-32601` — handle dispatch default 分支
 - [x] `handlePing()` — 响应 ping 请求 — CanPing 检查 + 空 result
 - [x] Server 信息声明（name, version, capabilities） — ServerInfo{name:"yaa", version:runtimeVersion="0.1.0"}, Capabilities{tools:{listChanged:false}}
-- [~] 会话管理（多客户端连接隔离） — stdio 单 session (progress #19) + SSEServer 多 session session_id (progress #20) 已交付; StreamableHTTPServer 多 session (32-byte crypto/rand ID + session map + 30min idle + 1024 上限) 待 Step 3 commit
+- [x] 会话管理（多客户端连接隔离） — stdio 单 session (progress #19) + SSEServer 多 session session_id (progress #20) + StreamableHTTPServer 多 session by 32-byte Mcp-Session-Id (session map + 30min idle sweep + 1024 上限 + DELETE 销毁) (progress #21) 全部已交付
 
 ## 4. Transport — stdio
 
@@ -87,7 +87,7 @@ v1 副债：listTools 严格 DTO 的 DisallowUnknownFields（当前 request Unma
 ### §5/§6 v1 transport 完整度
 - Client side: stdio + SSE + StreamableHTTP 全部完成 ClientTransport 接口
 - Manager buildTransport 选 transport by config; Prepare 走 stdio/sse/streamable_http 同 connectAndDiscover+registerProxies+publishGeneration+runUpstream path
-- Server side: SSEServer 已落地 progress #20 (listener + endpoint GET SSE 帧 + POST messages 入站 + session map + heartbeat 30s + 端到端测试 7 例); StreamableHTTPServer (32-byte crypto/rand ID + session map + 30min idle + 1024 上限 + Origin 校验 + DELETE/GET/POST routing + 405/404/400/503/403) 待 Step 3 commit
+- Server side: SSEServer 已落地 progress #20 (listener + endpoint GET SSE 帧 + POST messages 入站 + session map + heartbeat 30s + 端到端测试 7 例); StreamableHTTPServer 已落地 progress #21 (listener + single endpointPath 处理 POST/GET/DELETE + 32-byte crypto/rand URL-safe ID + 1024 上限 503 + 30min idle sweeper + DELETE 204 销毁 + GET 405 only-close SSE v1 + Origin allowlist 403 DNS-rebinding 防护 + batch 数组 400 + 缺 ID 400 + 未知 ID 404 + 数组/batch + 413 + 端到端测试 10 例)
 - StreamableHTTP 状态映射 docs §3.3 错误表完整覆盖 14 子用例 (401/403 Auth / init 404/405 Config / init 408/504 ConnTimeout / init 429/5xx Unavailable / business POST 5xx/429 TransportWrite / session-POST 400/404/410 TransportClosed / 413 ProtocolError / 3xx CheckRedirect 拒)
 
 ## 7. Tool 映射

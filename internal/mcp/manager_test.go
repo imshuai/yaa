@@ -182,32 +182,64 @@ func TestManagerPrepareNoOp(t *testing.T) {
 	}
 }
 
-// Manager.Prepare 校验 mcp.server.enabled=true 但 transport 是 streamable_http (未实现) 或
-// sse 缺 Addr 时 fail-fast 返 ErrMCPConfig, 避免静默启用无效 Server (docs §7.1).
-// sse 已实现 (progress #20); streamable_http 仍待 commit.
-func TestManagerPrepareRejectsEnabledButUnsupportedTransport(t *testing.T) {
+// Manager.Prepare 校验 mcp.server.enabled=true 但 cfg.Addr 缺失时 fail-fast (docs §6).
+// 三种已实现 transport 中 sse / streamable_http 需要 Addr (网络 listener); stdio 不需要.
+// progress #21 起所有 transport 都已实现; 该测试覆盖 Addr 缺失防御.
+func TestManagerPrepareRejectsNetworkServerWithoutAddr(t *testing.T) {
 	tm := buildToolManager(t)
-	// streamable_http 未实现 → ErrMCPConfig.
-	cfg1 := &config.MCPConfig{
-		Server: config.MCPExposeConfig{
-			Enabled: true, AgentID: "a1", Transport: "streamable_http",
-			ExposedTools: []string{"builtin.echo"},
-		},
+	for _, tr := range []string{"sse", "streamable_http"} {
+		t.Run(tr, func(t *testing.T) {
+			cfg := &config.MCPConfig{
+				Server: config.MCPExposeConfig{
+					Enabled: true, AgentID: "a1", Transport: tr,
+					ExposedTools: []string{"builtin.echo"},
+				},
+			}
+			m, _ := NewManager(cfg, tm, nil)
+			err := m.Prepare()
+			if !errors.Is(err, ErrMCPConfig) {
+				t.Errorf("Prepare transport=%q no addr: got %v, want ErrMCPConfig", tr, err)
+			}
+		})
 	}
-	m1, _ := NewManager(cfg1, tm, nil)
-	if err := m1.Prepare(); !errors.Is(err, ErrMCPConfig) {
-		t.Errorf("Prepare transport=streamable_http: got %v, want ErrMCPConfig", err)
-	}
-	// sse 缺 Addr → ErrMCPConfig (根 Validator 应已校验, 但 NewMCPServer 仍防御校验).
-	cfg2 := &config.MCPConfig{
-		Server: config.MCPExposeConfig{
-			Enabled: true, AgentID: "a1", Transport: "sse",
-			ExposedTools: []string{"builtin.echo"},
-		},
-	}
-	m2, _ := NewManager(cfg2, tm, nil)
-	if err := m2.Prepare(); !errors.Is(err, ErrMCPConfig) {
-		t.Errorf("Prepare transport=sse no addr: got %v, want ErrMCPConfig", err)
+}
+
+// Manager.Prepare 对已实现 transport (sse/streamable_http, Addr=127.0.0.1:0) + AgentID + Tool allowlist
+// 成功构造 MCPServer; 不应返 ErrMCPConfig. 验证三种 transport 都能 Prepare.
+func TestManagerPrepareAcceptsAllSupportedTransports(t *testing.T) {
+	tm := buildToolManager(t)
+	tm.Register(fakeEchoTool{})
+	for _, tc := range []struct {
+		name         string
+		enabled      bool
+		transport    string
+		addr         string
+		exposedTools []string
+	}{
+		{"stdio nil tools", true, "stdio", "", nil},
+		{"sse ok", true, "sse", "127.0.0.1:0", []string{"echo"}},
+		{"streamable_http ok", true, "streamable_http", "127.0.0.1:0", []string{"echo"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.MCPConfig{
+				Server: config.MCPExposeConfig{
+					Enabled: tc.enabled, AgentID: "a1", Transport: tc.transport, Addr: tc.addr,
+					ExposedTools: tc.exposedTools, Path: "/mcp", MessagesPath: "/message",
+				},
+			}
+			m, _ := NewManager(cfg, tm, nil)
+			if err := m.Prepare(); err != nil {
+				t.Errorf("Prepare transport=%q: got %v, want nil", tc.transport, err)
+			}
+			// Stop 释放 listener (m.mcpServer 已持 listener).
+			stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = m.Stop(stopCtx)
+			select {
+			case <-m.Done():
+			case <-time.After(time.Second):
+			}
+		})
 	}
 }
 

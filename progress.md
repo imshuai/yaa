@@ -1854,3 +1854,85 @@ go test -count=1 -timeout 90s ./internal/mcp/ -run TestSSEServer -v   # 7 例 PA
 4. Agent/Session/Provider 集成 (checklist §9 §2)
 5. Planner step 1-10 (docs/planner/)
 6. Remote API `GET /api/v1/mcp/servers` + `:name` (checklist §9)
+
+## progress #21 — 本地 MCPServer Step 3 (StreamableHTTPServer)
+
+**HEAD 序列**: 在 `d65d802` (本地 MCPServer Step 2 SSEServer) 之上新增 commit;
+本节为本地 MCPServer Step 3: Streamable HTTP Server transport (docs §3.3 + §4 NewStreamableHTTPServer).
+**本地 MCPServer 三种 transport (stdio + legacy SSE + Streamable HTTP) 全部交付**.
+
+### 改动文件清单
+
+**新增**:
+- `internal/mcp/streamable_http_server.go` (~290 行): StreamableHTTPServer struct 实现 ServerTransport.
+  - 单 listener + 单 endpointPath 处理 POST / GET / DELETE 三类方法 (mux).
+  - 处理路径: `handleEndpoint` Origin 校验 → 按 r.Method dispatch (handlePOST / handleGET / handleDELETE).
+  - POST 路径: body ≤ 4 MiB (MaxBytesReader, 触发 413) + JSON 数组/batch 防御 (400 + -32600) + JSON 解析失败 (400 + -32700) + envelope 校验 + 孤立 response 拒绝 (400 + -32600).
+    - initialize 且无 Mcp-Session-Id → createSession (32-byte crypto/rand URL-safe ID + 1024 上限 503) + 响应 header 返回 ID; 调用 handler; 同步写入 200 application/json.
+    - 非 initialize 必须带合法 ID; 缺 header 400 + -32600; 未知/过期 ID 404 + -32001; handler response 写 200 application/json; notification/response 走 202 空 body.
+  - GET 路径: v1 不实现 Server-to-Client SSE;返 405 Method Not Allowed (docs §3.3 state table "可选 GET 405 - 只关闭 SSE 不影响 POST").
+  - DELETE 路径: 带 Mcp-Session-Id 销毁; 成功返 204 No Content; 缺 header 返 405; 未知 ID 返 404.
+  - session map 锁下 create/find/touch/delete; handler 不持锁. 30min idle sweeper goroutine 周期 1min 主动清理. Server Close 标记所有 session closed 并清空 map.
+  - Origin 校验 (防 DNS rebinding): 缺失 Origin 允许非浏览器; 存在必须精确命中非空 allowlist; allowlist为空或不匹配 → 403.
+  - randomSessionID32: 32-byte crypto/rand base64 RawURL (与 SSEServer 16-byte 区分, docs §4 明示 32-byte).
+- `internal/mcp/server_streamable_http_test.go` (~370 行): 10 个端到端测试 (raw HTTP POST, 不依赖 streamable_http client 互连, 用 http.DefaultClient):
+  - TestStreamableHTTPServerE2E: initialize→Mcp-Session-Id header→notifications/initialized 202→tools/list 200→tools/call 200 echo:hello-stream→ping 200→resources/list 200 -32601→DELETE 204→DELETE 再来 404→后续 POST 404 + -32001.
+  - TestStreamableHTTPServerRejectsMissingSession: 非 initialize POST 缺 session ID → 400 + -32600.
+  - TestStreamableHTTPServerRejectsInitializeWithExistingSession: initialize 带 session ID → 400.
+  - TestStreamableHTTPServerRejectsBatch: POST body 是 JSON 数组 → 400 + -32600.
+  - TestStreamableHTTPServerRejectsMalformedBody: POST body 非 JSON → 400 + -32700.
+  - TestStreamableHTTPServerGET405: GET → 405 + Content-Type: text/event-stream.
+  - TestStreamableHTTPServerDELETEWithoutSession: DELETE 缺 session ID → 405.
+  - TestStreamableHTTPServerOriginAllowlist: 非空 allowlist + allowed Origin 200 + disallowed Origin 403 + 无 Origin 200.
+  - TestStreamableHTTPServerEmptyOriginAllowlist: 空 allowlist + 任何 Origin → 403; 无 Origin 200.
+  - TestStreamableHTTPServerCtxCancelExit: Serve ctx 取消 → Shutdown → 退出.
+
+**修改**:
+- `internal/mcp/server.go`: NewMCPServer switch case `"streamable_http"` 接入 `net.Listen("tcp", cfg.Addr)` + `NewStreamableHTTPServer(listener, cfg.Path, cfg.OriginAllowlist)`; Addr 缺失仍返 ErrMCPConfig (根 Validator 校验已通过防御). 注释同步 v1 三种 transport 全实现.
+- `internal/mcp/manager_test.go`:
+  - 拆分原 `TestManagerPrepareRejectsEnabledButUnsupportedTransport` → `TestManagerPrepareRejectsNetworkServerWithoutAddr` (sse/streamable_http 缺 Addr fail-fast).
+  - 新增 `TestManagerPrepareAcceptsAllSupportedTransports` (3 subcase: stdio/sse/streamable_http Addr=127.0.0.1:0 + AgentID + ExposedTools=echo 全部 Prepare 成功; Stop 释放 listener).
+- `docs/mcp/checklist.md`:
+  - §3 会话管理勾选完成 (stdio + SSEServer + StreamableHTTPServer 三种 transport 多 session 全部交付).
+  - §5/§6 Server side marker 同步 progress #21 新增 (StreamableHTTPServer 落地细节).
+
+### 验证
+```
+go build ./...     # 18 包全过
+go vet ./...       # 无 warning
+go test -count=1 -timeout 300s ./...   # 18 包全绿
+go test -count=1 -timeout 120s ./internal/mcp/ -run TestStreamableHTTPServer -v   # 10 例 PASS
+```
+
+### 决策记录
+- **Single endpointPath vs 双 path (SSE 双 path 是 legacy compat 不得以)**: Streamable HTTP 文档描述 POST/GET/DELETE 共用同一 endpointPath (不像 legacy SSE 用 endpoint + messages 双 path), 由 r.Method 校验分发; mux.Handle(s.endpointPath, ...) 单 handler 覆盖三种 method.
+- **GET v1 返 405 only-close-SSE**: docs §3.3 "可选 GET" + §3.3 状态表 "可选 GET 405 - 只关闭 Server-to-Client SSE; POST transport 仍可用". Yaa! v1 不实现 GET-to-server-push SSE (client side StreamableHTTPClient 也不发 GET/DELETE, v1 stateless); 后续 GET SSE 流接入留下一个增量 commit (含 Last-Event-ID 续传 client/server 对称).
+- **DELETE v1 返 204 No Content**: docs §3.3 "DELETE 成功返 200 OK 或 204 No Content", 选 204 (空 body 更紧凑, 与 manager Stop teardown 一致).
+- **session ID 用 32-byte crypto/rand + base64 RawURL**: docs §4 明示 32-byte, 与 SSEServer 的 16-byte 不同 (SSE session_id 通过 SSE frame data 字段而非 header, 字节数无文档约束).
+- **session map 锁下 create/find/touch/delete**: 文档 §4 明示; touch (lookupSession 刷 lastActive) + create (上限检查) + delete (mark closed delete) 都在 mu 下; handler 处理一个 POST 期间不持锁 (handler 返回的 *Message 已不依赖 Transport 状态).
+- **30min idle 用 sweeper goroutine (周期 1min)**: 不依赖 r.Context() (单 TCP 关掉不销毁 session 仍要存活 30min 直至 client 真断), 文档 §4 "单次 TCP/HTTP 连接关闭不销毁 session".
+- **Origin 校验策略**: 缺失 Origin header 允许 (非浏览器 client); 存在必须命中非空 allowlist — 这是 DNS rebinding 防御标准模式 (browser fetch 含 Origin header). allowlist 为空且 Origin 存在 → 403 (强制 allowlist 显式).
+- **body 上限 4 MiB (sseMessageMaxBytes 复用)**: 与 stdio/sse 一致 (docs §2 表). MaxBytesReader 触发 413 + -32700.
+- **数组/batch 防御 (400 + -32600)**: docs §3.3 "每个 HTTP body 只允许一个 JSON-RPC message; 数组/batch 返回 HTTP 400 和 JSON-RPC -32600". 通过 strings.HasPrefix(trimmed, "[") 简单检测.
+- **孤立 response 拒绝 (400 + -32600)**: Server 不发起 request, 不接受 POST 单走的 response (类似 stdio handle 同一防御).
+- **handler hard fail → 500 + -32603**: 文档未明示 handler 返 err 的语义, 与 SSEServer 一致退化.
+- **不引入 in-memory event buffer 重发 (Last-Event-ID 等)**: v1 stateless POST-response 模式不依赖 Server 端 - to -client 推送; 后续 GET SSE 流接入时同步考虑.
+- **reuse sseMessageMaxBytes 常量 + 不重复定义**: sse.go 已定义, streamable_http_server 仍用同一上限, 避免 per-transport 常量分歧.
+
+### 本地 MCPServer 三种 transport 全部交付里程碑
+
+- stdio (progress #19): ServerSession 状态机 + 单 session + cursor 分页
+- legacy SSE (progress #20): 多 session (16-byte session_id) + GET SSE 流 + endpoint/heartbeat/message 帧 + Last-Event-ID 接收 (v1 不续传)
+- Streamable HTTP (progress #21): 多 session (32-byte Mcp-Session-Id header) + POST 同步 response + DELETE 销毁 + 1024 上限 + Origin allowlist DNS rebinding 防护 + 30min idle sweep
+
+### 下一轮方向
+1. commit + push gitea/main
+2. Streamable HTTP Client GET SSE 流 + DELETE terminate session (client side v1 stateless → fully stateful 增量 commit):
+   - 客户端在 initialize 拿到 Mcp-Session-Id 后可发 GET 打开 server-to-client SSE 流; DELETE 显式销毁 session.
+   - server-to-client 流接 listChanged notification 等异步事件 (Server 端 GET v2 实现 - 当前 GET 返 405 占位)
+3. Agent/Session/Provider 集成 (checklist §9 §2):
+   - MCP Tool 在 Agent turn 投影到 Provider Function 列表
+   - Session 视图按 Agent allowall 投影可用 MCP Tool
+4. Planner step 1-10 (docs/planner/): 完全没动.
+5. Remote API `GET /api/v1/mcp/servers` + `:name` (checklist §9).
+6. 文档副债 (W1/W2/W4).

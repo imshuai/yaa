@@ -92,7 +92,7 @@ func NewMCPServer(tools *tool.Manager, cfg config.MCPExposeConfig) (*MCPServer, 
 		digest:    catalogDigest(catalog),
 		serveDone: make(chan struct{}),
 	}
-	// v1: stdio 与 legacy sse 已实现 (progress #19 stdio, #20 sse); streamable_http 留下 commit.
+	// v1: stdio + legacy sse + streamable_http 三种 transport 全部实现 (progress #19 stdio + #20 sse + #21 streamable_http).
 	switch cfg.Transport {
 	case "stdio":
 		s.transport = NewStdioServer()
@@ -107,7 +107,15 @@ func NewMCPServer(tools *tool.Manager, cfg config.MCPExposeConfig) (*MCPServer, 
 		}
 		s.transport = NewSSEServer(listener, cfg.Path, cfg.MessagesPath)
 	case "streamable_http":
-		return nil, fmt.Errorf("%w: mcp.server.transport=%q not supported in current build (待 StreamableHTTPServer commit)", ErrMCPConfig, cfg.Transport)
+		// docs §6: streamable_http 走 net.Listen("tcp", cfg.Addr); 默认绑 loopback (根 Validator 校验).
+		if cfg.Addr == "" {
+			return nil, fmt.Errorf("%w: mcp.server.addr required for transport=%q", ErrMCPConfig, cfg.Transport)
+		}
+		listener, err := net.Listen("tcp", cfg.Addr)
+		if err != nil {
+			return nil, fmt.Errorf("%w: listen %s: %v", ErrMCPConfig, cfg.Addr, err)
+		}
+		s.transport = NewStreamableHTTPServer(listener, cfg.Path, cfg.OriginAllowlist)
 	default:
 		return nil, fmt.Errorf("%w: mcp.server.transport=%q unknown", ErrMCPConfig, cfg.Transport)
 	}
