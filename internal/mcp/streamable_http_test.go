@@ -421,3 +421,201 @@ func TestStreamableHTTPClientCheckRedirectReject3xx(t *testing.T) {
 	}
 }
 
+
+// fakeStreamableServerWithSSE 是 newFakeStreamableServer 的增强版: 记录 DELETE 与 GET 调用,
+// 可选在 GET 路径返 SSE event 流推送自定义 message 帧 (用来驱动 Client.runSSERecvLoop 接收).
+type fakeStreamableServerWithSSE struct {
+	*fakeStreamableServer
+	deleteCount atomic.Int32
+	getCount    atomic.Int32
+	getPush     []byte // 若非空则 GET 返 200 text/event-stream 推送 (单条 SSE frame)
+	getPushOnce atomic.Bool
+}
+
+func newFakeStreamableServerWithSSE(t *testing.T, withSession bool) *fakeStreamableServerWithSSE {
+	t.Helper()
+	inner := newFakeStreamableServer(t, withSession) // 创建一个 fake server
+	f := &fakeStreamableServerWithSSE{fakeStreamableServer: inner}
+	// 把 inner 的 server handler 替换为 f.handleEnhanced (获得 GET/DELETE 计数 + SSE 推送).
+	inner.server.Config.Handler = http.HandlerFunc(f.handleEnhanced)
+	return f
+}
+
+func (f *fakeStreamableServerWithSSE) handleEnhanced(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		f.getCount.Add(1)
+		if len(f.getPush) == 0 {
+			// v1 StreamableHTTPServer 的 GET 行为: 返 405 only-close SSE.
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		// 200 + text/event-stream + 推送一条 message 帧.
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(f.getPush)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		// 然后阻塞直到 client 关 GET 流 (r.Context().Done) 让 connection 优雅退出.
+		<-r.Context().Done()
+		return
+	case http.MethodDelete:
+		f.deleteCount.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	default:
+		// POST 走原 handle.
+		f.fakeStreamableServer.handle(w, r)
+	}
+}
+
+// TestStreamableHTTPClientGETProbedOnceAndGraceful405 验证 transport 在 Send initialize 拿到
+// Mcp-Session-Id header 后异步发一次 GET 试探 SSE 流; Server 返 405 → runSSERecvLoop graceful 退出;
+// Close 等退出 + 发 DELETE. 直接 transport 层 (不走 Client wrapper 避免与 Client runRecvLoop 竞 recvCh).
+func TestStreamableHTTPClientGETProbedOnceAndGraceful405(t *testing.T) {
+	f := newFakeStreamableServerWithSSE(t, true)
+	tr := NewStreamableHTTPClient(f.url, nil, nil, nil)
+	if err := tr.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	initMsg := &Message{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage("1"),
+		Method:  "initialize",
+		Params:  json.RawMessage(`{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}`),
+	}
+	if err := tr.Send(ctx, initMsg); err != nil {
+		t.Fatalf("Send initialize: %v", err)
+	}
+	// tr.Recv 取 initialize 响应 (POST 同步 application/json 投递 recvCh).
+	resp, rerr := tr.Recv(ctx)
+	if rerr != nil || resp == nil || resp.Result == nil {
+		t.Fatalf("Recv initialize: err=%v msg=%v", rerr, resp)
+	}
+	// 等 async GET (GET 路径返 405; runSSERecvLoop graceful 退出).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if f.getCount.Load() >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := f.getCount.Load(); got != 1 {
+		t.Errorf("GET count: got %d want 1 (transport should probe once after init)", got)
+	}
+	// Close 应等 sseLoopDone 完成后发 DELETE.
+	if err := tr.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	if got := f.deleteCount.Load(); got != 1 {
+		t.Errorf("DELETE count: got %d want 1 (Close should DELETE terminate)", got)
+	}
+}
+
+// TestStreamableHTTPClientGETReceivesServerPushSSE 验证 Server 在 GET 路径返 200 + text/event-stream
+// 并推送一条 message event; transport.recDSERecvLoop 把它投递 recvCh, 第二次 tr.Recv 应取出该 notification.
+func TestStreamableHTTPClientGETReceivesServerPushSSE(t *testing.T) {
+	f := newFakeStreamableServerWithSSE(t, true)
+	// 编一条 message event 给 GET 流推送 (notifications/tools/list_changed).
+	notification := "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n"
+	f.getPush = []byte(notification)
+	tr := NewStreamableHTTPClient(f.url, nil, nil, nil)
+	if err := tr.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	initMsg := &Message{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage("1"),
+		Method:  "initialize",
+		Params:  json.RawMessage(`{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}`),
+	}
+	if err := tr.Send(ctx, initMsg); err != nil {
+		t.Fatalf("Send initialize: %v", err)
+	}
+	// 第一次 Recv → initialize 响应 (POST 同步路径).
+	_, rerr := tr.Recv(ctx)
+	if rerr != nil {
+		t.Fatalf("Recv init: %v", rerr)
+	}
+	// 第二次 Recv → SSE 流推送的 notification.
+	msg, rerr := tr.Recv(ctx)
+	if rerr != nil {
+		t.Fatalf("Recv SSE: %v", rerr)
+	}
+	if msg == nil || msg.Method != "notifications/tools/list_changed" {
+		t.Errorf("Recv SSE: msg=%v method=%q want notifications/tools/list_changed", msg, msgMethodString(msg))
+	}
+	if err := tr.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	if got := f.deleteCount.Load(); got != 1 {
+		t.Errorf("DELETE count: got %d want 1", got)
+	}
+}
+
+// msgMethodString 安全取 Message.Method 用于 error 报告.
+func msgMethodString(m *Message) string {
+	if m == nil {
+		return "<nil>"
+	}
+	return m.Method
+}
+
+// TestStreamableHTTPClientDELETEHandles404IdempotentClose 验证 Close 时 DELETE 404 幂等忽略, 不返错.
+func TestStreamableHTTPClientDELETEHandles404IdempotentClose(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			var m Message
+			_ = json.Unmarshal(body, &m)
+			if m.Method == "initialize" {
+				w.Header().Set("Mcp-Session-Id", "sess-xyz")
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"f","version":"1"}}}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+			return
+		}
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}))
+	defer srv.Close()
+
+	tr := NewStreamableHTTPClient(srv.URL, nil, nil, nil)
+	if err := tr.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	initMsg := &Message{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage("1"),
+		Method:  "initialize",
+		Params:  json.RawMessage(`{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}`),
+	}
+	if err := tr.Send(ctx, initMsg); err != nil {
+		t.Fatalf("Send init: %v", err)
+	}
+	_, _ = tr.Recv(ctx)
+	if err := tr.Close(); err != nil {
+		t.Errorf("Close with DELETE 404: %v (should be nil idempotent)", err)
+	}
+}

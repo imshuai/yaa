@@ -80,7 +80,7 @@ v1 副债：listTools 严格 DTO 的 DisallowUnknownFields（当前 request Unma
 - [x] Client transport: `StreamableHTTPClient` 实现 ClientTransport (Server transport 待 §3 本地 Server)
 - [x] POST JSON-RPC，Accept 支持 JSON 与 SSE — POST Accept: application/json, text/event-stream; Content-Type: application/json; response body JSON 单对象或 SSE 流多帧解析 parseSSEFrame
 - [x] 可选 `Mcp-Session-Id`：上游未返回时 Client 保持 stateless；获得时后续 POST 必带 — `sessionID` 字段记录; NewStreamableHTTPClient 不强制要求 server 返 (stateless 模式)
-- [ ] 同一 endpoint 的 POST/GET/DELETE 语义 — v1 仅 POST (stateless + session 复用模式); GET SSE 流与 DELETE 终止留后续 commit (docs 明示 stateless Client 不发 GET/DELETE)
+- [x] 同一 endpoint 的 POST/GET/DELETE 语义 — v1 POST 同步响应 (stateless + session 复用) + initialize 拿到 Mcp-Session-Id 后 async GET 试探 Server-to-Client SSE 流 (200+text/event-stream → runSSERecvLoop 投 recvCh; 405/非 SSE → graceful 退出不影响 POST) + Close cancel SSE loop + 发一次 DELETE 终止 session (404/405 幂等忽略) (progress #22)
 - [x] TLS 与认证 Header 注入 — http.Client 由调用方配 TLS (Manager 用 defaults); headers 注入每条 POST
 - [x] 任何已经发送的 `tools/call` 都不自动重放 — Send POST 无重试; 失败直接 recvCh err; Manager attemptReconnect 路径重建 Client 重新 initialize + Discover 才服务新调用
 

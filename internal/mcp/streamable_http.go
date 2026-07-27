@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/exp/slog"
 )
@@ -41,6 +43,13 @@ type StreamableHTTPClient struct {
 	recvReady chan struct{} // Start 完成 close; Recv 在此阻塞
 	closeOnce sync.Once
 	recvCh    chan recvItem // Post 投递的响应或事件
+
+	// Server-to-Client SSE 流字段. 仅当 initialize 拿到 Mcp-Session-Id 后启动一次 GET 试探.
+	// 200 + text/event-stream → 启动 SSE recvLoop goroutine 投递 recvCh; 405/其他 → graceful 关掉, 不影响 POST 模式.
+	sseStarted   uint32         // atomic: 0 未尝试 GET, 1 已尝试 (不管成功与否)
+	sseCtx       context.Context // 由 openServerToClientStream 创建, 与 Start 同生命周期 (Close cancel)
+	sseCancel    context.CancelFunc
+	sseLoopDone  chan struct{} // SSE recvLoop 退出信号; nil 表示未启动
 }
 
 // recvItem 是 Send 后投递到 recvCh 的中间结构.
@@ -159,8 +168,14 @@ func (c *StreamableHTTPClient) Send(ctx context.Context, msg *Message) error {
 	// 提取 Mcp-Session-Id 首次响应返回则保存.
 	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
 		c.mu.Lock()
+		first := c.sessionID == ""
 		c.sessionID = sid
 		c.mu.Unlock()
+		if first {
+			// Async 试探 GET 打开 Server-to-Client SSE 流 (docs §3.3 "可选 GET"; 405 → graceful);
+			// 不阻塞 Send; 失败不影响 POST 模式.
+			go c.tryOpenServerToClientStream(context.Background())
+		}
 	}
 
 	// 检查是否请求类 (request Id + method) 或 notification; 通知无 body 直接成功.
@@ -307,19 +322,146 @@ func (c *StreamableHTTPClient) Recv(ctx context.Context) (*Message, error) {
 	}
 }
 
-// Close 幂等关闭. v1 不发 DELETE (stateless + session header 复用模式): docs §3.3
-// DELETE 携 session terminate; stateless client 不发. (后续接 server SSE 流时再补 DELETE.)
+// Close 幂等关闭. 拿到 session ID 后 (stateful client):
+//   - cancel SSE recvLoop + 等 sseLoopDone 退出;
+//   - 发一次 DELETE 终止 session (docs §3.3 DELETE 成功 200/204, 404/405 幂等忽略);
+//   - 失败或无 session (stateless mode) 不返错.
+// DELETE 由独立的短超时 ctx 控制; 不阻塞 Close 主路径过久.
 func (c *StreamableHTTPClient) Close() error {
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
 		c.closed = true
+		sid := c.sessionID
+		sseCancel := c.sseCancel
+		sseLoopDone := c.sseLoopDone
 		c.info.Connected = false
 		c.mu.Unlock()
-		// 关 recvCh 让 recvLoop 自然走 EOF 路径 (TransportClosed).
-		// 但 channel 是发送入队列; 直接 drain + close 需保护 recvLoop 独有读路径.
-		// Ponytail: 不 close channel (避免 panic); recvCh 仅通过 ctx 取消/Recv 路径退出. Client.Close 已 cancel connCtx.
+		if sseCancel != nil {
+			sseCancel()
+		}
+		if sseLoopDone != nil {
+			<-sseLoopDone
+		}
+		if sid != "" {
+			c.sendDelete(context.Background(), sid)
+		}
 	})
 	return nil
+}
+
+// tryOpenServerToClientStream 试探性发送一次 GET 打开可选 Server-to-Client SSE 流 (docs §3.3 "可选 GET").
+// 仅在 initialize 拿到 Mcp-Session-Id 后调用一次 (atomic CAS 保证); 200 + text/event-stream → 启动 SSE recvLoop
+// goroutine 读取 server push 帧投递 recvCh; 405 → graceful 关闭, 不影响 POST 模式.
+func (c *StreamableHTTPClient) tryOpenServerToClientStream(parent context.Context) {
+	if !atomic.CompareAndSwapUint32(&c.sseStarted, 0, 1) {
+		return // 已 tried.
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	sid := c.sessionID
+	if sid == "" {
+		c.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(parent)
+	c.sseCtx = ctx
+	c.sseCancel = cancel
+	c.sseLoopDone = make(chan struct{})
+	url := c.url
+	headers := c.headers
+	client := c.client
+	logger := c.logger
+	c.mu.Unlock()
+
+	go c.runSSERecvLoop(ctx, url, sid, headers, client, logger)
+}
+
+// runSSERecvLoop 发 GET 请求打开 SSE 流并持续 readSSEFrame → 投递 recvCh;
+// 405/非 event-stream → graceful 退出 (serverPushActive=false, POST 模式继续); ctx 取消或连接中断则退出.
+func (c *StreamableHTTPClient) runSSERecvLoop(ctx context.Context, url, sid string, headers map[string]string, client *http.Client, logger *slog.Logger) {
+	defer close(c.sseLoopDone)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		logger.Info("mcp streamable_http sse open build req", "err", err)
+		return
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Mcp-Session-Id", sid)
+	resp, err := client.Do(req)
+	if err != nil {
+		// ctx 取消或连接断; 不投错到 recvCh (Close 流程触发).
+		if ctx.Err() == nil {
+			logger.Info("mcp streamable_http sse open dial", "err", err)
+		}
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		// 405 / 其他: docs §3.3 "可选 GET 405 - 只关闭 SSE 不影响 POST"; 不报错.
+		return
+	}
+	ctype := resp.Header.Get("Content-Type")
+	if !strings.Contains(ctype, "text/event-stream") {
+		// 非 SSE: 也 graceful 退出.
+		return
+	}
+	reader := bufio.NewReaderSize(resp.Body, streamableMessageMaxBytes+4096)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		frame, ferr := readSSEFrame(reader)
+		if ferr != nil {
+			// EOF / 错: server 关流或读流断; graceful 不报 ErrMCPProtocolError (与 SSEClient 一致易处理).
+			return
+		}
+		if frame.event != "" && frame.event != "message" {
+			continue
+		}
+		if len(frame.data) == 0 {
+			continue
+		}
+		var m Message
+		if jerr := json.Unmarshal(frame.data, &m); jerr != nil {
+			continue
+		}
+		select {
+		case c.recvCh <- recvItem{msg: &m}:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// sendDelete 发一次 DELETE 终止 session. docs §3.3:
+//   - 成功: 200 / 204 (Client 不区分; 都是干净退出);
+//   - 404 / 405: 幂等忽略 (Close 的 DELETE 404/405 幂等忽略 docs §3.3 错误表最后一行);
+//   - 其他非 2xx/超时: 仅日志, 不返错 (Close 不应因为 DELETE 失败 panic).
+func (c *StreamableHTTPClient) sendDelete(parent context.Context, sid string) {
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.url, nil)
+	if err != nil {
+		return
+	}
+	for k, v := range c.headers {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Mcp-Session-Id", sid)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, streamableRespBodyCap))
 }
 
 // Info 返当前 transport 元数据.

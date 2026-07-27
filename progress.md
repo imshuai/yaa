@@ -1936,3 +1936,38 @@ go test -count=1 -timeout 120s ./internal/mcp/ -run TestStreamableHTTPServer -v 
 4. Planner step 1-10 (docs/planner/): 完全没动.
 5. Remote API `GET /api/v1/mcp/servers` + `:name` (checklist §9).
 6. 文档副债 (W1/W2/W4).
+
+## progress #22 — Streamable HTTP Client stateful 升级 (GET SSE + DELETE terminate session)
+
+**Commit (将提交)**: 本轮工作树未提交 → commit 后 push gitea/main.
+
+**目标**: StreamableHTTPClient 从 v1 stateless-only 升级为 fully stateful. 上游 server 返 Mcp-Session-Id header 后客户端: 首次 Send initialize 响应触发 async GET 试探 Server-to-Client SSE 流 (docs §3.3 "可选 GET" + §3.3 状态表 "可选 GET 405 - 只关闭 SSE 不影响 POST"); Close 时 cancel SSE loop + 发一次 DELETE terminate session (docs §3.3 "DELETE 成功 200/204, 404/405 幂等忽略").
+
+**实现** (`internal/mcp/streamable_http.go`):
+- import 加 `sync/atomic` + `time`.
+- struct 加字段 `sseStarted uint32` (atomic CAS 保证 GET 试探只启一次) + `sseCtx`/`sseCancel` + `sseLoopDone chan struct{}`.
+- Send 中首次拿到 `Mcp-Session-Id` header (`first := c.sessionID == ""`) 后异步 `go c.tryOpenServerToClientStream(context.Background())` (不阻塞 Send).
+- 新增 `tryOpenServerToClientStream(parent)`: atomic CAS sseStarted 0→1; 取 sid/url/headers/client/logger 后创建 sseCtx/sseCancel/sseLoopDone + 启 `runSSERecvLoop` goroutine.
+- 新增 `runSSERecvLoop(ctx, url, sid, headers, client, logger)`: GET + Accept text/event-stream + Mcp-Session-Id header → 200 + text/event-stream 才进 readSSEFrame 循环; event 非 "" 且 != "message" 跳过 (仅消费 message 帧); 非 200 / 非 SSE → graceful return 不报错; ctx 取消或 EOF → 退出; message 帧投 `recvCh` 与 POST 同步响应共用 (Client recvLoop 统一消费, docs §3.3 "客户端以 JSON-RPC id 关联响应").
+- Close 改为: cancel sseCtx + 等 sseLoopDone (确保 SSE goroutine 退出再发 DELETE, 避免 handler 仍持有 body) + `sendDelete(parent, sid)` (5s timeout; drain body 16KiB; 404/405 幂等不返错).
+
+**测试** (`internal/mcp/streamable_http_test.go`, +3 例 纯 transport 层 tr.Start + tr.Send + tr.Recv, 不走 Client wrapper 避免与 Client runRecvLoop 竞 recvCh):
+- `fakeStreamableServerWithSSE` helper: 嵌入 `*fakeStreamableServer` + `deleteCount`/`getCount` atomic.Int32 + `getPush []byte`; handleEnhanced GET → 计数 + 200 text/event-stream 写一条 frame + `<-r.Context().Done()` 阻塞等 client 关流; DELETE → 计数 + 204; POST 走原 fakeStreamableServer.handle.
+- `TestStreamableHTTPClientGETProbedOnceAndGraceful405`: Server GET 返 405 → runSSERecvLoop graceful 退出; 轮询等 async GET count=1 → Close → DELETE count=1.
+- `TestStreamableHTTPClientGETReceivesServerPushSSE`: Server GET 返 200 + 推 `notifications/tools/list_changed` message frame; 第一次 tr.Recv 取 initialize POST 响应, 第二次 tr.Recv 取 SSE notification; Close 后 DELETE count=1.
+- `TestStreamableHTTPClientDELETEHandles404IdempotentClose`: Server DELETE 返 404 + Close 返 nil (幂等忽略, docs §3.3 错误表最后一行).
+
+**验证**:
+```
+go vet ./internal/mcp/   # 通
+go test -count=1 -timeout 60s ./internal/mcp/ -run "TestStreamableHTTPClientGETProbedOnce|TestStreamableHTTPClientGETReceivesServerPushSSE|TestStreamableHTTPClientDELETEHandles404" -v   # 3 例 PASS
+go build ./... && go vet ./... && go test -count=1 -timeout 300s ./...   # 18 包全绿 (TestManagerPrepareSSEAutoStartRegistersTools 首跑偶现 5s deadline flake, 单独稳定通过)
+```
+
+**决策记录**:
+- **GET 试探只启动一次**: atomic CAS sseStarted 0→1 (与 session ID 同步点在 Send 的 `first := c.sessionID == ""` 判断). 防 session 复用模式下重复 GET.
+- **GET 与 POST recvCh 共用**: docs §3.3 "客户端以 JSON-RPC id 关联响应"; SSE goroutine 把 message 帧投同一 recvCh, Client wrapper recvLoop 统一消费. 测试为避免与 Client runRecvLoop 竞争同一 recvCh, 用纯 transport 层 tr.Recv 不走 wrapper.
+- **GET 路径 graceful 不报 ErrMCPProtocolError**: 与 SSEClient 关流一致 (server 主动 EOF / ctx 取消 / 405 都是正常退出, 不向 recvCh 投错误).
+- **DELETE 5s timeout 防卡 Close**: parent 用 context.Background() (Close 不应被 Send 的 ctx 取消所阻断); body drain 上限 `streamableRespBodyCap` (16KiB) 防 server 写大 body 卡 Close.
+- **404/405 DELETE 幂等**: docs §3.3 错误表最后一行明示 "DELETE 404/405 幂等忽略"; sendDelete 不分类非 2xx 都不返 err.
+- **handleEnhanced GET 200 path 推完 frame 后 `<-r.Context().Done()` 阻塞**: 前一轮担心 `runSSERecvLoop` 读完 frame 后阻塞在 readSSEFrame. 实测不阻塞因为: (1) 测试 tr.Recv 取出 notification 后立即 tr.Close() → sseCancel 取消 req ctx → runSSERecvLoop 的 ReadString 因 request context cancel 通过 http transport 解除阻塞返 err → graceful return; (2) Server handler 的 `<-r.Context().Done()` 同步解除. 闭环 0.01s.
