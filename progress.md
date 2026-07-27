@@ -1253,3 +1253,66 @@ Connect 顺序改为**先 transport.Start 再 startLoops** —— startLoops 启
 - Python fake MCP server 用 `-c` inline 字符串避免临时文件管理；每个测试独立 python subprocess 不复用
 - 删 cmd/yaasmoke + /tmp 辅助脚本：诊断工具复用任务结束，按 ponytail "few files, no scaffolding" 原则不留
 - 选用 `exec.Command`（不是 `exec.CommandContext`）：避免 ctx cancel 触发立即 SIGKILL 绕过 stdin.close 等待路径；Close 自己控 5s 超时
+
+---
+
+## #11 Manager.runUpstream 雏形 + Tool Stable Proxy 集成 (HEAD 待 push)
+
+### 范围
+checklist §1 runUpstream + §7 Tool 映射 + §9 集成（与 Tool Manager + Runtime shutdown）。SSE / Streamable HTTP / heartbeat / catalog reconciliation / 指数退避重连留后续 commit。
+
+### 改动文件
+- **`internal/mcp/proxy.go` 新建** (~145 行)：`ProxyHandle{atomic.Pointer[Client]}` + `MCPToolProxy` 实现 `tool.Tool` 接口（Name/Description/Parameters/Execute）+ `toToolResult` （多 text 块 \n 连接，isError 透传，非 text → ErrMCPUnsupportedContent，nil result → ErrMCPProtocolError）+ `toMCPResult`（反向映射，留待本地 MCPServer commit 用）。
+  - 采用 docs/mcp/integration.md §1 代码样例，但补 `description` 字段（原样例缺省会被 `tool.ToolManager.Register` 拒空描述 → 文档先修）。
+  - Execute：handle nil → `ErrMCPUnavailable`；非零 `timeout` 用 `WithCancelCause + AfterFunc`（Go 1.20 无 `WithTimeoutCause`）；返回前查 caller ctx 与 callCtx cause。
+- **`internal/mcp/manager.go` 重写** (~310 行，公开 API 签名不变)：
+  - `serverEntry` 扩 `cfg config.MCPServerConfig + handle *ProxyHandle + client *Client + status ServerStatus + tools []tool.ToolInfo`。
+  - `NewManager` 缓存 cfg + 默认 stdio transport + 初始 ServerStatus 全 disconnected。
+  - `Prepare`：遍历 auto_start=true 的 stdio server → `StdioClient + NewClient` → `Connect(connTimeout)` → `Initialize(initTimeout)` → `DiscoverTools(initTimeout hardcap)` → 每个 tool 注册 `MCPToolProxy` 到 ToolManager；success → Store handle + Status=connected + ToolCount + ConnectedAt。
+    - 非 stdio transport 标 LastError="transport not supported in current build" 跳过（SSE / Streamable HTTP 待后续）。
+    - 单 server 失败仅 LastError + Status=Error，**不阻断其他 server**（docs/integration.md §4）。
+    - connect/init timeout 配置优先：`mcp.servers[i].timeout > mcp.timeout.connect/init`，缺省分别 10s/15s。
+  - `Stop`：cancelRun + 关每个已建立 client (`Close` 幂等) + `handle.Store(nil)` + status 复位 Disconnected + close(done) + ready=false。
+  - `List/Get/Tools` 投影真实状态（ConnectedAt 指针深拷贝；Tools 未连接或无 Tool → (nil,false)）。
+  - `ProtocolVersion` 字段本轮仍 nil：Client 未暴露协商版本 getter，未引入额外 API 扩展（留 SSE/Streamable HTTP commit 补）。
+- **`docs/mcp/integration.md` §1 修正**：MCPToolProxy 结构补 `description string` 字段（原文档样例省略，会导致 ToolManager.Register 拒空描述）+ 补 Name/Description/Parameters 方法注释。
+- **`docs/mcp/checklist.md`**：
+  - §1 runUpstream 勾选 + Prepare/Stop/Get/Tools/List 备注更新为本轮实际行为
+  - §2 Client 整 11 项补勾选（前轮忘勾，progress #10 已记）
+  - §7 Tool 映射：勾 9 项（适配/前缀/schema/结果/错误/稳定 Proxy/共享 handle/超时/分页），仅留 catalog reconciliation 重连原子替换 handle 未实现
+  - §9 集成：勾 Tool Manager 集成 + Skill binding 之前注册 + Runtime shutdown Stop/Done/fresh-Stop（runtime.go:344-347 已落地，本轮补勾）
+- **`internal/mcp/manager_integration_test.go` 新建** (~300 行)：复用 stdio_test.go 的 `fakeMCPStdioServer` Python 脚本，5 例端到端 + 5 例纯函数测试：
+  - `TestManagerPrepareAutoStartStdioRegistersTools`：auto_start stdio → connected + ToolCount=2 + ConnectedAt 非 nil + Tools() 返 mcp.fake.alpha/beta + Source="mcp"
+  - `TestManagerToolProxyCallViaToolManager`：经 `tool.Manager.Execute(ctx, scope, "mcp.fake.alpha", {})` 拿到 "hello alpha"
+  - `TestManagerPrepareStdioAutoStartFailureMarksError`：command 不存在 → Status=error + LastError 非空 + ToolCount=0 + Prepare 不返错
+  - `TestManagerPrepareAutoStartFalseLeavesDisconnected`：auto_start=false 不被 Prepare 启动
+  - `TestManagerStopDisconnectsClients`：Stop 后所有 server 回 Disconnected + Tools 返 (nil,false)
+  - `TestMCPToolProxyUnavailableWhenHandleNil`：handle nil → Execute 返 `ErrMCPUnavailable` + Name/Description 浅校验
+  - `TestToToolResult{JoinsText,RejectsNonText,NilResult,WrapsErr}`：4 例纯函数
+
+### 验证
+```
+HTTP_PROXY=... go vet ./internal/mcp/      # 通过
+HTTP_PROXY=... go build ./...              # 18 包全过
+HTTP_PROXY=... go vet ./...                # 全项目无 warning
+HTTP_PROXY=... go test -count=1 -timeout 120s ./internal/mcp/
+  # ok 1.970s — 55 例全绿 (13 manager + 9 transport + 15 client + 8 stdio + 10 本轮新)
+HTTP_PROXY=... go test -count=1 -timeout 240s ./...
+  # 18 包全过，WS flake 本轮未触发（详见 progress 早前记录）
+```
+
+### 决策
+- **ServerStatus.ProtocolVersion 本轮 nil**：Client 未暴露协商版本 getter，本轮不为此扩展 Client API；LE 与 docs *string 可选定义对齐。SSE / Streamable HTTP commit 实现时一并补。
+- **Tool registration 中途失败不回滚 ToolManager**：Manager 关 client + 标 LastError + Status=Error 收敛；ToolManager.Unregister 回滚属 YAGNI，留后续 catalog reconciliation commit 一起做。
+- **Prepare 同步完成上游连接（无 runUpstream goroutine）**：v1 stdio auto_start 启动是有限并可等待的；Runtime 启动序需要 binding 校验前 Tool 已注册，同步语义最贴近 docs/integration.md §4。heartbeat / 后台重连 / catalog reconciliation 留 async runUpstream commit。
+- **docs/integration.md §1 修正优先于代码**：根据用户规则"发现文档问题先修文档"，MCPToolProxy 缺 description 字段是文档 bug。
+- **stripServerPrefix helper**：DiscoverTools 返回 mcp.<server>.<remote>，注册 Proxy 逆推出 remoteName 给 CallTool 用；正反路径都走 canonicalToolName 保证一致性。
+
+### 下一轮方向
+1. **重连 + catalog reconciliation + heartbeat**（checklist §1 §7 §8）：async runUpstream goroutine 定期 Ping → 失败按 mcp.reconnect 指数退避 → 重新 Initialize + 完整分页 tools/list → 重连后比对 Tool name+description+inputSchema 三元一致才 Store 新 handle，差异保持 unavailable + ErrMCPProtocolError。
+2. **SSE Transport**（checklist §5）：SSEClient Event 流解析 + Last-Event-ID 续传。
+3. **Streamable HTTP Transport**（checklist §6）：POST JSON-RPC + Mcp-Session-Id 状态码映射。
+4. **本地 MCP Server**（checklist §3[+§6 +§9 本地暴露]）：MCPServer handleInitialize/ListTools/CallTool/Ping + -32601 Resource/Prompt。
+5. **ServerStatus.ProtocolVersion 暴露**：给 Client 加 protocolVersion getter（Initialize 校验后保存），Manager 投影到 ServerStatus + 实现 SSE 2024-11-05 路径。
+6. **Worker 集成 Agent / Session / Provider**（checklist §9 §2）：MCP Tool 在 Agent turn 投影到 Provider Function 列表；Session 视图按 Agent allowall 投影可用 MCP Tool。
+7. **Planner step 1-10**（docs/planner/）。

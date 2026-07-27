@@ -31,14 +31,17 @@ type ProxyHandle struct {
 }
 
 type MCPToolProxy struct {
-    server     string
-    remoteName string
-    schema     json.RawMessage
-    timeout    time.Duration // 0 表示只使用 Tool Manager 的 caller deadline
-    handle     *ProxyHandle
+    server      string
+    remoteName  string
+    description string          // MCP 返回的 Tool 描述，非空（ToolManager.Register 拒绝空描述）
+    schema      json.RawMessage
+    timeout     time.Duration  // 0 表示只使用 Tool Manager 的 caller deadline
+    handle      *ProxyHandle
 }
 
-func (p *MCPToolProxy) Execute(ctx context.Context, scope tool.ExecutionScope, params map[string]any) (tool.ToolResult, error) {
+// Name 返回 canonical 名 mcp.<server>.<remote>；Description 返回 MCP 描述；
+// Parameters 返回不可变 JSON Schema 快照。三者与 MCPTool 一同从 DiscoverTools 结果
+// 注入，重连时 Manager 比对三者精确一致才原子替换 client handle。
     client := p.handle.client.Load()
     if client == nil {
         return tool.ToolResult{}, ErrMCPUnavailable

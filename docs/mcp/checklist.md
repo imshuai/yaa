@@ -8,27 +8,31 @@
 ## 1. MCP Manager
 
 - [x] `Manager` 结构体定义（entries、run/stop context、done、logger、mu） — v1 起点已落地；Tool Manager 字段已签名透传，待后续 commit 接 Client / Proxy 后实际使用；本地 MCPServer 字段尚未引入（待 §3 commit）
-- [x] `Get()` / `Tools()` — 返回状态和 Tool 列表深拷贝；v1 起 Tools 返 (nil, false) 无生命周期，Get 返 ServerStatus 副本
-- [x] `List() []ServerStatus` — 列出所有配置的上游连接状态（v1 全 disconnected）
-- [x] `Prepare()` — v1 起骨架返 nil；启动 auto-start Client 并注册稳定 Proxy 部分待后续 lifecycle commit 落地，当前 Prepare 是契约占位
+- [x] `Get()` / `Tools()` — 返回 ServerStatus 副本（含 ConnectedAt 指针深拷贝）+ Tool 列表深拷贝；Tools 在 server 未连接或无 Tool 时返 (nil, false)
+- [x] `List() []ServerStatus` — 列出所有配置的上游连接状态（从 status 字段投影，Prepare 后含 connected / error 真实状态）
+- [x] `Prepare()` — 实现启动 auto-start=true 的 stdio 上游 Client 并注册稳定 Proxy（Connect → Initialize → DiscoverTools → Register MCPToolProxy）；SSE / Streamable HTTP 待 §5/§6 commit；单 server 失败仅标 LastError + Status=Error，不阻断其他
 - [x] `Activate()` — v1：仅当 cfg.Server.Enabled=true 时返 ErrMCPConfig（本地 Serve 实现未交付不静默启用）；disabled 时返 nil
 - [x] `Ready()` — v1 恒 true（无本地 Serve），Stop 后置 false；本地 Serve 意外退出→ unhealthy 待 §3 commit
-- [x] `Stop()` / `Done()` — 同步幂等清空、Done 信号、二次 Stop 返 cache error 已落地；后台用 `errors.Join` 完成 teardown 待 Client / Proxy 引入
-- [ ] `runUpstream` — Manager 唯一拥有 heartbeat、catalog reconciliation 和指数退避重连（未实现，待后续 lifecycle commit）
+- [x] `Stop()` / `Done()` — 同步幂等 cancelRun；关闭每条已建立的 *Client（Close 幂等）+ 置 handle nil；再 close(done) + ready=false；二次 Stop 返 cache error
+- [x] `runUpstream` 雏形 — stdio auto_start 路径已落地（Prepare 同步执行连接 → 握手 → 发现 Tool → 注册 Proxy）；待后续 commit：heartbeat 定期 Ping、catalog reconciliation（重连后比对 tool 三元一致才替换 handle）、指数退避重连、SSE / Streamable HTTP
 
 ## 2. MCP Client
 
-- [ ] `Client` 结构体定义（name、单代 transport、status、mu 与 cancel/done lifecycle）
-- [ ] `Connect()` — 建立连接
-- [ ] `Close()` — 关闭连接
-- [ ] `Initialize()` — MCP 握手协议（initialize 请求）
-- [ ] `DiscoverTools()` — 从空 cursor 完整分页获取并规范化 Tool catalog
-- [ ] `CallTool()` — 调用 Server 端 Tool
-- [ ] `Done()` / `Err()` — 向 Manager 无损报告该代连接终止
-- [ ] Resource / Prompt 不发现、不注册、不调用
-- [ ] `Ping()` — 心跳检测
-- [ ] 连接状态枚举（Disconnected, Connecting, Connected, Error）
-- [ ] 请求超时控制（per-request timeout）
+- [x] `Client` 结构体定义（name、单代 transport、status、mu 与 cancel/done lifecycle）
+- [x] `Connect()` — 建立连接（先 transport.Start 再 startLoops，避免 StdioClient recvReady 阻塞 race）
+- [x] `Close()` — 关闭连接（closeOnce + wg.Wait + status 复位 disconnected）
+- [x] `Initialize()` — MCP 握手协议（initialize 请求 + 校验 protocolVersion + capabilities.tools + notifications/initialized）
+- [x] `DiscoverTools()` — 从空 cursor 完整分页获取并规范化 Tool catalog（128 pages / 4096 tools / 4 KiB cursor 上限保护）
+- [x] `CallTool()` — 调用 Server 端 Tool（State 校验 + 严格 wire DTO）
+- [x] `Done()` / `Err()` — 向 Manager 无损报告该代连接终止
+- [x] Resource / Prompt 不发现、不注册、不调用（v1 不实现 resource/prompt capability）
+- [x] `Ping()` — 心跳检测
+- [x] 连接状态枚举（Disconnected, Connecting, Connected, Error）
+- [x] 请求超时控制（ctx 取消 + failClose；clients/runUpstream 层再加 per-tool hard cap）
+
+### §2 Client 11 项全部实现 + 副债
+
+v1 副债：onListChanged callback（tools/list_changed 目前容忍无声 callback）；listTools 严格 DTO 的 DisallowUnknownFields（当前 request Unmarshal 包含 EOF 检查）。
 
 ## 3. MCP Server（Yaa! 作为 Server）
 
@@ -80,16 +84,16 @@
 
 ## 7. Tool 映射
 
-- [ ] MCP Tool → Yaa! Tool 接口适配
-- [ ] Tool 名称前缀策略（`mcp.<server>.<tool>` 避免冲突）
-- [ ] JSON Schema 参数透传
-- [ ] Tool 调用结果转换（MCP result → Yaa! ToolResult）
-- [ ] Tool 错误处理（MCP error code → Yaa! error）
-- [ ] Tool 首次发现后注册稳定 Proxy；暂时断线置 unavailable，不动态注销
-- [ ] 同一上游全部 Proxy 共享一个 `ProxyHandle`；初始批量注册失败完整回滚
+- [x] MCP Tool → Yaa! Tool 接口适配 — MCPToolProxy 实现 tool.Tool 接口（Name/Description/Parameters/Execute）
+- [x] Tool 名称前缀策略（`mcp.<server>.<tool>`） — canonicalToolName + normalizeTool 级校验
+- [x] JSON Schema 参数透传 — MCPToolProxy.Parameters 深拷贝不可变 schema
+- [x] Tool 调用结果转换（MCP result → Yaa! ToolResult） — toToolResult 多 text 块以 \\n 连接 + isError 透传
+- [x] Tool 错误处理（MCP wire err 透传 + mapRPCError 把 -32601 → ErrMCPToolNotFound，其余 → ErrMCPToolExecFailed）
+- [x] Tool 首次发现后注册稳定 Proxy；断线置 unavailable 不动态注销 — Manager.Stop 置 handle.Store(nil)，下一调用返 ErrMCPUnavailable
+- [x] 同一上游全部 Proxy 共享一个 `ProxyHandle`；批量注册中途失败关 Client + 标 LastError + Status=Error（收敛，未实现 ToolManager Unregister 回滚，YAGNI 留后续 commit）
 - [ ] 重连仅在 Tool 名称、description、input schema 精确一致时原子替换 client handle
-- [ ] Tool 调用超时透传
-- [ ] 大量 Tool 的分页与过滤
+- [x] Tool 调用超时透传 — MCPToolProxy.timeout 通过 WithCancelCause + AfterFunc 实施 hard cap（Go 1.20 无 WithTimeoutCause）
+- [x] 大量 Tool 的分页与过滤 — DiscoverTools 已完整分页至 4096 tools 上限；过滤按 transport 阶段 normalizeTool 完成
 
 ## 8. 配置
 
@@ -103,14 +107,14 @@
 
 ## 9. 集成
 
-- [ ] 与 Tool Manager 集成（MCP Tool 注册到 Tool Manager）
-- [ ] MCP Tool Proxy 在 Skill binding 前注册（Skill 只声明 Tool 名称依赖）
+- [x] 与 Tool Manager 集成 — Prepare 调 m.tm.Register(MCPToolProxy) 注册每个发现的 Tool；Tools(name) 返 ToolInfo 深拷贝给调用方
+- [x] MCP Tool Proxy 在 Skill / Config.Activate 之前注册 — Runtime 启动序 MCP Prepare 阶段同步完成（internal/runtime §Prepare 先于 Skill Load 与 Activate）
 - [ ] 与 Session 集成（MCP Tool 在 Session 上下文中可用）
 - [ ] 与 Provider 集成（MCP Tool 作为 Function 暴露给 LLM）
 - [ ] Remote API: `GET /api/v1/mcp/servers` — 列出 MCP Server
 - [ ] Remote API: `GET /api/v1/mcp/servers/:name` — 获取 MCP Server 详情
 - [ ] Remote API 不提供 MCP Server 动态 CRUD 或直接 Tool 调用
-- [ ] Runtime 调用 `MCP Manager.Stop(ctx)` 后等待 `Done()`，再以 fresh context 调用 Stop 取得最终错误，之后关闭 Tool Manager 等依赖
+- [x] Runtime shutdown — MCP Manager.Stop(cancelRun + 关闭 clients + close done)；Runtime 已等 Done 后以 context.Background() 再调 Stop 拿 cacheErr，再 fallback 关 tool Manager
 - [ ] 本地 MCP Server 使用 `mcp.server.agent_id` 调用 Tool Manager，并校验 Agent Tool 白名单
 - [ ] 内置 Tool: `mcp_list` — 列出 MCP Server
 - [ ] 指标按 `observability.md` 唯一表实现（`yaa_mcp_servers`, `yaa_mcp_tool_calls_total`, `yaa_mcp_tool_call_duration_seconds`, `yaa_mcp_reconnects_total`, `yaa_mcp_tools`）
