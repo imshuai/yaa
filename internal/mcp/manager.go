@@ -1,7 +1,9 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -11,20 +13,23 @@ import (
 	"golang.org/x/exp/slog"
 )
 
-// runUpstream heartbeat 固定参数（docs/mcp/config-ref.md §7.2）。
-// 本 commit 不引入 reconnect / reconciliation / listChanged 调度，但 ticker 已实作.
+// runUpstream heartbeat 固定参数 (docs/mcp/config-ref.md §7.2).
 const (
 	heartbeatInterval = 30 * time.Second
 	heartbeatTimeout  = 10 * time.Second
 )
+
 // Manager 是 catalog、稳定 Tool Proxy、heartbeat 和重连的唯一 owner
-// （docs/mcp/README.md §2）。Manager 不向调用方暴露可变 *Client，
+// (docs/mcp/README.md §2、docs/mcp/config-ref.md §7.2)。Manager 不向调用方暴露可变 *Client,
 // 调用方只能拿到 ServerStatus 快照与 Tool 列表深拷贝。
 //
-// 本系列 commit：实现 stdio auto_start 上游连接 + DiscoverTools + 稳定 Proxy 注册到 ToolManager,
-// 暴露 ServerStatus.ProtocolVersion，并落地 runUpstream async goroutine (heartbeat ticker 30s +
-// 10s Ping timeout + compare-and-clear generation 失败清理 + Stop 全 goroutine 同步退出).
-// lifecycle: Prepare 同步启动 stdio auto_start Client (connect → initialize → discovertools → register),
+// 本 series commit 已经实现:
+//   - stdio auto_start 上游连接: Connect → Initialize → DiscoverTools → 注册稳定 Proxy.
+//   - runUpstream async goroutine (heartbeat 30s ticker + 10s Ping timeout + compare-and-clear generation 失败清理).
+//   - 失败后按 mcp.reconnect 指数退避重连: 退化退避 (initial * 2^(attempt-1) cap max); catalog 三元严格比对一致
+//     才原子替换 handle + 递增 generation; 比对失败保持 Error 等待 Runtime 重启 (不可自愈).
+//   - Stop 全 goroutine 同步退出 (upstreamWG.Wait) + close done.
+// lifecycle: Prepare 同步启动 stdio auto_start Client (connect → init → discover → register),
 // 成功后启动 runUpstream goroutine; 失败仅标记 server 的 LastError + Status=Error, 不阻断其他 server.
 // SSE / Streamable HTTP transport、heartbeat 失败后的指数退避重连、catalog reconciliation、
 // tools/list_changed 通知合并待后续 commit.
@@ -70,11 +75,11 @@ type serverEntry struct {
 	client    *Client          // 当前代连接；断线置 nil
 	status    ServerStatus     // 含 ToolCount/ProtocolVersion/ConnectedAt/LastError
 	tools     []tool.ToolInfo // 已发现的 Tool 快照深拷贝
-	// generation 是 runUpstream 用于 compare-and-clear 的代际计数；每代 Client 一个 generation，
-	// 新代替换旧代时递增（docs/mcp/config-ref.md §7.2）。本期 connectStdioServer 启动时 generation=0。
+	// generation 是 runUpstream 用于 compare-and-clear 的代际计数; 每代 Client 一个 generation,
+	// 新代替换旧代时递增 (docs/mcp/config-ref.md §7.2). 首代 = 0; 每次 attemptReconnect 成功递增.
 	generation uint64
-	// listChanged 是该代独有的合并通道（cap 1），本期仅声明，下一 commit 接 tools/list_changed
-	// notification 投递与 catalog reconciliation；旧代不被新代复用以避免迟到 callback 触发重连。
+	// listChanged 是该代独有的合并通道 (cap 1). 本 commit 仍只声明, listChanged 事件投递与
+	// catalog reconciliation 留 Step 3 commit; 旧代不被新代复用以避免迟到 callback 触发新代重连.
 	listChanged chan struct{}
 }
 
@@ -121,10 +126,10 @@ func NewManager(cfg *config.MCPConfig, tm *tool.Manager, logger *slog.Logger) (*
 // Prepare 校验并持有本地 transport，启动 auto_start 上游 Client 并注册稳定 Tool Proxy，
 // 但不运行本地 Serve。（docs/mcp/README.md §2、docs/mcp/integration.md §4、docs/mcp/checklist.md §1）
 //
-// 本 commit：仅 stdio + auto_start=true 的 server 启动真实连接 ——
-// StdioClient → Connect(connTimeout) → Initialize(initTimeout) → DiscoverTools →
-// 每个 tool 注册 MCPToolProxy 到 ToolManager。其他 transport 暂保持 Disconnected，
-// 等 SSE / Streamable HTTP 后续 commit 实现。
+// 当前 commit: 仅 stdio + auto_start=true 的 server 启动真实连接 ——
+// StdioClient → Connect(ConnectTimeout) → Initialize(InitTimeout) → DiscoverTools → 注册 MCPToolProxy 到 ToolManager.
+// 失败的 server 启动 runUpstream 后会按 mcp.reconnect 自动重连 (本期已落地 Step 2); 仍失败的 final 保持 Error.
+// 其他 transport (sse / streamable_http) 暂保持 Disconnected, 等后续 commit.
 // 任一 server 失败仅标 LastError + Status=Error，不影响其他 server 或 Runtime 启动。
 // ToolManager.Register 失败（罕见：canonical 重名 / 空 description）也只标 LastError，不停止其他工作。
 func (m *Manager) Prepare() error {
@@ -145,43 +150,61 @@ func (m *Manager) Prepare() error {
 	return nil
 }
 
-// connectStdioServer 启动单个 stdio auto_start server：构造 transport，
-// 建立连接，握手，发现工具，并向 ToolManager 注册稳定 Proxy。
-// 失败仅更新 e.status（LastError + Status=Error）；成功更新 Status=connected + ToolCount + ConnectedAt + ProtocolVersion。
+// connectStdioServer 启动单个 stdio auto_start server：建立 Client + DiscoverTools + 注册 Proxy + 发布初代 generation + 启动 runUpstream goroutine.
+// 失败仅更新 e.status（LastError + Status=Error）不影响其它 server.
+// 成功后：e.handle 持有 stable ProxyHandle；e.client/generation/tools/status 是初代快照；m.upstreamWG 已 Add(1).
 func (m *Manager) connectStdioServer(e *serverEntry) {
-	// handler := NewProxyHandle  // 反正 etm 的可空性，每 server 一个独立 handle.
 	handle := &ProxyHandle{}
-
-	// 构造 transport。command 缺失属配置错误（已在 config.Validate 校验，此处兜底）。
-	if e.cfg.Command == "" {
-		m.mu.Lock()
-		e.status.Status = StatusError
-		e.status.LastError = "stdio server missing command"
-		m.mu.Unlock()
-		return
-	}
-	tr := NewStdioClient(e.cfg.Command, e.cfg.Args, e.cfg.Env, m.logger)
-	client := NewClient(e.name, m.runCtx, tr)
-
-	// 应用 connect timeout（缺省 10s）。
-	connTimeout := e.cfg.Timeout
-	if connTimeout <= 0 {
-		connTimeout = m.cfg.Timeout.Connect
-	}
-	if connTimeout <= 0 {
-		connTimeout = 10 * time.Second // docs §6 default 表
-	}
-	connCtx, cancel := context.WithTimeout(m.runCtx, connTimeout)
-	defer cancel()
-	if err := client.Connect(connCtx); err != nil {
+	client, tools, err := m.connectAndDiscover(e)
+	if err != nil {
 		m.mu.Lock()
 		e.status.Status = StatusError
 		e.status.LastError = err.Error()
 		m.mu.Unlock()
 		return
 	}
+	// 首 Register：本期首代必须注册稳定 Proxy 才能供 ToolManager 调用。
+	// 重连 (attemptReconnect) 已不再 register，因 Proxy 在首代成功后即固定且客户端不变；目录一致即可原子替换 handle。
+	toolTimeout := effectiveToolTimeout(e.cfg.Timeout, m.cfg.Timeout.Tool)
+	if err := m.registerProxies(e, handle, tools, toolTimeout); err != nil {
+		_ = client.Close()
+		m.mu.Lock()
+		e.status.Status = StatusError
+		e.status.LastError = err.Error()
+		m.mu.Unlock()
+		return
+	}
+	m.publishGeneration(e, handle, client, tools, 0)
+	// 启动 runUpstream goroutine：固定 30s heartbeat + 10s timeout + 失败重连闭环 (本期接 attemptReconnect).
+	m.upstreamWG.Add(1)
+	go m.runUpstream(e, handle, client, e.generation)
+}
 
-	// initialize timeout（缺省 15s）。
+// connectAndDiscover 从 e.cfg 起构造 stdio Client，完成 Connect → Initialize → DiscoverTools.
+// 不注册 Proxy，不修改 entry（除首代 listChanged channel 初始化）.
+// 失败时仅 Close client（如有），entry 状态由调用者修订.
+// 成功返回 client + 已规范的 normalized/sorted MCPTool 列表.
+// （重连与初次启动共享此 path；catalog 注册由调用方自行决定）.
+func (m *Manager) connectAndDiscover(e *serverEntry) (*Client, []MCPTool, error) {
+	if e.cfg.Command == "" {
+		return nil, nil, fmt.Errorf("stdio server missing command")
+	}
+	tr := NewStdioClient(e.cfg.Command, e.cfg.Args, e.cfg.Env, m.logger)
+	client := NewClient(e.name, m.runCtx, tr)
+
+	connTimeout := e.cfg.Timeout
+	if connTimeout <= 0 {
+		connTimeout = m.cfg.Timeout.Connect
+	}
+	if connTimeout <= 0 {
+		connTimeout = 10 * time.Second
+	}
+	connCtx, cancel := context.WithTimeout(m.runCtx, connTimeout)
+	defer cancel()
+	if err := client.Connect(connCtx); err != nil {
+		return nil, nil, err
+	}
+
 	initTimeout := m.cfg.Timeout.Init
 	if initTimeout <= 0 {
 		initTimeout = 15 * time.Second
@@ -190,69 +213,52 @@ func (m *Manager) connectStdioServer(e *serverEntry) {
 	defer initCancel()
 	if err := client.Initialize(initCtx); err != nil {
 		_ = client.Close()
-		m.mu.Lock()
-		e.status.Status = StatusError
-		e.status.LastError = err.Error()
-		m.mu.Unlock()
-		return
+		return nil, nil, err
 	}
 
-	// DiscoverTools 用 initTimeout 的同口径 hardcap，避免分页长尾卡住 Runtime 启动。
 	toolsCtx, toolsCancel := context.WithTimeout(m.runCtx, initTimeout)
 	defer toolsCancel()
 	tools, err := client.DiscoverTools(toolsCtx)
 	if err != nil {
 		_ = client.Close()
-		m.mu.Lock()
-		e.status.Status = StatusError
-		e.status.LastError = err.Error()
-		m.mu.Unlock()
-		return
+		return nil, nil, err
 	}
+	return client, tools, nil
+}
 
-	// MCP tool hard timeout（0 = 仅使用 caller deadline）。
-	toolTimeout := m.cfg.Timeout.Tool
-	if e.cfg.Timeout > 0 {
-		toolTimeout = e.cfg.Timeout
+// registerProxies 将 normalized Tool 列表注册为稳定 MCPToolProxy 到 ToolManager.
+// toolTimeout 是 single-call hard cap (0 = 仅 caller deadline).
+// Register 失败 (典型: canonical 重名 / 空 description) → 返回 error 由调用方关 client.
+// 成功登记每个 tool；中途失败不回滚已注册 (ToolManager 不提供 Unregister，本 commit 不引入).
+// Ponytail：保持与首代 connectStdioServer 相同语义；重连不调用本函数因 Proxy 在首代已固定.
+func (m *Manager) registerProxies(e *serverEntry, handle *ProxyHandle, tools []MCPTool, toolTimeout time.Duration) error {
+	if m.tm == nil {
+		return nil
 	}
-
-	// 注册每个 Tool 为稳定 Proxy。ToolManager 缺失或 Register 失败 →
-	// 关 client + 记 LastError（重连 / 重试不在本 commit）。
-	if m.tm != nil {
-		for _, mt := range tools {
-			if mt.Description == "" {
-				// Ponytail：上游送空 description 在 normalizeTool 不强制拒绝；
-				// 但 ToolManager.Register 拒空描述 → Manager 视为协议错并标 LastError 后收敛。
-				_ = client.Close()
-				m.mu.Lock()
-				e.status.Status = StatusError
-				e.status.LastError = fmt.Sprintf("tool %q missing description", mt.Name)
-				m.mu.Unlock()
-				return
-			}
-			proxy := NewMCPToolProxy(e.name, stripServerPrefix(e.name, mt.Name), mt.Description, mt.InputSchema, toolTimeout, handle)
-			if err := m.tm.Register(proxy); err != nil {
-				_ = client.Close()
-				m.mu.Lock()
-				e.status.Status = StatusError
-				e.status.LastError = fmt.Sprintf("register tool %q: %v", proxy.Name(), err)
-				m.mu.Unlock()
-				return
-			}
+	for _, mt := range tools {
+		if mt.Description == "" {
+			return fmt.Errorf("tool %q missing description", mt.Name)
+		}
+		proxy := NewMCPToolProxy(e.name, stripServerPrefix(e.name, mt.Name), mt.Description, mt.InputSchema, toolTimeout, handle)
+		if err := m.tm.Register(proxy); err != nil {
+			return fmt.Errorf("register tool %q: %w", proxy.Name(), err)
 		}
 	}
+	return nil
+}
 
-	// 成功：handle 持有当前代 client；entry 持有 client 与 handle 与状态；generation=0
-	// 是首代；listChanged 是该代独有合并通道。启动 runUpstream goroutine（heartbeat ticker）。
+// publishGeneration 在 entry 锁内原子更新 autostart 成功后的代际状态.
+// 入参 newGen >= 0；初代为 0，重连递增到 e.generation+1 (由调用方传入).
+// 不持锁调用 m.mu；handle.Store 在锁内执行保证与 entry 字段一致快照可见.
+func (m *Manager) publishGeneration(e *serverEntry, handle *ProxyHandle, client *Client, tools []MCPTool, newGen uint64) {
 	handle.Store(client)
 	m.mu.Lock()
 	e.handle = handle
 	e.client = client
-	e.generation = 0 // 初代；下一 commit 重连时递增
+	e.generation = newGen
 	if e.listChanged == nil {
 		e.listChanged = make(chan struct{}, 1)
 	} else {
-		// 复用 entry；清空可能的历史投递。
 		select {
 		case <-e.listChanged:
 		default:
@@ -262,26 +268,28 @@ func (m *Manager) connectStdioServer(e *serverEntry) {
 	e.status.Status = StatusConnected
 	e.status.ConnectedAt = &now
 	e.status.ToolCount = len(tools)
-	// ProtocolVersion: 由 Client.Initialize 协商后保存的版本派生（legacy 兼容版本如 sse 选 2024-11-05 时正确反映）。
+	e.status.LastError = ""
 	pv := client.ProtocolVersion()
 	e.status.ProtocolVersion = &pv
-	// ToolInfo 快照深拷贝 → 支持 Manager.Tools(name) 返回.
 	e.tools = make([]tool.ToolInfo, 0, len(tools))
 	for _, mt := range tools {
 		e.tools = append(e.tools, tool.ToolInfo{
-			Name:        canonicalToolName(e.name, stripServerPrefix(e.name, mt.Name)),
+			Name:        mt.Name, // 已 canonical mcp.<server>.<remote>
 			Description: mt.Description,
-			Parameters:  append(tool.ToolInfo{}.Parameters, mt.InputSchema...),
+			Parameters: append(json.RawMessage(nil), mt.InputSchema...),
 			Enabled:     true,
 			Source:      "mcp",
 		})
 	}
 	m.mu.Unlock()
+}
 
-	// 启动 runUpstream goroutine：固定 30s heartbeat + 10s timeout。
-	// 本期仅 Ping ticker；重连 / catalog reconciliation / listChanged 在下一 commit 接入。
-	m.upstreamWG.Add(1)
-	go m.runUpstream(e, handle, client, e.generation)
+// effectiveToolTimeout 选 server-specific timeout，否则取全局；都 0 则使用 caller deadline only.
+func effectiveToolTimeout(serverTimeout, globalTimeout time.Duration) time.Duration {
+	if serverTimeout > 0 {
+		return serverTimeout
+	}
+	return globalTimeout
 }
 
 // stripServerPrefix 从 normalized canonical tool name 去掉 mcp.<server>. 前缀，
@@ -310,15 +318,10 @@ func (m *Manager) Activate() error {
 }
 
 // runUpstream 是每个 entry 唯一的重连 / heartbeat owner（docs/mcp/config-ref.md §7.2）。
-// 当前 commit：仅实现 heartbeat ticker + client.Done() 失败信号；
-// 重连、指数退避、catalog reconciliation、tools/list_changed 通知合并待后续 commit 接入。
-//
-// 入参：handle/client/entryCreationGen 都是 launch 时刻的快照（不动 entry.mu 之外的 e.client）：
-//   - client: 当前代 Client，作为 ticker Ping 目标；
-//   - gen: 启动时刻的代际；如果 Ping 失败、或 entry 的 e.generation 已升高（重连发生），
-//     检测 stale 后退出本轮 goroutine，避免把旧代状态写到新 entry。
-// 设计上 e.client 在多 goroutine（旧代仍然可能还在 ticker）下读 access 时，使用者需读 m.mu 下
-// snapshot，避免使用 bare comparison（Ponytail：本 commit 单代 1 次，重连原子后真正加 generation 比对）.
+// 每次 select 命中失败分支 (client.Done() / Ping 失败) 先 markGenerationFailed compare-and-clear,
+// 再驱动 attemptReconnect 按 mcp.reconnect 指数退避创建新 Client；目录三元严格比对一致才原子替换 handle.
+// 一个 entry 只允许该一个 goroutine 重连；max_attempts 耗尽后停止重连保持 Error/Unavailable.
+// 重连成功后该 goroutine 仍继续 tick 用新 client (ticker.Reset) 不开新 goroutine.
 func (m *Manager) runUpstream(e *serverEntry, handle *ProxyHandle, client *Client, gen uint64) {
 	defer m.upstreamWG.Done()
 	ticker := time.NewTicker(heartbeatInterval)
@@ -326,48 +329,49 @@ func (m *Manager) runUpstream(e *serverEntry, handle *ProxyHandle, client *Clien
 	for {
 		select {
 		case <-m.runCtx.Done():
-			// Manager 关闭；Stop 路径会关闭 client，本 goroutine 退出.
 			return
 		case <-client.Done():
-			// 当前代 Client 已 fail/Close（外部取消或 transport 断开）.
-			// compare-and-clear handle 并标 error；本 commit 不重连.
 			m.markGenerationFailed(e, handle, client, gen, "client done", client.Err())
-			return
+			newClient, newGen, keepGoing := m.attemptReconnect(e, handle, gen)
+			if !keepGoing {
+				return
+			}
+			client = newClient
+			gen = newGen
+			ticker.Reset(heartbeatInterval)
 		case <-ticker.C:
-			// heartbeat Ping: heartbeatTimeout 限制; 失败时标 error 并退出该代 goroutine.
 			pingCtx, cancel := context.WithTimeout(m.runCtx, heartbeatTimeout)
 			err := client.Ping(pingCtx)
 			cancel()
 			if err == nil {
 				continue
 			}
-			// ctx 已取消（Manager 关闭）则不视为 heartbeat 失败.
 			if m.runCtx.Err() != nil {
 				return
 			}
 			m.markGenerationFailed(e, handle, client, gen, "heartbeat failed", err)
-			return
+			newClient, newGen, keepGoing := m.attemptReconnect(e, handle, gen)
+			if !keepGoing {
+				return
+			}
+			client = newClient
+			gen = newGen
+			ticker.Reset(heartbeatInterval)
 		}
 	}
 }
 
-// markGenerationFailed 在 heartbeat / Done() 触发失败时统一处理：
-// （1）若 entry 已进入新区代（gen != e.generation）本次视为 stale，忽略；
-// （2）否则在 m.mu 下比对 e.client==client 仍是当前代（避免与 Stop race），
-//     handle.Store(nil)，关闭 client，置 status=Error + LastError.
-// 本 commit 重连未接入：成功标志 error + unavailable 后停止 ticker goroutine.
-// docs/mcp/config-ref.md §7.2:
-//   "Ping/Recv/disconnect 的暂时错误先用 entry 当前 generation 做 compare-and-clear,
-//    将 handle 置 nil、状态置 error，再在锁外关闭旧 Client".
+// markGenerationFailed compare-and-clear entry 的 (generation, client) tuple.
+// 若 gen != e.generation → 已是新代，本次失败信号属于 stale → 忽略.
+// 否则 handle.Store(nil) + e.client=nil + status=Error + LastError=reason[:cause].
+// 锁外 Close 旧 client (幂等；Stop 路径再次 Close 也安全).
 func (m *Manager) markGenerationFailed(e *serverEntry, handle *ProxyHandle, client *Client, gen uint64, reason string, cause error) {
 	m.mu.Lock()
 	if e.generation != gen {
-		// 已进入新区代；本代失败已无关.
 		m.mu.Unlock()
 		return
 	}
 	if e.client != client {
-		// Stop 已将 e.client 置 nil 或替换，本边路视为已处理.
 		m.mu.Unlock()
 		return
 	}
@@ -382,8 +386,174 @@ func (m *Manager) markGenerationFailed(e *serverEntry, handle *ProxyHandle, clie
 		e.status.LastError = reason
 	}
 	m.mu.Unlock()
-	// 锁外关闭旧 client（Close 幂等，Stop 路径再次调用也无副作用）.
 	_ = client.Close()
+}
+
+// attemptReconnect 失败后按 mcp.reconnect 指数退避构新 Client 并原子替换 entry.
+// 入参 oldGen 是失败代的 generation (用于 entry 锁下递增).
+// 返回: newClient / newGen / keepGoing.
+//   keepGoing=true 表示重连成功：entry 已切换到新通代 client, 调用方继续 ticker.
+//   keepGoing=false 表示重连不再继续: mcp.reconnect.enabled=false / runtime 已停止 / max_attempts 耗尽;
+//        entry 维持 Error/unavailable, 调用方应退出 goroutine.
+// 退避: backoff = initial_delay * 2^(attempt-1) cap max_delay; 期间可被 m.runCtx 中断 (runtime Stop).
+// 比对失败 (catalog 差异) 立即保持 Error 不再退避 (协议错要求 Runtime 重启, 见 docs §7.2 末段).
+func (m *Manager) attemptReconnect(e *serverEntry, handle *ProxyHandle, oldGen uint64) (*Client, uint64, bool) {
+	rc := m.cfg.Reconnect
+	if !rc.Enabled {
+		return nil, 0, false
+	}
+	maxAttempts := rc.MaxAttempts
+	if maxAttempts < 0 {
+		maxAttempts = 0
+	}
+	attempt := 0
+	for {
+		attempt++
+		if attempt > maxAttempts {
+			return nil, 0, false
+		}
+		// 指数退避: initial * 2^(attempt-1) cap max_delay. attempt 从 1 起.
+		backoff := rc.InitialDelay
+		for k := attempt - 1; k > 0; k-- {
+			backoff *= 2
+			if backoff >= rc.MaxDelay {
+				backoff = rc.MaxDelay
+				break
+			}
+		}
+		if !sleepInterruptible(m.runCtx, backoff) {
+			// runtime 停止: 立即放弃.
+			return nil, 0, false
+		}
+		if m.runCtx.Err() != nil {
+			return nil, 0, false
+		}
+		// 构新 client: 复用 connectAndDiscover 完整 path (connect → init → discover).
+		newClient, newTools, err := m.connectAndDiscover(e)
+		if err != nil {
+			m.mu.Lock()
+			if e.status.Status == StatusError && e.generation == oldGen {
+				e.status.LastError = fmt.Sprintf("reconnect attempt %d: %v", attempt, err)
+			}
+			m.mu.Unlock()
+			continue
+		}
+		// 目录三元严格比对 (canonical name + description + canonical-marshal InputSchema).
+		snapshot, _ := snapshotTools(newTools)
+		if !m.catalogMatches(e, snapshot) {
+			_ = newClient.Close()
+			errMsg := fmt.Sprintf("reconnect attempt %d: catalog drift (ErrMCPProtocolError)", attempt)
+			// 协议错: 重连不可自愈, 保持 Error 等待 Runtime 重启 (docs §7.2 末段).
+			m.mu.Lock()
+			if e.generation == oldGen {
+				e.status.Status = StatusError
+				e.status.LastError = errMsg
+			}
+			m.mu.Unlock()
+			return nil, 0, false
+		}
+		// Stop race: 进入 entry 锁前再确认 runtime 未停止 + 代际未变.
+		if m.runCtx.Err() != nil {
+			_ = newClient.Close()
+			return nil, 0, false
+		}
+		m.mu.Lock()
+		if e.generation != oldGen {
+			// 期内已被其它路径替换 (理论上不会, 本 entry 只此 goroutine 重连).
+			m.mu.Unlock()
+			_ = newClient.Close()
+			return nil, 0, false
+		}
+		newGen := oldGen + 1
+		e.generation = newGen
+		e.client = newClient
+		handle.Store(newClient)
+		now := time.Now()
+		e.status.Status = StatusConnected
+		e.status.ConnectedAt = &now
+		e.status.ToolCount = len(newTools)
+		e.status.LastError = ""
+		pv := newClient.ProtocolVersion()
+		e.status.ProtocolVersion = &pv
+		m.mu.Unlock()
+		return newClient, newGen, true
+	}
+}
+
+// catalogMatches 比对 entry 已冻结快照与新发现 normalized MCPTool 三元 (canonical name + description + canonical re-marshal InputSchema).
+// docs §7.2: 规范化后 name/description/schema 集合精确一致才允许原子替换, 不比分页或对象 key 顺序.
+// 异常 returning false 由 attemptReconnect 标 ErrMCPProtocolError + 保持 Error 要求 Runtime 重启.
+func (m *Manager) catalogMatches(e *serverEntry, discovered []catalogItem) bool {
+	m.mu.RLock()
+	snap := e.tools
+	m.mu.RUnlock()
+	if len(snap) != len(discovered) {
+		return false
+	}
+	for i := range snap {
+		if snap[i].Name != discovered[i].canonicalName {
+			return false
+		}
+		if snap[i].Description != discovered[i].description {
+			return false
+		}
+		snapSchema, err1 := canonicalJSON(snap[i].Parameters)
+		discSchema, err2 := canonicalJSON(discovered[i].inputSchema)
+		if err1 != nil || err2 != nil || !bytes.Equal(snapSchema, discSchema) {
+			return false
+		}
+	}
+	return true
+}
+
+// catalogItem 是 attemptReconnect 与 catalogMatches 之间共享的比对快照 (已在 NewMCPToolProxy 注册前规范化).
+type catalogItem struct {
+	canonicalName string
+	description  string
+	inputSchema   json.RawMessage
+}
+
+// snapshotTools 把 normalized MCPTool 列表 (已知按 Name 升序排序) 转换为比对快照.
+func snapshotTools(tools []MCPTool) ([]catalogItem, error) {
+	items := make([]catalogItem, 0, len(tools))
+	for _, mt := range tools {
+		items = append(items, catalogItem{
+			canonicalName: mt.Name,
+			description:   mt.Description,
+			inputSchema:   mt.InputSchema,
+		})
+	}
+	return items, nil
+}
+
+// canonicalJSON 把 RawMessage 反-序列化后重新 marshal 以消除 key 顺序差异 (满足 docs §7.2 文字要求),
+// 保持 Slow path 简单: UseNumber 保留大整数精度, 不引入额外 indent/sort key 调整 (Go json.Marshal 已排序 map keys).
+// Ponytail: map keys 已由 Go json.Marshal 排序; 只需 round-trip 即可.
+func canonicalJSON(raw json.RawMessage) (json.RawMessage, error) {
+	var v any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	// Go json.Marshal 默认按 map key 升序输出, 避免 re-marshal 顺序差异.
+	return json.Marshal(v)
+}
+
+// sleepInterruptible 在指定 duration 内可被 ctx 取消打断.
+// 返回 false 表示 ctx 已取消 (runtime 停止), 调用方应直接退出.
+func sleepInterruptible(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // Stop 同步清空 handles，后台 teardown 用 errors.Join 完成；Done 后再次 Stop 返回缓存的最终错误。

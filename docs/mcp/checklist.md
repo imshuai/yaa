@@ -15,7 +15,8 @@
 - [x] `Ready()` — v1 恒 true（无本地 Serve），Stop 后置 false；本地 Serve 意外退出→ unhealthy 待 §3 commit
 - [x] `Stop()` / `Done()` — 同步幂等 cancelRun；关闭每条已建立的 *Client（Close 幂等）+ 置 handle nil；upstreamWG.Wait 等 runUpstream goroutine 退出；close(done) + ready=false；二次 Stop 返 cache error
 - [x] `runUpstream` heartbeat ticker — stdio auto_start 成功后启动每 entry 唯一 goroutine（30s ticker + 10s Ping timeout）；client.Done() 或 Ping 失败时按 generation compare-and-clear 将 handle.Store(nil)+status=Error+关闭 client；Stop 经 upstreamWG.Wait 同步退出全部 goroutine
-- [ ] `runUpstream` 重连 + catalog reconciliation — 仍待后续 commit：Ping/Done() 失败后按 mcp.reconnect 指数退避创建新 Client（重新 Initialize + 完整 DiscoverTools）；比对 Tool 三元（name+description+inputSchema）精确一致才原子替换 handle, 差异保持 unavailable + ErrMCPProtocolError 要求重启；listChanged channel 启合并 tools/list_changed 通知触发完整 DiscoverTools
+- [x] `runUpstream` 重连 (Step 2 已落地) — Ping/Done() 失败后按 mcp.reconnect 指数退避 (initial * 2^(attempt-1) cap max) 由同一 goroutine 重连创建新 Client (重新 Connect+Initialize+完整 DiscoverTools)；Tool 三元 (canonical name + description + canonical-marshal InputSchema) 精确一致才原子替换 handle (handle.Store + entry 锁下递增 generation)；差异保持 unavailable + LastError 记 catalog drift; max_attempts 耗尽后保持 Error 要求 Runtime 重启
+- [ ] `runUpstream` listChanged 事件路径 (Step 3 待实现) — tools/list_changed notification 投递到该代 listChanged cap-1 channel → runUpstream select 命中 → 用当前代 Client 完整 DiscoverTools + 三元严格比对; 不一致保持 unavailable + ErrMCPProtocolError 要求重启
 
 ## 2. MCP Client
 
@@ -92,7 +93,7 @@ v1 副债：onListChanged callback（tools/list_changed 目前容忍无声 callb
 - [x] Tool 错误处理（MCP wire err 透传 + mapRPCError 把 -32601 → ErrMCPToolNotFound，其余 → ErrMCPToolExecFailed）
 - [x] Tool 首次发现后注册稳定 Proxy；断线置 unavailable 不动态注销 — Manager.Stop 置 handle.Store(nil)，下一调用返 ErrMCPUnavailable
 - [x] 同一上游全部 Proxy 共享一个 `ProxyHandle`；批量注册中途失败关 Client + 标 LastError + Status=Error（收敛，未实现 ToolManager Unregister 回滚，YAGNI 留后续 commit）
-- [ ] 重连仅在 Tool 名称、description、input schema 精确一致时原子替换 client handle
+- [x] 重连仅在 Tool 名称、description、input schema 精确一致时原子替换 client handle — catalogMatches: canonical name + description + canonical-marshal InputSchema 三元严格比对（不比分页/key 顺序）
 - [x] Tool 调用超时透传 — MCPToolProxy.timeout 通过 WithCancelCause + AfterFunc 实施 hard cap（Go 1.20 无 WithTimeoutCause）
 - [x] 大量 Tool 的分页与过滤 — DiscoverTools 已完整分页至 4096 tools 上限；过滤按 transport 阶段 normalizeTool 完成
 

@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -380,6 +381,8 @@ func TestManagerRunUpstreamRecoversTransportClose(t *testing.T) {
 		}},
 		// 连接 / init timeout 给点冗余避免慢机器误判.
 		Timeout: config.MCPTimeoutConfig{Connect: 5 * time.Second, Init: 5 * time.Second},
+		// 本测试专测 markGenerationFailed 失败后保持 Error 的 Step 1 路径; 显式 关闭重连.
+		Reconnect: config.MCPReconnectConfig{Enabled: false, MaxAttempts: 0, InitialDelay: time.Second, MaxDelay: time.Second},
 	}
 	m, err := NewManager(cfg, tm, nil)
 	if err != nil {
@@ -427,7 +430,7 @@ func TestManagerRunUpstreamRecoversTransportClose(t *testing.T) {
 		t.Errorf("last_error empty; expected reason recorded by markGenerationFailed")
 	}
 
-	// 后续 Proxy 调用应返 ErrMCPUnavailable (handle.Store(nil)).
+	// 后续 Proxy 调用应返 ErrMCPUnavailable (handle.Store(nil)) - 重连关闭所以保持 unavailable.
 	_, err = tm.Execute(context.Background(), scope, "mcp.exit.alpha", map[string]any{})
 	if !errors.Is(err, ErrMCPUnavailable) {
 		t.Errorf("after transport closed, Execute mcp.exit.alpha err=%v want ErrMCPUnavailable", err)
@@ -465,4 +468,164 @@ func TestManagerStopJoinsUpstreamGoroutines(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Done not closed within 2s after Stop returned")
 	}
+}
+
+// TestManagerRunUpstreamReconnectsAfterTransportClose 验证重连闭环 (Step 2):
+// 触发上游 subprocess 退出 (调 mcp.recon.stop → sys.exit) → markGenerationFailed 转为 Error
+// → attemptReconnect 按 Reconnect.InitialDelay=100ms 退避后重新 connectAndDiscover (新 subprocess)
+// → catalog 三元一致 → 进入 entry 锁递增 generation + handle.Store(newClient) + status=Connected.
+// 断言: status 在 Error 短暂停留后回到 Connected; zi Tool 可再次通过 ToolManager.Execute 成功
+// (Proxy handle 已原子切换, 不需重注册 ToolManager).
+func TestManagerRunUpstreamReconnectsAfterTransportClose(t *testing.T) {
+	requirePython3(t)
+	tm := buildToolManager(t)
+	cfg := &config.MCPConfig{
+		Servers: []config.MCPServerConfig{{
+			Name:      "recon",
+			Transport: "stdio",
+			Command:   requirePython3(t),
+			Args:      []string{"-c", fakeMCPExitServer},
+			AutoStart: true,
+		}},
+		Timeout:   config.MCPTimeoutConfig{Connect: 5 * time.Second, Init: 5 * time.Second},
+		Reconnect: config.MCPReconnectConfig{Enabled: true, MaxAttempts: 3, InitialDelay: 100 * time.Millisecond, MaxDelay: time.Second},
+	}
+	m, err := NewManager(cfg, tm, nil)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer func() {
+		_ = m.Stop(context.Background())
+		<-m.Done()
+	}()
+	if err := m.Prepare(); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if st, _ := m.Get("recon"); st.Status != StatusConnected || st.ToolCount != 2 {
+		t.Fatalf("prereq: status=%q tools=%d", st.Status, st.ToolCount)
+	}
+
+	scope := tool.ExecutionScope{AgentID: "a1"}
+	// 启动后正常 alpha 调用一次.
+	if _, err := tm.Execute(context.Background(), scope, "mcp.recon.alpha", map[string]any{}); err != nil {
+		t.Fatalf("pre-crash Execute mcp.recon.alpha: %v", err)
+	}
+	// 触发上游停 (sys.exit(2)).
+	_, _ = tm.Execute(context.Background(), scope, "mcp.recon.stop", map[string]any{})
+
+	// polling ≤5s: status 先出现 Error (markGenerationFailed) 后回到 Connected (attemptReconnect 成功).
+	deadline := time.Now().Add(5 * time.Second)
+	sawError := false
+	finalStatus := StatusDisconnected
+	var finalErr string
+	for time.Now().Before(deadline) {
+		s, _ := m.Get("recon")
+		if s.Status == StatusError {
+			sawError = true
+		}
+		if s.Status == StatusConnected && sawError {
+			finalStatus = s.Status
+			finalErr = s.LastError
+			break
+		}
+		finalStatus = s.Status
+		finalErr = s.LastError
+		time.Sleep(20 * time.Millisecond)
+	}
+	if finalStatus != StatusConnected {
+		t.Fatalf("after crash status=%q want Connected (sawError=%v last_error=%q)", finalStatus, sawError, finalErr)
+	}
+	if !sawError {
+		t.Errorf("expected sawError=true (markGenerationFailed intermediate state)")
+	}
+
+	// 重连后 Tool 再次成功: handle 已切换到 newClient; ToolManager 不需重注册 (Proxy 在首代已固定).
+	if _, err := tm.Execute(context.Background(), scope, "mcp.recon.alpha", map[string]any{}); err != nil {
+		t.Fatalf("post-reconnect Execute mcp.recon.alpha: %v", err)
+	}
+
+	// 确认 generation 递增 (gen > 0): 用 entry 内部状态. 间接验证通过 Stop 干净.
+	stopCh := make(chan error, 1)
+	go func() { stopCh <- m.Stop(context.Background()) }()
+	select {
+	case err := <-stopCh:
+		if err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return within 5s (reconnect goroutine not joined)")
+	}
+}
+
+// TestCatalogMatches 覆盖目录三元比对核心逻辑 (Step 2):
+// canonical name + description + canonical-marshal InputSchema 严格相等.
+// 不依赖 stdio, 单测 attemptReconnect 内部使用的 catalogMatches 决策函数.
+func TestCatalogMatches(t *testing.T) {
+	m := mustNewManager(t)
+	defer func() { _ = m.Stop(context.Background()); <-m.Done() }()
+
+	// e 是一个虚拟 server entry, 配置一套 catalog 快照 (与 discovered 相同).
+	e := &serverEntry{
+		name:      "s1",
+		transport: "stdio",
+		cfg:       config.MCPServerConfig{Command: ""},
+		status: ServerStatus{Name: "s1", Status: StatusConnected},
+		tools: []tool.ToolInfo{
+			{Name: "mcp.s1.alpha", Description: "a", Parameters: json.RawMessage(`{"type":"object","properties":{"x":{"type":"string"}}}`)},
+			{Name: "mcp.s1.beta", Description: "b", Parameters: json.RawMessage(`{"type":"object","properties":{"y":{"type":"number"}}}`)},
+		},
+	}
+
+	base := []catalogItem{
+		{canonicalName: "mcp.s1.alpha", description: "a", inputSchema: json.RawMessage(`{"type":"object","properties":{"x":{"type":"string"}}}`)},
+		{canonicalName: "mcp.s1.beta", description: "b", inputSchema: json.RawMessage(`{"type":"object","properties":{"y":{"type":"number"}}}`)},
+	}
+	if !m.catalogMatches(e, base) {
+		t.Fatalf("identical snapshot/desc → catalogMatches=false (want true)")
+	}
+	// schema key 顺序不同→ canonical marshal 后应相等.
+	if !m.catalogMatches(e, []catalogItem{
+		{canonicalName: "mcp.s1.alpha", description: "a", inputSchema: json.RawMessage(`{"properties":{"x":{"type":"string"}},"type":"object"}`)},
+		{canonicalName: "mcp.s1.beta", description: "b", inputSchema: json.RawMessage(`{"type":"object","properties":{"y":{"type":"number"}}}`)},
+	}) {
+		t.Fatalf("schema key re-order should be canonical equal (marshal 后 Go 已按 map key 排序)")
+	}
+	// 不同 canonical name -> false.
+	badName := append([]catalogItem{}, base...)
+	badName[1].canonicalName = "mcp.s1.gamma"
+	if m.catalogMatches(e, badName) {
+		t.Errorf("different name → catalogMatches=true (want false)")
+	}
+	// 不同 description -> false.
+	badDesc := append([]catalogItem{}, base...)
+	badDesc[0].description = "different"
+	if m.catalogMatches(e, badDesc) {
+		t.Errorf("different description → catalogMatches=true (want false)")
+	}
+	// 不同 schema (type 差异) -> false.
+	badSchema := append([]catalogItem{}, base...)
+	badSchema[0].inputSchema = json.RawMessage(`{"type":"string"}`)
+	if m.catalogMatches(e, badSchema) {
+		t.Errorf("different schema → catalogMatches=true (want false)")
+	}
+	// 不同数量 -> false.
+	more := append(append([]catalogItem{}, base...), catalogItem{canonicalName: "mcp.s1.gamma", description: "g", inputSchema: json.RawMessage(`{"type":"object"}`)})
+	if m.catalogMatches(e, more) {
+		t.Errorf("different count → catalogMatches=true (want false)")
+	}
+	// 空 entry + 空 discovered -> true.
+	emptyE := &serverEntry{name: "s2"}
+	if !m.catalogMatches(emptyE, []catalogItem{}) {
+		t.Errorf("both empty → catalogMatches=false (want true)")
+	}
+}
+
+// mustNewManager 构造一个最小 Manager (空 cfg, 供测试直接挂载 entry 后整 Stop).
+func mustNewManager(t *testing.T) *Manager {
+	t.Helper()
+	m, err := NewManager(&config.MCPConfig{}, nil, nil)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	return m
 }

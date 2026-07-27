@@ -1445,3 +1445,63 @@ go test -count=1 -timeout 240s ./... # 二次跑 18 包全绿 (含 WS flake 已�
 4. 本地 MCPServer（checklist §3）.
 5. Agent/Session/Provider 集成（checklist §9 §2）.
 6. Planner step 1-10（docs/planner/）.
+
+---
+
+## #15 runUpstream 重连 Step 2 — 指数退避 + generation compare-and-clear + catalog 三元严格比对 (待 push)
+
+### 范围
+progress #14 末尾下一步 §1: runUpstream 失败分支接入 attemptReconnect. 按 mcp.reconnect 指数退避构新 Client (connect+init+discover) → catalog 三元 (canonical name + description + canonical-marshal InputSchema) 严格比对一致才能原子替换 handle + 递增 generation; 不一致保持 Error 不可自愈; max_attempts 耗尽后停止重连. **不**含 listChanged 事件路径 (留 Step 3).
+
+### 改动文件
+- `internal/mcp/manager.go` (+~190 行, 总 ~660 行)：
+  - import + `bytes`/`encoding/json`
+  - 提炼 `connectAndDiscover(e) (*Client, []MCPTool, error)` — Connect → Initialize → DiscoverTools 复用 path, 不改 entry. 失败仅 Close client 不改 status
+  - 提炼 `registerProxies(e, handle, tools, toolTimeout) error` — 首代注册稳定 Proxy 完整流程, 中途失败不回滚已注册 (ToolManager 不提供 Unregister)
+  - 提炼 `publishGeneration(e, handle, client, tools, newGen)` — entry 锁内原子更新 generation/client/tools/ConnectedAt/status/ProtocolVersion. 首代 newGen=0; 重连 newGen=oldGen+1
+  - 提炼 `effectiveToolTimeout(serverTimeout, globalTimeout) time.Duration` — server 优先, 否则 global, 0= 仅 caller deadline
+  - 新 `attemptReconnect(e, handle, oldGen) (*Client, uint64, bool)` — `Reconnect.Enabled=false` 直接返 keepGoing=false; attempt 1..max_attempts 退避 `initial * 2^(attempt-1) cap max` (interruptible via sleepInterruptible on m.runCtx); 调 connectAndDiscover, 失败记 LastError 并续 attempt; 成功后调 catalogMatches, 不等到一致前 close newClient. 进入 entry 锁前再检 `m.runCtx.Err() != nil` (Stop race) + 锁下比 generation == oldGen + 递增 newGen + handle.Store(newClient) + status=Connected + LastError=""
+  - `catalogMatches(e, discovered []catalogItem)` 加锁读 e.tools 副本, 与 discovered 按 Index 对位三元机器比对 (len 不等 fail); canonical name + description 直接字符串相等; InputSchema 用 `canonicalJSON` round-trip marshal 后 bytes.Equal (Go json.Marshal 默认按 map key 升序排序) 消除 schema 对象 key 顺序差异 (docs §7.2 明示)
+  - `catalogItem{canonicalName, description, inputSchema}` + `snapshotTools(tools)` 转 MCPTool → catalogItem
+  - `canonicalJSON(raw json.RawMessage) (json.RawMessage, error)` — UseNumber 解 + Marshal 编, round-trip 后等价字节
+  - `sleepInterruptible(ctx, d) bool` — Timer + ctx.Done() select, ctx 取消返 false 由调用层放弃重连
+  - `runUpstream` 失败分支 (client.Done() / Ping 失败): 先 markGenerationFailed, 再调 attemptReconnect; keepGoing=true 则更新 local client/gen + ticker.Reset(heartbeatInterval) 继续同 goroutine (避免每 entry 多 goroutine); keepGoing=false 退出
+  - `connectStdioServer` 改为: connectAndDiscover → registerProxies → publishGeneration(newGen=0) → go runUpstream. Talker 引入 Reconnect 配置使用 (Stop 兼容)
+  - `markGenerationFailed` 注释与 signature 不变 (已正确 compare-and-clear)
+  - 注释 sync: 顶部 series commit 段落补 Step 2 已落地描述; Prepare/serverEntry 注释中「下一 commit / Step 3 接入」改为「等待 Step 3」
+
+- `internal/mcp/manager_integration_test.go` (+~110 行):
+  - import + `encoding/json`
+  - `TestManagerRunUpstreamRecoversTransportClose` (Step 1 旧例) 加 `Reconnect: {Enabled: false}` 保持失败不重连的 Step 1 路径行为期望 (Stage=Error 后 Execute 返 ErrMCPUnavailable); 已验证 5 次重复不 break
+  - 新 `TestManagerRunUpstreamReconnectsAfterTransportClose`: 用同 fakeMCPExitServer (stop → sys.exit 触发 transport close); 配 `Reconnect: {Enabled: true, MaxAttempts: 3, InitialDelay: 100ms, MaxDelay: 1s}`; polling ≤5s 验 sawError (markGenerationFailed 中间态) → Connected (重连成功); 重连后 `mcp.recon.alpha` Execute 成功; 末尾 Stop ≤5s (重连 goroutine 干净 join)
+  - 新 `TestCatalogMatches`: 函数级 catalogMatches 三元比对单测. 覆盖: 同 → true; schema key 顺序不同 → canonical 等 true; 不同 name/description/schema → false; 数量不同 → false; both empty → true. 不依赖 stdio (0.00s)
+  - `mustNewManager(t)` 帮助函数供单测构造最小 Manager
+
+### 验证
+```
+HTTP_PROXY=http://192.168.4.1:7890 HTTPS_PROXY=http://192.168.4.1:7890 GOPROXY=https://goproxy.cn,direct GOSUMDB=sum.golang.org go test -count=1 -timeout 60s ./internal/mcp/ -run 'TestManagerRunUpstreamReconnects|TestCatalogMatches' -v
+  # 2 例 PASS (Reconnects 0.50s, CatalogMatches 0.00s)
+go test -count=5 -timeout 120s ./internal/mcp/ -run 'TestManagerRunUpstreamReconnects|TestManagerRunUpstreamRecovers|TestManagerStopJoins' -v
+  # 3 例 × 5 = 15 PASS, 无 flake
+go vet ./... # 全项目无 warning
+go build ./... # 18 包全过
+go test -count=1 -timeout 240s ./... # 18 包全绿 (含 WS flake 上轮已根治)
+```
+
+### 决策
+- **catalog 三元比对用 canonical JSON round-trip**: docs §7.2 明文「不比分页或对象 key 顺序」. Go `json.Marshal` 已按 map key 升序序列化, round-trip 即可吸顺序差异; UseNumber 防大整数丢精度. 比 strings.TrimSpace + bytes.Equal 更严格等价.
+- **`Ponytail`: 不引入 lifecycleMu**. 文档 §7.2 提到「取得 lifecycleMu 检查 stopping」但当前 Manager 已用 `m.runCtx` 作 stop 信号 (Stop 调 cancelRun 取消). attemptReconnect 进入 entry 锁前再查一次 `m.runCtx.Err() != nil` + 锁下比 generation == oldGen, 与「lifecycleMu/stopping」语义等价但少一个 mutex (ponytail ladder: 现有 lock 已够用, 不新加 lock).
+- **重连不开新 goroutine**: docs §7.2 「每个 entry 只允许该一个 goroutine 重连」. runUpstream 失败分支直接 inline 调 attemptReconnect, 成功后 ticker.Reset 用新 client 继续 select. 这条 invariant 满足且无额外 wg 计数 (已是 upstreamWG 跟的同一 goroutine).
+- **重连不重注册 Proxy**: ToolManager.Register 失败回滚不在 ToolManager 支持范围 (YAGNI Unregister). 首代成功后 Proxy 已 ToolManager 注册固定, 重连只需原子切 handle 的 client 字段 (Proxy.handle atomic Load). 第 N 代只需要 catalog 与首代一致, Proxy.Name()/Description()/Parameters() 不变. 接 attemptReconnect 时不调 registerProxies.
+- **退避 interruptible**: sleepInterruptible 可被 m.runCtx.Done() 中断, 让 Stop ≤5s (与 StopJoinsUpstreamGoroutines 测试一致). Stop 路径触发 cancelRun 立刻打断退避 timer.
+- **catalog 漂移 ExitOK → 不继续 attempt**: docs §7.2 「差异保持 unavailable + ErrMCPProtocolError 要求重启 Runtime」, 即 catalog 漂移是非自愈错误. catalogMatches 返 false 时 attemptReconnect 立即返 keepGoing=false (不再尝试 max_attempts), Status 保持 Error, LastError 记 catalog drift.
+- **接入 generation compare-and-clear 重代场景**: 重连成功 newGen=oldGen+1, markGenerationFailed 用 gen 比对. 单代时 e.generation==gen 总成立, mark 不 short-circuit; 重连后代已升 gen, 旧 gen 标记不会污染新代 (暑期在更复杂并发场景下有效).
+- **TestManagerRunUpstreamRecoversTransportClose 加 Reconnect.Enabled=false**: 该 Step 1 旧例验证 markGenerationFailed 后保持 Error 路径, 不应被 Step 2 重连影响. 显式 关 Reconnect 保持原意图, 同时给 Step 2 单独留测试用例.
+- **不测 attemptReconnect 单独调用**: 单测函数级 catalogMatches 已覆盖比对核心, attemptReconnect 完整端到端由 ReconnectsAfterTransportClose 覆盖 (含退避 + Stop join + post-reconnect Execute). 不写重复单测减少 flake 表面 (Ponytail: YAGNI 测试).
+
+### 下一轮方向
+1. **runUpstream Step 3 — listChanged 事件路径**: Client.onListChanged 投递到该代 listChanged cap-1 channel → runUpstream select 命中 → 用当前代 Client 完整 DiscoverTools + 三元严格比对; 不一致保持 unavailable + ErrMCPProtocolError.
+2. SSE / Streamable HTTP transport (checklist §5 / §6).
+3. 本地 MCPServer (checklist §3) — Yaa! 作为 Server.
+4. Agent/Session/Provider 集成 (checklist §9 §2).
+5. Planner step 1-10 (docs/planner/).
