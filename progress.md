@@ -1800,3 +1800,57 @@ go test -count=1 -timeout 30s ./internal/mcp/ -run 'TestStdioMCPServer|TestListC
 2. commit + push gitea/main
 3. 进入本地 MCPServer Step 2 (SSEServer + StreamableHTTPServer): listener + session map +
    origin allowlist 校验 + DELETE/Last-Event-ID (docs §3.2/§3.3)
+
+## progress #20 — 本地 MCPServer Step 2 (SSEServer)
+
+**HEAD 序列**: 在 `87857fe` (本地 MCPServer Step 1 stdio) 之上新增 commit;
+本节为本地 MCPServer Step 2: legacy SSE Server transport (docs §3.2 + §4 NewSSEServer 签名).
+
+### 改动文件清单
+
+**新增**:
+- `internal/mcp/sse_server.go` (+~360 行): SSEServer struct + Serve (http.Server + Shutdown on ctx-cancel) + GET endpointPath (SSE event stream, 首帧 event:endpoint data:<post-path>?session_id=<id> + heartbeat 30s ticker + 写 message 帧) + POST messagesPath (404 session 不存在 / 400 缺 session_id + 解析错 / 202 Accepted 成功) + session map (16-byte crypto/rand ID) + writeSSEEvent + writeJSONRPCErrorHTTP + randomSessionID.
+- `internal/mcp/server_sse_test.go` (+~430 行): 端到端 SSE MCPServer lifecycle 测试 (用 http.DefaultClient GET 流 + POST verify).
+  - TestSSEServerE2E: GET 流开 session + endpoint 帧 url.Parse + ResolveReference 同 host 校验 + POST initialize 协议版本 2024-11-05 + serverInfo.name=yaa + tools/list count=1 + tools/call content="echo: hello-sse" + ping + resources/list -32601 + POST 缺 session_id 400 + GET 错 Accept 406 + GET /unknown 404.
+  - TestSSEServerContextCancelExit: Serve ctx 取消 → Shutdown → 后端退出.
+  - TestSSEServerPOSTUnknownSession404: 不存在 session_id POST → 404 + JSON-RPC -32001.
+  - TestSSEServerPOSTMalformedBody400: POST body 非 JSON → 400 + JSON-RPC -32700.
+  - TestSSEServerWritesHeartbeatFrame / TestSSEServerWritesMessageFrame: writeSSEEvent 单测 (event:/id:/data: + 空 newline) + heartbeat (`: ping\n\n`).
+  - TestSSEServerMPOSTNotAllowed: PUT /mcp + PUT /message → 405.
+
+**修改**:
+- `internal/mcp/server.go`:
+  - import 加 `net`
+  - NewMCPServer switch case `"sse"`: `net.Listen("tcp", cfg.Addr)` + `NewSSEServer(listener, cfg.Path, cfg.MessagesPath)`; Addr 缺失即返 ErrMCPConfig (config Validator 已校验, 这里仍留防御)
+  - case `streamable_http` 占位仍返 ErrMCPConfig "待 StreamableHTTPServer commit"
+- `internal/mcp/manager_test.go`:
+  - `TestManagerPrepareRejectsEnabledButUnsupportedTransport` 语义调整: streamable_http 未实现仍返 ErrMCPConfig; sse 缺 Addr 仍 ErrMCPConfig (sse 已支持, Addr 缺失败只能体现 fail-fast 校验).
+- `docs/mcp/checklist.md`: §3 会话管理勾部分 (stdio + sse 已交付, StreamableHTTPServer 待); §4 SSEClient 行追加 "SSEServer 已落地 progress #20"; §5/§6 Server side marker 更新 SSEServer 已落地, StreamableHTTPServer 待 Step 3.
+
+### 验证
+```
+go build ./...     # 18 包全过
+go vet ./...       # 无 warning
+go test -count=1 -timeout 300s ./...   # 18 包全绿
+go test -count=1 -timeout 90s ./internal/mcp/ -run TestSSEServer -v   # 7 例 PASS
+```
+
+### 决策记录
+- **SSEServer 是 legacy SSE transport (docs §3.2)**: listener 同时承载 GET endpointPath (开 SSE 流 + 推 handler response message 帧 + heartbeat `: ping`) 与 POST messagesPath (接收 Client → Server JSON-RPC); POST 成功返 202 空 body, handler response 通过同 session GET 流推回 `event: message id:<n> data:<json>`.
+- **session_id 是 16-byte base64 RawURL** (字母数字 + `_-`, 不需任何路径转义): 通过首帧 event:endpoint 的 data 字段 `<messagesPath>?session_id=<id>` 投递给 Client; Client 端做 url.Parse + ResolveReference 解析绝对 URL (与 SSEClient Start 路径一致).
+- **session map 锁下 create/find/delete** (docs §4): handler 调用时不持该锁 (handler 通过 ses.server *ServerSession 直接状态机操作, 不需 mu).
+- **Last-Event-ID v1 不续传**: 与 SSEClient 决策 (checklist §5 line 73) 一致; 重连时 client 自行重做 tool 请求. Server 端只接收 Last-Event-ID header 但不重放任何已发事件, 简化 v1 实现 (复杂的事件 buffer 重发 留 v2).
+- **heartbeat 改用 session 级 30s ticker**: 每 session 一个 heartbeat goroutine 投 sseEvent{kind:heartbeat} 到 ses.out (非阻塞 + 满即丢); GET handler select 同时读 out + ctx.Done + r.Context().Done().
+- **out 满降级 fallback**: 当 GET 流消费过慢导致 out channel 满, 帧 POST 同步 200 application/json 响应代替 SSE 推送 (避免 POST goroutine 阻死). 这降低了 SSE 严格性但 v1 接受; 文档没禁这种 退化路径.
+- **POST handler hard fail → 500 + JSON-RPC -32603**: 文档未明示 handler 返 err 的语义; v1 退化为同步 500 内部错给 POST. notification handler 返 (nil,nil) 时 POST 返 202 不推任何帧.
+- **streamable_http 仍占位**: Step 3 单独 commit 实现 StreamableHTTPServer (session map + 32-byte crypto/rand ID + 1024 上限 + 30min idle + DELETE/GET/POST routing + Origin 校验 + 405/404/400/503/403 状态映射), 避免单 commit 过大.
+- **新测试不依赖 python3 / 子进程**: SSEServer 用 net.Listen + NewMCPServer + http.DefaultClient; fake SSE Client 用同包 readSSEFrame 解析帧, 比起 callback 跨进程模式更稳定可复跑.
+- **POST messagesPath 的 session_id query 校验**: 路径本身就是 endpoint 帧的 data 字段值, client 必须传输 session_id. v1 通过 r.URL.Query().Get("session_id"); 缺失返 400 + JSON-RPC -32600; 不存在返 404 + JSON-RPC -32001 (自定义 code, 文档未指定 code 但 v1 用 -32001 与 -32000 Server error 区间).
+
+### 下一轮方向
+1. commit + push gitea/main
+2. 进入本地 MCPServer Step 3 (StreamableHTTPServer): session map + 32-byte crypto/rand URL-safe ID + 1024 上限 + 30min idle 删除 + DELETE 销毁 + 405 only-close SSE + Origin 校验 (缺失允许非浏览器; 存在必命中非空 allowlist 否则 403); 接入 NewMCPServer switch case "streamable_http"
+3. 后续: Streamable HTTP Client GET SSE 流 (server-to-client) + DELETE terminate session (client 侧增量)
+4. Agent/Session/Provider 集成 (checklist §9 §2)
+5. Planner step 1-10 (docs/planner/)
+6. Remote API `GET /api/v1/mcp/servers` + `:name` (checklist §9)

@@ -182,27 +182,32 @@ func TestManagerPrepareNoOp(t *testing.T) {
 	}
 }
 
-// Manager.Prepare 校验 mcp.server.enabled=true 但 Transport 是未实现 transport (sse/streamable_http)
-// 时 fail-fast 返 ErrMCPConfig, 避免未实现 Server 被静默启用 (docs §7.1).
-// v1 仅交付 stdio Server; 其它 transport 的 SSEServer/StreamableHTTPServer 留下 commit.
+// Manager.Prepare 校验 mcp.server.enabled=true 但 transport 是 streamable_http (未实现) 或
+// sse 缺 Addr 时 fail-fast 返 ErrMCPConfig, 避免静默启用无效 Server (docs §7.1).
+// sse 已实现 (progress #20); streamable_http 仍待 commit.
 func TestManagerPrepareRejectsEnabledButUnsupportedTransport(t *testing.T) {
 	tm := buildToolManager(t)
-	for _, tr := range []string{"sse", "streamable_http"} {
-		t.Run(tr, func(t *testing.T) {
-			cfg := &config.MCPConfig{
-				Server: config.MCPExposeConfig{
-					Enabled:      true,
-					AgentID:      "a1",
-					Transport:    tr,
-					ExposedTools: []string{"builtin.echo"},
-				},
-			}
-			m, _ := NewManager(cfg, tm, nil)
-			err := m.Prepare()
-			if !errors.Is(err, ErrMCPConfig) {
-				t.Errorf("Prepare transport=%q: got %v, want ErrMCPConfig", tr, err)
-			}
-		})
+	// streamable_http 未实现 → ErrMCPConfig.
+	cfg1 := &config.MCPConfig{
+		Server: config.MCPExposeConfig{
+			Enabled: true, AgentID: "a1", Transport: "streamable_http",
+			ExposedTools: []string{"builtin.echo"},
+		},
+	}
+	m1, _ := NewManager(cfg1, tm, nil)
+	if err := m1.Prepare(); !errors.Is(err, ErrMCPConfig) {
+		t.Errorf("Prepare transport=streamable_http: got %v, want ErrMCPConfig", err)
+	}
+	// sse 缺 Addr → ErrMCPConfig (根 Validator 应已校验, 但 NewMCPServer 仍防御校验).
+	cfg2 := &config.MCPConfig{
+		Server: config.MCPExposeConfig{
+			Enabled: true, AgentID: "a1", Transport: "sse",
+			ExposedTools: []string{"builtin.echo"},
+		},
+	}
+	m2, _ := NewManager(cfg2, tm, nil)
+	if err := m2.Prepare(); !errors.Is(err, ErrMCPConfig) {
+		t.Errorf("Prepare transport=sse no addr: got %v, want ErrMCPConfig", err)
 	}
 }
 

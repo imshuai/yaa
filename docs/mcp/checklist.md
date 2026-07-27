@@ -47,7 +47,7 @@ v1 副债：listTools 严格 DTO 的 DisallowUnknownFields（当前 request Unma
 - [x] Resource / Prompt request 返回 JSON-RPC `-32601` — handle dispatch default 分支
 - [x] `handlePing()` — 响应 ping 请求 — CanPing 检查 + 空 result
 - [x] Server 信息声明（name, version, capabilities） — ServerInfo{name:"yaa", version:runtimeVersion="0.1.0"}, Capabilities{tools:{listChanged:false}}
-- [ ] 会话管理（多客户端连接隔离） — stdio 单 session 已交付; 网络 transport (SSEServer/StreamableHTTPServer) 多 session 留下 commit
+- [~] 会话管理（多客户端连接隔离） — stdio 单 session (progress #19) + SSEServer 多 session session_id (progress #20) 已交付; StreamableHTTPServer 多 session (32-byte crypto/rand ID + session map + 30min idle + 1024 上限) 待 Step 3 commit
 
 ## 4. Transport — stdio
 
@@ -66,7 +66,7 @@ v1 副债：listTools 严格 DTO 的 DisallowUnknownFields（当前 request Unma
 
 ## 5. Transport — SSE
 
-- [x] `SSEClient` 结构体定义（URL、HTTP client、event stream） — `SSEClient` 已落地（Start/Send/Recv/Close/Info); `SSEServer` 待 §3 本地 MCP Server commit
+- [x] `SSEClient` 结构体定义（URL、HTTP client、event stream） — `SSEClient` 已落地（Start/Send/Recv/Close/Info); `SSEServer` 已落地 progress #20 (internal/mcp/sse_server.go) 多 session by session_id + endpoint 帧 + heartbeat 30s + Last-Event-ID 接收 (v1 不续传与 SSEClient 决策一致)
 - [x] SSE 连接建立（GET + Accept: text/event-stream） — `Start` 发 GET, Accept: text/event-stream, 解析首帧 event:endpoint
 - [x] 事件流解析（data: / event: / id: 字段） — `readSSEFrame` 支持多行 data:, event:, id:, comment heartbeat (`: ping`), 空行结束 frame
 - [x] POST 请求发送 JSON-RPC 消息 — `Send` POST 到 endpoint, Content-Type: application/json, Accept: application/json, text/event-stream; 非 2xx → ErrMCPTransportWrite
@@ -87,7 +87,7 @@ v1 副债：listTools 严格 DTO 的 DisallowUnknownFields（当前 request Unma
 ### §5/§6 v1 transport 完整度
 - Client side: stdio + SSE + StreamableHTTP 全部完成 ClientTransport 接口
 - Manager buildTransport 选 transport by config; Prepare 走 stdio/sse/streamable_http 同 connectAndDiscover+registerProxies+publishGeneration+runUpstream path
-- Server side (SSEServer / StreamableHTTPServer) 待本地 MCPServer Step 2 commit (stdio Step 1 在 progress #19 已交付; sse/streamable_http 留下 commit)
+- Server side: SSEServer 已落地 progress #20 (listener + endpoint GET SSE 帧 + POST messages 入站 + session map + heartbeat 30s + 端到端测试 7 例); StreamableHTTPServer (32-byte crypto/rand ID + session map + 30min idle + 1024 上限 + Origin 校验 + DELETE/GET/POST routing + 405/404/400/503/403) 待 Step 3 commit
 - StreamableHTTP 状态映射 docs §3.3 错误表完整覆盖 14 子用例 (401/403 Auth / init 404/405 Config / init 408/504 ConnTimeout / init 429/5xx Unavailable / business POST 5xx/429 TransportWrite / session-POST 400/404/410 TransportClosed / 413 ProtocolError / 3xx CheckRedirect 拒)
 
 ## 7. Tool 映射

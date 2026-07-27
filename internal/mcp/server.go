@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sort"
 	"sync"
 
@@ -91,12 +92,22 @@ func NewMCPServer(tools *tool.Manager, cfg config.MCPExposeConfig) (*MCPServer, 
 		digest:    catalogDigest(catalog),
 		serveDone: make(chan struct{}),
 	}
-	// v1: 仅 stdio 实现; sse / streamable_http 留下 commit (信道 §3 §5 §6 后续支持).
+	// v1: stdio 与 legacy sse 已实现 (progress #19 stdio, #20 sse); streamable_http 留下 commit.
 	switch cfg.Transport {
 	case "stdio":
 		s.transport = NewStdioServer()
-	case "sse", "streamable_http":
-		return nil, fmt.Errorf("%w: mcp.server.transport=%q not supported in current build (待 SSEServer/StreamableHTTPServer commit)", ErrMCPConfig, cfg.Transport)
+	case "sse":
+		// docs §6: sse 走 net.Listen("tcp", cfg.Addr); 默认绑 loopback (根 Validator 已校验).
+		if cfg.Addr == "" {
+			return nil, fmt.Errorf("%w: mcp.server.addr required for transport=%q", ErrMCPConfig, cfg.Transport)
+		}
+		listener, err := net.Listen("tcp", cfg.Addr)
+		if err != nil {
+			return nil, fmt.Errorf("%w: listen %s: %v", ErrMCPConfig, cfg.Addr, err)
+		}
+		s.transport = NewSSEServer(listener, cfg.Path, cfg.MessagesPath)
+	case "streamable_http":
+		return nil, fmt.Errorf("%w: mcp.server.transport=%q not supported in current build (待 StreamableHTTPServer commit)", ErrMCPConfig, cfg.Transport)
 	default:
 		return nil, fmt.Errorf("%w: mcp.server.transport=%q unknown", ErrMCPConfig, cfg.Transport)
 	}
