@@ -52,13 +52,19 @@ type Manager struct {
 	stopOnce sync.Once
 	cacheErr error
 
-	// ready 反映本地 Serve 是否在运行。v1：未配置本地 *Server，恒 true 直到 Stop。
-	// 后续实现本地 Server 时，Serve 意外退出置 false 推动 Runtime unhealthy。
+	// ready 反映本地 Serve 是否在运行。本地 Serve 意外退出后置 false 推动 Runtime unhealthy
+	// (docs/mcp/README.md §2; docs/mcp/config-ref.md §7.2).
 	readyMu sync.RWMutex
 	ready   bool
 
-	// upstreamWG 跟踪所有 entry 的 runUpstream goroutine；Stop 等其全部退出再 close done
-	// （docs/mcp/config-ref.md §7.3 teardown）。
+	// mcpServer 是本地 expose Server (Yaa! 作为 MCP Server). Prepare 阶段构造 (校验 + 持有
+	// StdioServer; docs §6 stdio 不创建 listener); Activate 阶段起 goroutine 调 Serve 并监听
+	// Done() 检测意外退出. 未启用本地 expose 时为 nil.
+	mcpServer     *MCPServer
+	mcpServerDone chan struct{} // Serve 退出后 close; nil 表示未启用或已停
+
+	// upstreamWG 跟踪所有 entry 的 runUpstream goroutine + 本地 Serve goroutine;
+	// Stop 等其全部退出再 close done (docs/mcp/config-ref.md §7.3 teardown).
 	upstreamWG sync.WaitGroup
 
 	mu sync.RWMutex
@@ -147,6 +153,16 @@ func (m *Manager) Prepare() error {
 			continue
 		}
 		m.connectStdioServer(e)
+	}
+	// 本地 expose Server: Prepare 阶段构造 (校验 agent_id + exposed_tools allowlist + 持有
+	// StdioServer; docs/mcp/server.md §6 stdio 不创建 listener). 失败 fail-fast 返回
+	// (docs/mcp/config-ref.md §7.1). v1 仅 stdio; sse/streamable_http 留下 commit.
+	if m.cfg.Server.Enabled {
+		srv, err := NewMCPServer(m.tm, m.cfg.Server)
+		if err != nil {
+			return fmt.Errorf("mcp.server prepare: %w", err)
+		}
+		m.mcpServer = srv
 	}
 	return nil
 }
@@ -334,16 +350,30 @@ func stripServerPrefix(serverName, canonical string) string {
 	return canonical
 }
 
-// Activate 仅在 Config.Activate(binding) 成功后由 Runtime 调用，启动本地 MCP Server。
-// （docs/mcp/README.md §2、docs/mcp/checklist.md §1）
-//
-// v1 起点：未配置 / 未实现本地 Server。若配置了 mcp.server.enabled=true 而本地 Server 实现
-// 仍未交付，返回 ErrMCPConfig 让 Runtime 启动失败而非静默启用 —— 避免 Remote 反过来被
-// 空 Server 接受请求产生语义错乱。
+// Activate 仅在 Config.Activate(binding) 成功后由 Runtime 调用，启动本地 MCP Server (docs §1).
+// 未启用本地 expose 时返 nil; 已启用 → 用继承 runCtx 的 Serve 起 goroutine 调 mcpServer.Serve,
+// 并登记 upstreamWG + mcpServerDone 以便 Stop 同步等待. Serve 非取消退出 → Ready() 置 false (unhealthy);
+// Stop 取消 runCtx 触发的退出不算故障 (docs/mcp/config-ref.md §7.2 §7.3).
 func (m *Manager) Activate() error {
-	if m.cfg.Server.Enabled {
-		return ErrMCPConfig
+	if m.mcpServer == nil {
+		// 未启用本地 expose; 兼容 v1 占位: 配置 enabled=true 但 Prepare 失败时不应该到达此处.
+		return nil
 	}
+	done := make(chan struct{})
+	m.mcpServerDone = done
+	m.upstreamWG.Add(1)
+	go func() {
+		defer m.upstreamWG.Done()
+		defer close(done)
+		// 用 m.runCtx 直接作 Serve ctx; Stop 取消 runCtx 即取消 Serve (docs §7.3).
+		serveErr := m.mcpServer.Serve(m.runCtx)
+		// 非取消退出视为意外退出: 置 Ready=false 推动 Runtime unhealthy (docs §7.2).
+		if m.runCtx.Err() == nil && serveErr != nil {
+			m.readyMu.Lock()
+			m.ready = false
+			m.readyMu.Unlock()
+		}
+	}()
 	return nil
 }
 
@@ -697,7 +727,12 @@ func (m *Manager) Stop(ctx context.Context) error {
 			}
 		}
 		m.mu.Unlock()
-		// 等所有 runUpstream goroutine 退出再 close done.
+		// 关闭本地 expose server transport (docs §7.3: Stop 取消 runCtx 后 transport 退出).
+		// 未启用时 mcpServer==nil 跳过.
+		if m.mcpServer != nil {
+			_ = m.mcpServer.Close()
+		}
+		// 等所有 runUpstream goroutine + 本地 Serve goroutine 退出再 close done.
 		m.upstreamWG.Wait()
 		m.doneOnce.Do(func() { close(m.done) })
 		m.readyMu.Lock()

@@ -1707,3 +1707,96 @@ go test -count=1 -timeout 240s ./... # 18 包全绿
 4. **Planner step 1-10 (docs/planner/)**.
 5. **Remote API `GET /api/v1/mcp/servers` + `GET /api/v1/mcp/servers/:name` (checklist §9)**.
 6. **文档副债** (W1 时间戳 / W2 README 导览 / W4 tokens[].roles 默认; 早前 progress 已记).
+
+## progress #19 — 本地 MCPServer Step 1 (StdioServer)
+
+**HEAD 序列**: 在 `682d0b4` (Streamable HTTP Client transport) 之上新增 commit, 本节为
+本地 MCPServer 第一步交付 (stdio 单 session 状态机 + Manager 接入 + 测试).
+
+### 改动文件清单
+
+**新增**:
+- `internal/mcp/server_transport.go` (~245 行): ServerSession 状态机 (new → negotiated →
+  ready → closed) + ServerTransport interface + StdioServer (bufio 行级 JSON-RPC);
+  StdioServer 改成可注入 io.Reader/io.Writer, Serve 用 goroutine 读 + select ctx, 让
+  ctx cancel 也能立即唤醒 (不再阻塞在 OS read, Stop 不 hang).
+- `internal/mcp/server.go` (~400 行): MCPServer + handle dispatch (initialize/initialized
+  /ping/tools/list/tools/call) + cursor 分页 + digest + cloneTools/serverVersion/decodeParams
+  等通用 helper.
+- `internal/mcp/server_unit_test.go`: list cursor round-trip + 篡改拒绝 + ServerSession 状态机
+  + serverVersion + catalogDigest + trimLine (10 + 子用例).
+- `internal/mcp/server_stdio_test.go`: 端到端 stdio MCPServer lifecycle
+  (initialize→tools/list→tools/call→ping→resources/list(-32601)→unknown tool(-32602)
+  →parse error(-32700)→stdin EOF→Serve 退出) + ctx 取消退出, 用 io.Pipe 注入可控 stdio.
+
+**修改**:
+- `internal/mcp/manager.go` (+~40 行):
+  - Manager struct 加 `mcpServer *MCPServer` + `mcpServerDone chan struct{}` 字段
+  - Prepare 末段若 `cfg.Server.Enabled` → `NewMCPServer` 持有 StdioServer; 失败 fail-fast 返错
+    (docs §7.1)
+  - Activate 用继承 runCtx 起 goroutine 调 mcpServer.Serve; 非取消退出置 `ready=false` (unhealthy)
+  - Stop 取消 runCtx 后关 mcpServer.Close + 等 upstreamWG (含本地 Serve goroutine)
+- `internal/mcp/manager_test.go`: 删除 v1 占位 `TestManagerActivateRejectsEnabledServerConfig`
+  (本地 Server 已交付山东), 改成 disabled 路径覆盖; 新增对未实现 transport (sse/streamable_http)
+  与 invalid server config (missing agent_id / unknown tool / unknown transport) 的 Prepare
+  fail-fast 测试.
+- `internal/mcp/client.go` (1 行): `runtimeVersion` 由 `"0.0.0-dev"` 统一为 `"0.1.0"`,
+  与 docs/mcp/server.md §2 示例引用同一常量; 注释也统一为 "Yaa! Runtime 向 MCP 对端声明版本".
+
+### 验证
+```
+go build ./...     # 18 包全过
+go vet ./...       # 无 warning
+go test -count=1 -timeout 300s ./...  # 18 包全绿
+go test -count=1 -timeout 30s ./internal/mcp/ -run 'TestStdioMCPServer|TestListCursor|TestServerSession|TestServerVersion|TestCatalogDigest|TestTrimLine|TestManagerPrepareRejects|TestManagerActivate'
+```
+
+### 决策记录
+- **runtimeVersion 统一为 `0.1.0`**: docs/mcp/server.md §2 示例 `serverInfo.version="0.1.0"`;
+  Client 的 ClientInfo.Version 与 Server 的 ServerInfo.Version 是 "Yaa! Runtime 向 MCP
+  对端声明的版本" 同一概念, 用同一常量. v1 不从 build 注入 (Ponytail: 单 caller 字面量);
+  之前 client 用 `0.0.0-dev` 与文档示例不一致.
+- **server.go 引用 `bytesReader` 改用 `bytes.NewReader`**: stdlib 已有, 不造 helper.
+- **StdioServer 重构注入 `io.Reader/io.Writer`**: 原版硬绑 `os.Stdin/os.Stdout` 使测试无法注入
+  可控 reader/writer. 改成字段 + `NewStdioServer()` 默认绑 os.Stdin/os.Stdout, 新增 `NewStdioServerRaw(r, w)`
+  供测试. Serve 主循环用 goroutine 投 readCh + `select <-ctx.Done()`, 让 ctx cancel 立刻返回
+  (Stop 流程不再 hang 在 OS read); 残留读 goroutine 在 stdin 关闭/进程退出时自然回收.
+- **`NewMCPServerRaw(tools, cfg, r, w)` 仅为测试可注入**: 生产路径 `NewMCPServer` 已绑 os.Stdin/os.Stdout,
+  调用方无需用 Raw 版本. 仅作 stdio 已交付的 v1 唯一可注入入口.
+- **Prepare 阶段而非 Activate 阶段 NewMCPServer**: docs §7.1 明示本地 Server 在 Prepare 阶段
+  即 NewMCPServer 校验 (agent_id + exposed_tools allowlist), 失败 fail-fast; Activate 仅起 goroutine.
+  这让 Prepare 失败错误优先于 binding 校验之前, 与远端 server error 隔离.
+- **MCPServer 意外退出 → Ready=false**: docs §7.2 区分 "意外退出" (非 ctx cancel) 与 "Stop 触发退出".
+  Activate goroutine 在 Serve 返非 ctx.Err() 错时置 `ready=false` (Runtime unhealthy); Stop 取消 runCtx
+  触发的 `serveErr == ctx.Err()` 不触发 unhealthy.
+- **不引入 lifecycleMu**: v1 Manager 已用 `runCtx` 作 stop 信号, 用 `stopOnce` 做 stop 单调;
+  本地 Server 加入用 `mcpServerDone` 是局部 channel, 不需要 lifecycle gate (docs 提的 lifecycleMu
+  实质是 `runCtx` + `readyMu` 的同义; 本 commit 最小破坏).
+- **不更新 `cacheErr` 加入 Serve err**: docs §7.3 提到 `errors.Join` 聚合错误可留下后续 commit;
+  v1 通过 `ready=false` 已反映 Serve 异常, `cacheErr` 仍只汇总 entries 的 client.Close 错.
+- **Manager.Activate 集成测试未直接覆盖**: stdio Server 占用 stdin/stdout, Manager 层测试无法
+  注入. 通过 NewStdioServerRaw 注入 io.Pipe 的单测 (server_stdio_test.go) 已覆盖 stdio lifecycle
+  + ctx 退出. Manager.Activate 接入路径通过 TestManagerPrepareRejects* 间接验证 (Prepare 失败
+  时 Activate 不启 Serve). Manager 端到端 stdio Server 测试留下 commit (要 SSEServer/StreamableHTTPServer
+  到位, 端到端路径经 HTTP transport 实现可控).
+
+### 上一轮 plan 留下的待办映射
+
+1. **修 server.go 编译错误** ✅ (`runtimeVersion` + `bytesReader`)
+2. **go build + vet + test (mcp 包)** ✅
+3. **Manager.Activate 接入 MCPServer** ✅ (Prepare 持有 + Activate 起 Serve + Stop 关 + Ready=false)
+4. **集成测试 server_test.go** ✅ (端到端 stdio lifecycle + ctx cancel)
+5. **docs/mcp/checklist.md 勾选** — 待 (下一步)
+6. **progress.md #19** ✅ (本节)
+7. **commit + push gitea/main** — 待 (下一步)
+8. **未解决**:
+   - 文档 checklist 勾选
+   - SSEServer + StreamableHTTPServer (下 commit)
+   - Streamable HTTP Client GET SSE 流 + DELETE
+   - Agent/Provider 集成 + Remote API + Planner step 1-10
+
+### 下一轮方向
+1. 更新 `docs/mcp/checklist.md` 勾选 §3 MCPServer (stdio 已做) 与 §4 StdioServer
+2. commit + push gitea/main
+3. 进入本地 MCPServer Step 2 (SSEServer + StreamableHTTPServer): listener + session map +
+   origin allowlist 校验 + DELETE/Last-Event-ID (docs §3.2/§3.3)

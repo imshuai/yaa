@@ -7,12 +7,12 @@
 
 ## 1. MCP Manager
 
-- [x] `Manager` 结构体定义（entries、run/stop context、done、logger、mu） — v1 起点已落地；Tool Manager 字段已签名透传，待后续 commit 接 Client / Proxy 后实际使用；本地 MCPServer 字段尚未引入（待 §3 commit）
+- [x] `Manager` 结构体定义（entries、run/stop context、done、logger、mu） — v1 起点已落地；Tool Manager 字段已签名透传，待后续 commit 接 Client / Proxy 后实际使用；本地 MCPServer 字段已在 progress #19 引入 (mcpServer *MCPServer + mcpServerDone chan struct{}). Prepare 持有本地 Server transport；Activate 起 Serve goroutine；Stop 关它.
 - [x] `Get()` / `Tools()` — 返回 ServerStatus 副本（含 ConnectedAt 指针深拷贝）+ Tool 列表深拷贝；Tools 在 server 未连接或无 Tool 时返 (nil, false)
 - [x] `List() []ServerStatus` — 列出所有配置的上游连接状态（从 status 字段投影，Prepare 后含 connected / error 真实状态）
 - [x] `Prepare()` — 自动启动 stdio auto_start Client 并注册稳定 Proxy（Connect → Initialize → DiscoverTools → Register MCPToolProxy → 启 runUpstream heartbeat goroutine）；SSE / Streamable HTTP 待 §5/§6 commit；单 server 失败仅标 LastError + Status=Error, 不阻断其他
-- [x] `Activate()` — v1：仅当 cfg.Server.Enabled=true 时返 ErrMCPConfig（本地 Serve 实现未交付不静默启用）；disabled 时返 nil
-- [x] `Ready()` — v1 恒 true（无本地 Serve），Stop 后置 false；本地 Serve 意外退出→ unhealthy 待 §3 commit
+- [x] `Activate()` — progress #19 已接入本地 MCPServer.Serve: 未启用 local Server 返 nil; 启用 → 起 goroutine 调 mcpServer.Serve 继承 runCtx; Serve 非取消退出置 Ready=false (unhealthy, docs §7.2)
+- [x] `Ready()` — 本地 Serve 未启用时恒 true; 启用后意外退出 → false (unhealthy, docs §7.2); Stop 后 false (progress #19 验证)
 - [x] `Stop()` / `Done()` — 同步幂等 cancelRun；关闭每条已建立的 *Client（Close 幂等）+ 置 handle nil；upstreamWG.Wait 等 runUpstream goroutine 退出；close(done) + ready=false；二次 Stop 返 cache error
 - [x] `runUpstream` heartbeat ticker — stdio auto_start 成功后启动每 entry 唯一 goroutine（30s ticker + 10s Ping timeout）；client.Done() 或 Ping 失败时按 generation compare-and-clear 将 handle.Store(nil)+status=Error+关闭 client；Stop 经 upstreamWG.Wait 同步退出全部 goroutine
 - [x] `runUpstream` 重连 (Step 2 已落地) — Ping/Done() 失败后按 mcp.reconnect 指数退避 (initial * 2^(attempt-1) cap max) 由同一 goroutine 重连创建新 Client (重新 Connect+Initialize+完整 DiscoverTools)；Tool 三元 (canonical name + description + canonical-marshal InputSchema) 精确一致才原子替换 handle (handle.Store + entry 锁下递增 generation)；差异保持 unavailable + LastError 记 catalog drift; max_attempts 耗尽后保持 Error 要求 Runtime 重启
@@ -38,20 +38,20 @@ v1 副债：listTools 严格 DTO 的 DisallowUnknownFields（当前 request Unma
 
 ## 3. MCP Server（Yaa! 作为 Server）
 
-- [ ] `MCPServer` 结构体定义（tools、agentID、exposed、transport）
-- [ ] `Serve(ctx)` — 阻塞运行已 prepared 的 Server transport
-- [ ] `Close()` — 幂等关闭 transport并解除 Serve
-- [ ] `handleInitialize()` — 响应客户端 initialize 请求
-- [ ] `handleListTools()` — 响应 tools/list 请求
-- [ ] `handleCallTool()` — 响应 tools/call 请求
-- [ ] Resource / Prompt request 返回 JSON-RPC `-32601`
-- [ ] `handlePing()` — 响应 ping 请求
-- [ ] Server 信息声明（name, version, capabilities）
-- [ ] 会话管理（多客户端连接隔离）
+- [x] `MCPServer` 结构体定义（tools、agentID、exposed、transport） — progress #19 落地 (internal/mcp/server.go)
+- [x] `Serve(ctx)` — 阻塞运行已 prepared 的 Server transport — `MCPServer.Serve` 调 `transport.Serve(ctx, handle)`
+- [x] `Close()` — 幂等关闭 transport并解除 Serve — `MCPServer.Close` 调 `transport.Close()`
+- [x] `handleInitialize()` — 响应客户端 initialize 请求 — `handleInitialize` decodeParams + serverVersion + Negotiate + InitializeResult
+- [x] `handleListTools()` — 响应 tools/list 请求 — `listTools` cursor 分页 + digest 校验 + offset 页边界
+- [x] `handleCallTool()` — 响应 tools/call 请求 — `handleCallTool` decodeParams + exposed check + ToolManager.Execute + toMCPResult/ErrorResult
+- [x] Resource / Prompt request 返回 JSON-RPC `-32601` — handle dispatch default 分支
+- [x] `handlePing()` — 响应 ping 请求 — CanPing 检查 + 空 result
+- [x] Server 信息声明（name, version, capabilities） — ServerInfo{name:"yaa", version:runtimeVersion="0.1.0"}, Capabilities{tools:{listChanged:false}}
+- [ ] 会话管理（多客户端连接隔离） — stdio 单 session 已交付; 网络 transport (SSEServer/StreamableHTTPServer) 多 session 留下 commit
 
 ## 4. Transport — stdio
 
-- [x] `StdioClient` / `StdioServer` 结构体定义（cmd, stdin, stdout） — `StdioClient` 已落地（Start/Send/Recv/Close/Info 实现 ClientTransport）；`StdioServer` 待 §3 本地 MCP Server commit
+- [x] `StdioClient` / `StdioServer` 结构体定义（cmd, stdin, stdout） — `StdioClient` 已落地（Start/Send/Recv/Close/Info 实现 ClientTransport）；`StdioServer` 已落地 progress #19 (internal/mcp/server_transport.go, 可注入 io.Reader/io.Writer)
 - [x] 子进程启动（`exec.Command`） —— `cmd := exec.Command(command, args...)` + cmd.Env 注入
 - [x] stdin/stdout 管道建立 —— cmd.StdinPipe / StdoutPipe / StderrPipe + cmd.Start
 - [x] JSON-RPC 消息读写（行分隔） —— Send: json.Marshal + 写 stdin 加行尾；Recv: bufio.Reader.ReadString('\n') → json.Unmarshal
@@ -87,7 +87,7 @@ v1 副债：listTools 严格 DTO 的 DisallowUnknownFields（当前 request Unma
 ### §5/§6 v1 transport 完整度
 - Client side: stdio + SSE + StreamableHTTP 全部完成 ClientTransport 接口
 - Manager buildTransport 选 transport by config; Prepare 走 stdio/sse/streamable_http 同 connectAndDiscover+registerProxies+publishGeneration+runUpstream path
-- Server side (SSEServer / StreamableHTTPServer) 待 §3 本地 MCPServer commit
+- Server side (SSEServer / StreamableHTTPServer) 待本地 MCPServer Step 2 commit (stdio Step 1 在 progress #19 已交付; sse/streamable_http 留下 commit)
 - StreamableHTTP 状态映射 docs §3.3 错误表完整覆盖 14 子用例 (401/403 Auth / init 404/405 Config / init 408/504 ConnTimeout / init 429/5xx Unavailable / business POST 5xx/429 TransportWrite / session-POST 400/404/410 TransportClosed / 413 ProtocolError / 3xx CheckRedirect 拒)
 
 ## 7. Tool 映射

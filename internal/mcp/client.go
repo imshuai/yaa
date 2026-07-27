@@ -11,9 +11,9 @@ import (
 	"time"
 )
 
-// runtimeVersion 是 InitializeParams.ClientInfo.Version 字段值。
-// v1 不从 build 注入；用常量以避免引入 build flag 依赖（Ponytail：单 caller 字面量）。
-const runtimeVersion = "0.0.0-dev"
+// runtimeVersion 是 Yaa! Runtime 向 MCP 对端声明的版本号 (ClientInfo.Version 与 ServerInfo.Version 共用).
+// docs/mcp/server.md §2 示例用 "0.1.0"; v1 不从 build 注入, 用常量避免引入 build flag 依赖 (Ponytail).
+const runtimeVersion = "0.1.0"
 
 // 客户端 wire 限制常量（docs/mcp/transport.md §2 表）。
 const (

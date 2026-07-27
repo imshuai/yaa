@@ -182,16 +182,62 @@ func TestManagerPrepareNoOp(t *testing.T) {
 	}
 }
 
-// Activate 配置 mcp.server.enabled=true 时返 ErrMCPConfig，
-// 表明本地 Server 实现尚未交付（不能静默启用）。
-func TestManagerActivateRejectsEnabledServerConfig(t *testing.T) {
-	cfg := &config.MCPConfig{Server: config.MCPExposeConfig{Enabled: true, AgentID: "a1"}}
-	m, _ := NewManager(cfg, nil, nil)
-	if err := m.Activate(); !errors.Is(err, ErrMCPConfig) {
-		t.Errorf("Activate: got %v, want ErrMCPConfig", err)
+// Manager.Prepare 校验 mcp.server.enabled=true 但 Transport 是未实现 transport (sse/streamable_http)
+// 时 fail-fast 返 ErrMCPConfig, 避免未实现 Server 被静默启用 (docs §7.1).
+// v1 仅交付 stdio Server; 其它 transport 的 SSEServer/StreamableHTTPServer 留下 commit.
+func TestManagerPrepareRejectsEnabledButUnsupportedTransport(t *testing.T) {
+	tm := buildToolManager(t)
+	for _, tr := range []string{"sse", "streamable_http"} {
+		t.Run(tr, func(t *testing.T) {
+			cfg := &config.MCPConfig{
+				Server: config.MCPExposeConfig{
+					Enabled:      true,
+					AgentID:      "a1",
+					Transport:    tr,
+					ExposedTools: []string{"builtin.echo"},
+				},
+			}
+			m, _ := NewManager(cfg, tm, nil)
+			err := m.Prepare()
+			if !errors.Is(err, ErrMCPConfig) {
+				t.Errorf("Prepare transport=%q: got %v, want ErrMCPConfig", tr, err)
+			}
+		})
 	}
 }
 
+// Manager.Prepare 在 cfg.Server Enabled + Transport=stdio 但 AgentID 或 ExposedTools 缺失时
+// fail-fast 返 ErrMCPConfig (docs/mcp/server.md §6 校验契约).
+func TestManagerPrepareRejectsInvalidServerConfig(t *testing.T) {
+	tm := buildToolManager(t)
+	cases := []struct {
+		name string
+		cfg  config.MCPExposeConfig
+	}{
+		{"missing agent id", config.MCPExposeConfig{Enabled: true, Transport: "stdio", ExposedTools: []string{"builtin.echo"}}},
+		{"unknown exposed tool", config.MCPExposeConfig{Enabled: true, Transport: "stdio", AgentID: "a1", ExposedTools: []string{"builtin.unknown"}}},
+		{"unknown transport", config.MCPExposeConfig{Enabled: true, Transport: "weird", AgentID: "a1", ExposedTools: []string{"builtin.echo"}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := &config.MCPConfig{Server: c.cfg}
+			m, _ := NewManager(cfg, tm, nil)
+			err := m.Prepare()
+			if !errors.Is(err, ErrMCPConfig) {
+				t.Errorf("Prepare %s: got %v, want ErrMCPConfig", c.name, err)
+			}
+		})
+	}
+}
+
+// Manager.Activate 在未启用本地 expose (mcpServer==nil) 时应返 nil; v1 兼容 disabled 路径.
+// 注意: 已不需 v1 占位测试 (cfg.Server.Enabled=true 不调 Prepare 的状态), 重命名为 disabled 路径覆盖.
+func TestManagerActivateRejectsEnabledServerConfig(t *testing.T) {
+	m, _ := NewManager(&config.MCPConfig{}, nil, nil)
+	if err := m.Activate(); err != nil {
+		t.Errorf("Activate: got %v, want nil", err)
+	}
+}
 // Activate 配置未启用本地 Server 应返 nil（v1 接受 disabled 路径）。
 func TestManagerActivateNilWhenDisabled(t *testing.T) {
 	m, _ := NewManager(&config.MCPConfig{}, nil, nil)
