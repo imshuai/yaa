@@ -1630,3 +1630,80 @@ go test -count=1 -timeout 240s ./... # 18 包全绿 (mcp 包现 68 例: 60 + 5 S
 3. Agent/Session/Provider 集成 (checklist §9 §2) — MCP Tool 在 Agent turn 投影到 Provider Function 列表.
 4. Planner step 1-10 (docs/planner/).
 5. Remote API `GET /api/v1/mcp/servers` + `GET /api/v1/mcp/servers/:name` (checklist §9).
+
+---
+
+## #18 Streamable HTTP Transport — StreamableHTTPClient (POST-only + session header 复用) + Manager 接入 (待 push)
+
+### 范围
+progress #17 末尾下一步 §1: checklist §6 Streamable HTTP transport. 新增 internal/mcp/streamable_http.go 实现 StreamableHTTPClient 满足 ClientTransport 接口. v1 实现 POST-only + session header 复用模式 (stateless + 含 session 后 POST 必带), 不发 GET SSE 流 / DELETE (docs 明示 stateless client 不发 GET/DELETE; Manager attemptReconnect 路径已用 initialize + Discover 重建 catalog, 不依赖 SSE 流的 tools/list_changed). HTTP 状态码完整按 docs §3.3 错误表映射 14 个分支.
+
+### 改动文件
+- `internal/mcp/streamable_http.go` (+~290 行新文件):
+  - 常量 `streamableMessageMaxBytes=4MiB` (与 stdio/SSE 一致); `streamableRespBodyCap=16KiB` (错误 body 有界丢弃 docs §3.3); `streamableRecvChanCapacity=256`
+  - `StreamableHTTPClient` struct 字段: url, headers, client *http.Client, logger, mu, started, closed, sessionID, info, recvReady, closeOnce, recvCh chan recvItem
+  - `recvItem {msg *Message; err error}` 中间结构 (Send 后投递 recvCh, Recv 取)
+  - `NewStreamableHTTPClient(rawurl, httpClient, headers, logger)`: httpClient nil → 默认; logger nil → slog.Default(); 强制 httpClient.CheckRedirect = `http.ErrUseLastResponse` 拒 3xx (docs §3.3)
+  - `Start(startupCtx)`: stateless 无持久连接; 仅校验 URL academy性 + 关 recvReady 让 recvLoop 进入
+  - `Send(ctx, msg)`: 先查 caller ctx (终结 → context.Cause 优先 docs); marshal >4MiB → ProtocolError; POST + Content-Type: application/json + Accept: application/json, text/event-stream + headers 注入 + Mcp-Session-Id (若有); 非 2xx → mapStatusError 投 err 到 recvCh; 2xx → notification 路径 202 空 body 不投; request 路径按 Content-Type 分流 (text/event-stream → drainSSEResponse 多帧投递 recvCh; application/json → json.Unmarshal 单帧投 recvCh; 数组 body ['…' 首字符 → ProtocolError catch batch])
+  - `drainSSEResponse(body)`: 复用 sse.go `readSSEFrame` parser, 把 SSE 流每条 message event 反序列化 Message 投 recvCh; 非 message event 跳过; EOF 视为流结束
+  - `mapStatusError(resp, msg)`: docs §3.3 错误表完整映射 (status 2xx → nil 调用方继续解析):
+    - 401/403 → ErrMCPAuthFailed
+    - init 404/405 → ErrMCPConfig
+    - init 408/504 → ErrMCPConnTimeout
+    - init 429/5xx → ErrMCPUnavailable
+    - hasSession + (400/404/410) → ErrMCPTransportClosed (session 失效重新 init)
+    - business POST (!isInit) + (408/429/5xx) → ErrMCPTransportWrite (结果不确定, 不重发)
+    - 413 / 3xx (含 CheckRedirect) → ErrMCPProtocolError
+    - 错误 Content-Type 既然默认 default 走 → ErrMCPProtocolError
+    - default → ErrMCPProtocolError
+  - `Recv(ctx)`: 阻塞读 recvCh 投递; ctx 取消优先
+  - `Close`: closeOnce + 标 closed + info.Connected=false; v1 不发 DELETE (stateless + session 复用模式; 待后续接 server SSE 流时补 DELETE 终止 session)
+  - `isErrContentType(resp)`: 响应 ctype 既非 application/json 也非 text/event-stream → 真 (用于 2xx 错误 ctype 分支)
+
+- `internal/mcp/streamable_http_test.go` (+~470 行新文件):
+  - `fakeStreamableServer` (httptest): POST 接 JSON-RPC; notification 返 202 空 body; request 返同步 application/json 响应; `withSession` 时 init 返 Mcp-Session-Id header + 后续 POST 校验携带
+  - `TestStreamableHTTPClientSyncJSONRoundTrip`: stateless POST 同步 JSON 端到端 Connect → Initialize (ProtocolVersion=2025-03-26) → Ping → DiscoverTools (alpha+beta) → CallTool alpha ("hello alpha") → Close
+  - `TestStreamableHTTPClientPBSessionHeader`: withSession=true; fake server init 返 Mcp-Session-Id; Client 捕获 sessionID; 后续 DiscoverTools 必带 session header (fake 校验缺失返 400; 测试 PASS 即正确)
+  - `TestStreamableHTTPClientSSEResponse`: fake server 返 text/event-stream (单条 SSE message event); Client drainSSEResponse 解析; Initialize → Ping → DiscoverTools (1 tool)
+  - `TestStreamableHTTPClientErrStatusMappings`: 14 子用例覆盖 docs §3.3 错误表 (auth401/403 → AuthFailed; init 404/405 → Config; init 408/504 → ConnTimeout; init 429/500 → Unavailable; business 500/429 → TransportWrite; session-engaged POST 400/404/410 → TransportClosed; 413 → ProtocolError)
+  - `TestStreamableHTTPClientBatchResponseRejected`: server 2xx 返 JSON 数组 body → Client 防御报 ErrMCPProtocolError (docs "数组/batch → 400")
+  - `TestStreamableHTTPClientConnRefusedOnDialFail`: 端口未开 → dial refused → ErrMCPConnRefused|TransportWrite
+  - `TestStreamableHTTPClientCheckRedirectReject3xx`: fake server 302 redirect → httpClient.CheckRedirect 返回 ErrUseLastResponse (不跟随) → client mapStatusError 把 3xx 当 ProtocolError
+
+- `internal/mcp/manager.go` (+15):
+  - buildTransport 加 `case "streamable_http"` → NewStreamableHTTPClient
+  - Prepare 允许 `e.transport == "streamable_http"`
+  - 头部注释 sync
+- `internal/mcp/manager_integration_test.go` (+64):
+  - `TestManagerPrepareStreamableHTTPAutoStartRegistersTools`: Manager.Prepare 跑 streamable_http auto_start; 校验 StatusConnected + ProtocolVersion=2025-03-26 + Transport="streamable_http" + ToolCount=2 + Execute mcp.strim.alpha + Stop ≤5s (runUpstream join)
+
+### 验证
+```
+HTTP_PROXY=http://192.168.4.1:7890 HTTPS_PROXY=http://192.168.4.1:7890 GOPROXY=https://goproxy.cn,direct GOSUMDB=sum.golang.org go test -count=1 -timeout 60s ./internal/mcp/ -run 'TestStreamableHTTPClient' -v
+  # 5 顶层 + 14 子用例全 PASS (0.2-0.5s)
+go test -count=5 -timeout 120s ./internal/mcp/ -run 'TestStreamableHTTP|TestManagerPrepareStreamableHTTP'
+  # 5x 重复全 PASS 无 flake
+go vet ./... # 无 warning
+go build ./... # 18 包全过
+go test -count=1 -timeout 240s ./... # 18 包全绿
+```
+
+### 决策
+- **POST-only 起步, 不发 GET SSE / DELETE**: docs §3.3 明示 "stateless Client 不发送 GET/DELETE"; v1 transport 状态以 session header 复用模式实现, 真正 GET SSE stream (server-to-client 流) 与 DELETE 终止 session 留下一 commit. Manager attemptReconnect 已通过新 Client 重新 initialize + 完整 DiscoverTools 重建 catalog, 不依赖 GET-流推送的 tools/list_changed notification. Για SSE 流 trigger listChanged 路径 (services 期望上层 listChanged 流) 留 增量 commit; 本期已收 v1 transport 全传播链路.
+- **错误投递走 recvCh 而非 Send 直接返 err**: 保持 ClientTransport Recv/Send 分离抽象与 SSE/stdio 一致 — Send POST 后非 2xx 或 body 解析错都把 err 投到 recvCh, Client recvLoop 通过 Recv 拿一致 fail 处理. Send 只返 ctx 已取消 / marshalling 错 (调用方 side 问题). 这样避免 "Send 也 fail + Recv 也 fail" 双线传播 Client race.
+- **错误 body 有界丢弃**: docs §3.3 "错误 body 最多有界丢弃 16 KiB 不进入稳定 Error/log". `io.LimitReader(resp.Body, streamableRespBodyCap)` 空 read 后扔掉. Server 真实 error body 不污染稳定 Error 文本.
+- **batch 数组防御**: server 返 200 但 body 是 JSON 数组 (违反 "每个 HTTP body 只允许一个 JSON-RPC message") → Client 识别 trimmed[0] == '[' → ErrMCPProtocolError catch. 测试覆盖.
+- **httpClient.CheckRedirect 强制 ErrUseLastResponse**: 在 NewStreamableHTTPClient 内部 default, 防止 client 不提供 customized http.Client 时漏配 3xx 跟随. mapStatusError 把任何 3xx 映射 ProtocolError.
+- **mapStatusError 用 msg.Method + sessionID 区分 init / business / session-engaged**: docs §3.3 错误表的关键区分. `isInit := msg.Method == "initialize"`; `hasSession := c.sessionID != ""`. 老子映射表覆盖完整, 14 子用例测每条.
+- **drainSSEResponse 复用 sse.go `readSSEFrame`**: SSE frame parser 已在 SSE commit 完备 (7 子用例单测). Streamable HTTP 同 SSE → 投 recvCh 完成相同处理器 (复用避免重复).
+- **Start stateless 不拨号**: HTTP 无连接; Start 仅校验 URL academy性 + 关 recvReady. Connect 流程在 Initialize 时第一次 POST 触发真实 HTTP 拨号. Connection 级 timeout 通过 POST 的 ctx 控制 (caller deadline).
+- **未实现 StreamableHTTPServer**: docs §6 仅 Client side; Server transport 在 §3 本地 MCPServer commit.
+
+### 下一轮方向
+1. **Streamable HTTP GET SSE 流 + DELETE terminate session** (本期 v1 不发, 增量 commit 接入): server-to-client SSE 流 接 listChanged notification; DELETE 终止 session. 状态从 stateless → fully stateful.
+2. **本地 MCPServer (checklist §3) — Yaa! 作为 Server** (StdioServer/SSEServer/StreamableHTTPServer).
+3. **Agent/Session/Provider 集成 (checklist §9 §2)** — MCP Tool 在 Agent turn 投影到 Provider Function 列表, Session 视图按 Agent allowall 投影可用 MCP Tool.
+4. **Planner step 1-10 (docs/planner/)**.
+5. **Remote API `GET /api/v1/mcp/servers` + `GET /api/v1/mcp/servers/:name` (checklist §9)**.
+6. **文档副债** (W1 时间戳 / W2 README 导览 / W4 tokens[].roles 默认; 早前 progress 已记).

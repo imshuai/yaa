@@ -130,7 +130,7 @@ func NewManager(cfg *config.MCPConfig, tm *tool.Manager, logger *slog.Logger) (*
 // 当前 commit: 仅 stdio + auto_start=true 的 server 启动真实连接 ——
 // StdioClient → Connect(ConnectTimeout) → Initialize(InitTimeout) → DiscoverTools → 注册 MCPToolProxy 到 ToolManager.
 // 失败的 server 启动 runUpstream 后会按 mcp.reconnect 自动重连 (本期已落地 Step 2); 仍失败的 final 保持 Error.
-// sse 已接入; streamable_http 暂保持 Disconnected等后续 commit.
+// sse / streamable_http 已接入; 未知 transport 等 future commit.
 // 任一 server 失败仅标 LastError + Status=Error，不影响其他 server 或 Runtime 启动。
 // ToolManager.Register 失败（罕见：canonical 重名 / 空 description）也只标 LastError，不停止其他工作。
 func (m *Manager) Prepare() error {
@@ -139,8 +139,8 @@ func (m *Manager) Prepare() error {
 		if !e.cfg.AutoStart {
 			continue
 		}
-		if e.transport != "stdio" && e.transport != "sse" {
-			// streamable_http / 未知 transport 待后续 commit.
+		if e.transport != "stdio" && e.transport != "sse" && e.transport != "streamable_http" {
+			// 未知 transport 待后续 commit.
 			m.mu.Lock()
 			e.status.LastError = "transport not supported in current build"
 			m.mu.Unlock()
@@ -303,6 +303,12 @@ func (m *Manager) buildTransport(e *serverEntry) (ClientTransport, error) {
 		}
 		hc := &http.Client{}
 		return NewSSEClient(e.cfg.URL, hc, e.cfg.Headers, m.logger), nil
+	case "streamable_http":
+		if e.cfg.URL == "" {
+			return nil, fmt.Errorf("streamable_http server missing url")
+		}
+		hc := &http.Client{}
+		return NewStreamableHTTPClient(e.cfg.URL, hc, e.cfg.Headers, m.logger), nil
 	default:
 		return nil, fmt.Errorf("%w: unsupported transport %q", ErrMCPConfig, e.transport)
 	}

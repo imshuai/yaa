@@ -936,3 +936,68 @@ func TestManagerPrepareSSEAutoStartRegistersTools(t *testing.T) {
 		t.Fatal("Stop did not return within 5s (SSE runUpstream join deadlock)")
 	}
 }
+
+
+// TestManagerPrepareStreamableHTTPAutoStartRegistersTools 端到端验证 Manager.Prepare 处理 streamable_http transport:
+// fake stateless streamable server (POST 同步 JSON 响应, 协议 2025-03-26); Manager.Prepare 启动上游 +
+// DiscoverTools + 注册稳定 Proxy + runUpstream goroutine; ServerStatus.ProtocolVersion = 2025-03-26.
+// ToolManager.Execute 应能调用 mcp.strim.alpha.
+func TestManagerPrepareStreamableHTTPAutoStartRegistersTools(t *testing.T) {
+	f := newFakeStreamableServer(t, false)
+	tm := buildToolManager(t)
+	cfg := &config.MCPConfig{
+		Servers: []config.MCPServerConfig{{
+			Name:      "strim",
+			Transport: "streamable_http",
+			URL:       f.url,
+			AutoStart: true,
+		}},
+		Timeout:   config.MCPTimeoutConfig{Connect: 5 * time.Second, Init: 5 * time.Second},
+		Reconnect: config.MCPReconnectConfig{Enabled: false, MaxAttempts: 0, InitialDelay: time.Second, MaxDelay: time.Second},
+	}
+	m, err := NewManager(cfg, tm, nil)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer func() {
+		_ = m.Stop(context.Background())
+		<-m.Done()
+	}()
+	if err := m.Prepare(); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	st, ok := m.Get("strim")
+	if !ok {
+		t.Fatalf("strim entry missing")
+	}
+	if st.Status != StatusConnected {
+		t.Fatalf("status=%q want Connected (LastError=%q)", st.Status, st.LastError)
+	}
+	if st.ToolCount != 2 {
+		t.Fatalf("ToolCount=%d want 2", st.ToolCount)
+	}
+	if st.ProtocolVersion == nil || *st.ProtocolVersion != ProtocolVersion {
+		var pv string
+		if st.ProtocolVersion != nil {
+			pv = *st.ProtocolVersion
+		}
+		t.Errorf("ProtocolVersion=%q want %q (streamable_http)", pv, ProtocolVersion)
+	}
+	if st.Transport != "streamable_http" {
+		t.Errorf("Transport=%q want streamable_http", st.Transport)
+	}
+	scope := tool.ExecutionScope{AgentID: "a1"}
+	if _, err := tm.Execute(context.Background(), scope, "mcp.strim.alpha", map[string]any{}); err != nil {
+		t.Errorf("Execute mcp.strim.alpha: %v", err)
+	}
+	stopCh := make(chan error, 1)
+	go func() { stopCh <- m.Stop(context.Background()) }()
+	select {
+	case err := <-stopCh:
+		if err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return within 5s")
+	}
+}

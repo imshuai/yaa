@@ -77,12 +77,18 @@ v1 副债：listTools 严格 DTO 的 DisallowUnknownFields（当前 request Unma
 
 ## 6. Transport — Streamable HTTP
 
-- [ ] Client/Server transport 接口分离
-- [ ] POST JSON-RPC，Accept 支持 JSON 与 SSE
-- [ ] 可选 `Mcp-Session-Id`：上游未返回时 Client 保持 stateless；Yaa Server 固定签发
-- [ ] 同一 endpoint 的 POST/GET/DELETE 语义（含 `Mcp-Session-Id`、202/404/405）
-- [ ] TLS 与认证 Header 注入
-- [ ] 任何已经发送的 `tools/call` 都不自动重放
+- [x] Client transport: `StreamableHTTPClient` 实现 ClientTransport (Server transport 待 §3 本地 Server)
+- [x] POST JSON-RPC，Accept 支持 JSON 与 SSE — POST Accept: application/json, text/event-stream; Content-Type: application/json; response body JSON 单对象或 SSE 流多帧解析 parseSSEFrame
+- [x] 可选 `Mcp-Session-Id`：上游未返回时 Client 保持 stateless；获得时后续 POST 必带 — `sessionID` 字段记录; NewStreamableHTTPClient 不强制要求 server 返 (stateless 模式)
+- [ ] 同一 endpoint 的 POST/GET/DELETE 语义 — v1 仅 POST (stateless + session 复用模式); GET SSE 流与 DELETE 终止留后续 commit (docs 明示 stateless Client 不发 GET/DELETE)
+- [x] TLS 与认证 Header 注入 — http.Client 由调用方配 TLS (Manager 用 defaults); headers 注入每条 POST
+- [x] 任何已经发送的 `tools/call` 都不自动重放 — Send POST 无重试; 失败直接 recvCh err; Manager attemptReconnect 路径重建 Client 重新 initialize + Discover 才服务新调用
+
+### §5/§6 v1 transport 完整度
+- Client side: stdio + SSE + StreamableHTTP 全部完成 ClientTransport 接口
+- Manager buildTransport 选 transport by config; Prepare 走 stdio/sse/streamable_http 同 connectAndDiscover+registerProxies+publishGeneration+runUpstream path
+- Server side (SSEServer / StreamableHTTPServer) 待 §3 本地 MCPServer commit
+- StreamableHTTP 状态映射 docs §3.3 错误表完整覆盖 14 子用例 (401/403 Auth / init 404/405 Config / init 408/504 ConnTimeout / init 429/5xx Unavailable / business POST 5xx/429 TransportWrite / session-POST 400/404/410 TransportClosed / 413 ProtocolError / 3xx CheckRedirect 拒)
 
 ## 7. Tool 映射
 
