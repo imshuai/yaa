@@ -10,11 +10,12 @@
 - [x] `Manager` 结构体定义（entries、run/stop context、done、logger、mu） — v1 起点已落地；Tool Manager 字段已签名透传，待后续 commit 接 Client / Proxy 后实际使用；本地 MCPServer 字段尚未引入（待 §3 commit）
 - [x] `Get()` / `Tools()` — 返回 ServerStatus 副本（含 ConnectedAt 指针深拷贝）+ Tool 列表深拷贝；Tools 在 server 未连接或无 Tool 时返 (nil, false)
 - [x] `List() []ServerStatus` — 列出所有配置的上游连接状态（从 status 字段投影，Prepare 后含 connected / error 真实状态）
-- [x] `Prepare()` — 实现启动 auto-start=true 的 stdio 上游 Client 并注册稳定 Proxy（Connect → Initialize → DiscoverTools → Register MCPToolProxy）；SSE / Streamable HTTP 待 §5/§6 commit；单 server 失败仅标 LastError + Status=Error，不阻断其他
+- [x] `Prepare()` — 自动启动 stdio auto_start Client 并注册稳定 Proxy（Connect → Initialize → DiscoverTools → Register MCPToolProxy → 启 runUpstream heartbeat goroutine）；SSE / Streamable HTTP 待 §5/§6 commit；单 server 失败仅标 LastError + Status=Error, 不阻断其他
 - [x] `Activate()` — v1：仅当 cfg.Server.Enabled=true 时返 ErrMCPConfig（本地 Serve 实现未交付不静默启用）；disabled 时返 nil
 - [x] `Ready()` — v1 恒 true（无本地 Serve），Stop 后置 false；本地 Serve 意外退出→ unhealthy 待 §3 commit
-- [x] `Stop()` / `Done()` — 同步幂等 cancelRun；关闭每条已建立的 *Client（Close 幂等）+ 置 handle nil；再 close(done) + ready=false；二次 Stop 返 cache error
-- [x] `runUpstream` 雏形 — stdio auto_start 路径已落地（Prepare 同步执行连接 → 握手 → 发现 Tool → 注册 Proxy）；待后续 commit：heartbeat 定期 Ping、catalog reconciliation（重连后比对 tool 三元一致才替换 handle）、指数退避重连、SSE / Streamable HTTP
+- [x] `Stop()` / `Done()` — 同步幂等 cancelRun；关闭每条已建立的 *Client（Close 幂等）+ 置 handle nil；upstreamWG.Wait 等 runUpstream goroutine 退出；close(done) + ready=false；二次 Stop 返 cache error
+- [x] `runUpstream` heartbeat ticker — stdio auto_start 成功后启动每 entry 唯一 goroutine（30s ticker + 10s Ping timeout）；client.Done() 或 Ping 失败时按 generation compare-and-clear 将 handle.Store(nil)+status=Error+关闭 client；Stop 经 upstreamWG.Wait 同步退出全部 goroutine
+- [ ] `runUpstream` 重连 + catalog reconciliation — 仍待后续 commit：Ping/Done() 失败后按 mcp.reconnect 指数退避创建新 Client（重新 Initialize + 完整 DiscoverTools）；比对 Tool 三元（name+description+inputSchema）精确一致才原子替换 handle, 差异保持 unavailable + ErrMCPProtocolError 要求重启；listChanged channel 启合并 tools/list_changed 通知触发完整 DiscoverTools
 
 ## 2. MCP Client
 

@@ -305,3 +305,164 @@ func TestToToolResultWrapsErr(t *testing.T) {
 		t.Errorf("err=%v want wrap %v", err, in)
 	}
 }
+
+// fakeMCPExitServer 是 fakeMCPStdioServer 变体：tools/call 收到 name=="_stop_" 时
+// sys.exit(2) 让 subprocess 主动退出模拟上游 transport 断开，验证 runUpstream client.Done() 路径.
+const fakeMCPExitServer = `
+import sys, json
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+SERVER_CAPS = {"tools": {}}
+SVR_INFO = {"name": "fake-mcp-exit-server", "version": "0.0.1"}
+
+tools = [
+  {"name": "alpha", "description": "a", "inputSchema": {"type":"object"}},
+  {"name": "stop", "description": "triggers subprocess exit", "inputSchema": {"type":"object"}},
+]
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except Exception:
+        emit({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+        continue
+    mid = msg.get("id")
+    method = msg.get("method")
+    params = msg.get("params", {})
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": SERVER_CAPS,
+            "serverInfo": SVR_INFO,
+        }})
+        continue
+    if method == "notifications/initialized":
+        continue
+    if method == "ping":
+        emit({"jsonrpc": "2.0", "id": mid, "result": {}})
+        continue
+    if method == "tools/list":
+        emit({"jsonrpc": "2.0", "id": mid, "result": {"tools": tools}})
+        continue
+    if method == "tools/call":
+        name = params.get("name", "")
+        if name == "stop":
+            sys.stdout.flush()
+            sys.exit(2)
+        emit({"jsonrpc": "2.0", "id": mid, "result": {
+            "content": [{"type":"text","text":"hello " + name}],
+            "isError": False,
+        }})
+        continue
+    emit({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "method not found"}})
+`
+
+// runUpstream 监听 client.Done()：上游 subprocess 异常退出（exit 2）触发 transport close,
+// Manager markGenerationFailed 转为 StatusError + handle.Store(nil)；
+// 后续 ToolManager.Execute(mcp.<server>.alpha) 应返 ErrMCPUnavailable.
+// 无需等 30s ticker：client.Done() 路径在断开后即时触发.
+func TestManagerRunUpstreamRecoversTransportClose(t *testing.T) {
+	requirePython3(t)
+	tm := buildToolManager(t)
+	cfg := &config.MCPConfig{
+		Servers: []config.MCPServerConfig{{
+			Name:      "exit",
+			Transport: "stdio",
+			Command:   requirePython3(t),
+			Args:      []string{"-c", fakeMCPExitServer},
+			AutoStart: true,
+		}},
+		// 连接 / init timeout 给点冗余避免慢机器误判.
+		Timeout: config.MCPTimeoutConfig{Connect: 5 * time.Second, Init: 5 * time.Second},
+	}
+	m, err := NewManager(cfg, tm, nil)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer func() {
+		_ = m.Stop(context.Background())
+		<-m.Done()
+	}()
+	if err := m.Prepare(); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	st, ok := m.Get("exit")
+	if !ok || st.Status != StatusConnected {
+		t.Fatalf("prereq: status=%q last_error=%q", st.Status, st.LastError)
+	}
+	if st.ToolCount != 2 {
+		t.Fatalf("prereq: tool_count=%d want 2", st.ToolCount)
+	}
+
+	// 触发上游 subprocess 主动退出: 触发 alpha -> stop (触发 sys.exit(2)) 让 python 退出.
+	// 走 mcp.exit.alpha 一次确保 transport 仍正常, 然后调 mcp.exit.stop 触发 sys.exit.
+	scope := tool.ExecutionScope{AgentID: "a1"}
+	// 先 normal alpha call 验证 Proxy 走通.
+	if _, err := tm.Execute(context.Background(), scope, "mcp.exit.alpha", map[string]any{}); err != nil {
+		t.Fatalf("Startup normal mcp.exit.alpha Execute: %v", err)
+	}
+	// 触发 subprocess 退出.
+	// 工具调用的 tools/call 在 server 端 emit 后 raise; client 端 Send 之后 recvLoop 在 stdout 被 close 后返 ErrMCPTransportClosed.
+	_, _ = tm.Execute(context.Background(), scope, "mcp.exit.stop", map[string]any{})
+
+	// 等 runUpstream 检测到 client.Done() 并 markGenerationFailed 置 Error.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if s, _ := m.Get("exit"); s.Status == StatusError {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	final, _ := m.Get("exit")
+	if final.Status != StatusError {
+		t.Fatalf("status after subprocess exit=%q want error (last_error=%q)", final.Status, final.LastError)
+	}
+	if final.LastError == "" {
+		t.Errorf("last_error empty; expected reason recorded by markGenerationFailed")
+	}
+
+	// 后续 Proxy 调用应返 ErrMCPUnavailable (handle.Store(nil)).
+	_, err = tm.Execute(context.Background(), scope, "mcp.exit.alpha", map[string]any{})
+	if !errors.Is(err, ErrMCPUnavailable) {
+		t.Errorf("after transport closed, Execute mcp.exit.alpha err=%v want ErrMCPUnavailable", err)
+	}
+}
+
+// Stop 在 runUpstream goroutine 运行中应能干净 Join 并 close Done 在合理时间内。
+// 避免引入"Stop 等到 ticker 30s"或者"Stop 死锁"的退化.
+func TestManagerStopJoinsUpstreamGoroutines(t *testing.T) {
+	requirePython3(t)
+	tm := buildToolManager(t)
+	cfg := &config.MCPConfig{
+		Servers: []config.MCPServerConfig{fakeStdioServerConfig(t, "fake", true)},
+	}
+	m, _ := NewManager(cfg, tm, nil)
+	if err := m.Prepare(); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if _, ok := m.Get("fake"); !ok {
+		t.Fatalf("prereq: server not found")
+	}
+
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- m.Stop(context.Background()) }()
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Errorf("Stop returned err=%v want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return within 5s while runUpstream was active (ticker join deadlock)")
+	}
+	select {
+	case <-m.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Done not closed within 2s after Stop returned")
+	}
+}

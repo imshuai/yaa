@@ -1397,3 +1397,51 @@ progress #11 末尾的下一轮方向余下 4 项：
 3. 本地 MCPServer（checklist §3）。
 4. Agent/Session/Provider 集成（checklist §9 §2）。
 5. Planner step 1-10（docs/planner/）。
+
+---
+
+## #14 runUpstream heartbeat ticker + transport-close 自恢复 (HEAD 待 push)
+
+### 范围
+progress #11 优先级 #1 第 1 步（async runUpstream goroutine + heartbeat ticker + client.Done()/Ping 失败 → compare-and-clear generation 失败清理 + Stop 同步 Join）。**不**含 重连 / 指数退避 / catalog reconciliation / listChanged channel —— 留下一 commit（progress #14 末尾下一步）。
+
+### 改动文件
+- `internal/mcp/manager.go` (+~170 行)：
+  - 新增常量 `heartbeatInterval=30s` / `heartbeatTimeout=10s`（docs/mcp/config-ref.md §7.2）
+  - `serverEntry` 加 `generation uint64`（启动时 gen=0；重连时下一 commit 递增）+ `listChanged chan struct{}`（cap 1，本期声明不投递，留给 catalog reconciliation commit）
+  - `Manager` 加 `upstreamWG sync.WaitGroup` 跟踪所有 entry 的 runUpstream goroutine
+  - `connectStdioServer` 成功路径启动 `go m.runUpstream(e, handle, client, e.generation)` 并 Add(1)
+  - 新 `runUpstream(e, handle, client, gen)`：select 等 4 事件 —— `runCtx.Done()` 退出 / `client.Done()` → markGenerationFailed / `ticker.C` → Ping（heartbeatTimeout）失败 → markGenerationFailed；ctx 已取消则视为 Manager 关闭不视为 heartbeat 失败
+  - 新 `markGenerationFailed`：m.mu 保护下 compare-and-clear generation + e.client==client 比对；OK 则 handle.Store(nil) + status=Error + LastError；锁外关 client（幂等）
+  - `Stop` 加 `m.upstreamWG.Wait()` 在 close done 之前；现有 cancelRun 已触发 runUpstream 的 `<-m.runCtx.Done()` 分支退出
+  - 头部 comment + Prepare comment + Stop comment 更新为本系列 lifecycle 实况
+- `internal/mcp/manager_integration_test.go`（+~150 行，3 例）：
+  - `const fakeMCPExitServer`：fakeMCPStdioServer 变体，`tools/call name=="stop"` 时 `sys.exit(2)` 模拟上游 transport 突然中断（不影响 stdio_test.go 原版 fakeMCPStdioServer 8 例稳定）
+  - `TestManagerRunUpstreamRecoversTransportClose`：Prepare → runUpstream 启动 → 触发子进程退出（调 mcp.exit.stop → python sys.exit）→ polling ≤5s 等 status 转 Error + LastError 非空 → 后续 `tm.Execute(mcp.exit.alpha)` 返 ErrMCPUnavailable（验证 handle.Store(nil)）
+  - `TestManagerStopJoinsUpstreamGoroutines`：Prepare 启动 runUpstream 后 Stop 必须 ≤5s 返 + Done ≤2s 关闭，ticker join 无死锁
+
+### 验证
+```
+go test -count=1 -timeout 60s ./internal/mcp/ -run 'TestManagerRunUpstream|TestManagerStopJoins|StopDisconnects' -v
+  # 3 例 PASS (RunUpstreamRecoversTransportClose 0.22s, StopJoins 0.21s, StopDisconnectsClients 0.21s)
+go vet ./... # 全项目无 warning
+go build ./... # 18 包全过
+go test -count=1 -timeout 120s ./internal/mcp/ # 58 例全绿 (上轮 56 + 本轮 3 新 - 重叠 TestManagerStopDisconnectsClients 已含; 实际加 2 例)
+go test -count=1 -timeout 240s ./... # 二次跑 18 包全绿 (含 WS flake 已上轮根治)
+```
+
+### 决策
+- **TestManagerStopDisconnectsClients 上轮已存在**：本 commit 该测试不动，验证 Stop 仍能在 transport active 时正确清理。新加的 StopJoins 是专门的 Stop+WG.Wait 同步测试，不重叠.
+- **`fakeMCPExitServer` 不复用 shared fakeMCPStdioServer**：原版 tools/call 收任意 name 都正常返；本期需 sys.exit 触发 transport 断开. 修改原版可能影响 stdio_test.go 8 例已稳定的断言, 单独变体最小风险.
+- **`_stop_ 工具触发 sys.exit(2)`** vs `kill proc`：kill proc 需要拿到 StdioClient.cmd.Process 私有字段在测试中访问过深；让 server 主动退出复用现有 tools/call 路径更接近"上游 process 异常崩溃"的语义, 是更真实的故障 репрезентативности.
+- **`heartbeatInterval=30s` 固定**: docs §7.2 明文 fixed 30s/10s. 测试不触发 ticker 真等 30s——`client.Done()` 路径在 subprocess 退出后 sub-second 触发 markGenerationFailed, 比 30s ticker 快.
+- **暂不引入指数退避重连**: 本 commit 是 雏形 heartbeat；失败立即转 Error + unavailable, 不重建. 配置 mcp.reconnect.enabled 的 rewrite 已是下个 commit 范围, 一次只动一个独立可验收步骤 (ponytail: 一步小可验收).
+- **`generation` 启动时 = 0**: 单代场景下 markGenerationFailed 中 `e.generation != gen` 永远 false → 不 short-circuit. 重连 commit 才真正利用 generation 比对避免旧代 stale writes.
+
+### 下一轮方向
+1. **runUpstream 重连第 2 步**：markGenerationFailed 后按 mcp.reconnect.* 指数退避构新 Client（Initialize+DiscoverTools）→ 递增 generation 原子切换 entry/Client/handle；目录三 真比对一致 才成功.
+2. **listChanged channel 事件路径**：tools/list_changed notification 投递到该代 listChanged cap-1 channel → runUpstream select 命中 → 完整 DiscoverTools + 三元严格比对 → 不一致保持 unavailable + ErrMCPProtocolError.
+3. SSE / Streamable HTTP transport（progress #11 §3 §5/§6）.
+4. 本地 MCPServer（checklist §3）.
+5. Agent/Session/Provider 集成（checklist §9 §2）.
+6. Planner step 1-10（docs/planner/）.
