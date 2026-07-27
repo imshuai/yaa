@@ -178,9 +178,6 @@ func TestWSStreamCancelRunningTurn(t *testing.T) {
 	}
 }
 
-// 防止编译器误报 strings 未使用。
-var _ = strings.HasPrefix
-
 // TestWSStreamDisconnectCancelsTurn 在 active turn 期间关闭连接，期望 service 端不会泄漏
 // 启动态 turn（无法检测远程行为，PN v1 只校验：重新 dail 同 turn_id 复用成功）。
 func TestWSStreamDisconnectCancelsTurn(t *testing.T) {
@@ -198,28 +195,25 @@ func TestWSStreamDisconnectCancelsTurn(t *testing.T) {
 	_ = conn.WriteMessage(websocket.TextMessage, req)
 	_ = conn.Close()
 
-	// 等一段让 service 处理取消。
-	time.Sleep(200 * time.Millisecond)
-
-	// 再次拨号；turn_abort_1 应已取消，不应在 active 列表。重发同一 turn_id 现在应被服务接受
-	// （queued 取消不消费 ID），所以 queued 帧应该正常回来。
-	conn2 := dialWS(t, hsrv.URL, s.ID)
-	defer conn2.Close()
-	_ = conn2.SetReadDeadline(time.Now().Add(10 * time.Second))
-	req2, _ := json.Marshal(wsClientFrame{Type: "message", TurnID: "turn_abort_1", Content: "again"})
-	_ = conn2.WriteMessage(websocket.TextMessage, req2)
-
-	f := readFrame(t, conn2)
-	// 首个进来的应该是 queued 或 assistant_start（取决于运行时序）。v1 文档要求 queued 先。
-	// 即使是 assistant_start 也表明 turn 已重新发起，证实 turn 状态已清理。
-	if f.Type != "queued" && f.Type != "assistant_start" && f.Type != "error" {
-		t.Fatalf("unexpected first frame: %+v", f)
+	// 等 service 处理取消：polling session.Manager.IsTurnActive 直到 turn 从 activeTurns 移除
+	// （之前用 200ms hard-coded Sleep 在全项目并行测试下 CPU 紧会提前醒来，导致 flake；此处最多等 5s）。
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !sm.IsTurnActive(s.ID, "turn_abort_1") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	// 若是 error 且 code=40001 turn id already used，则 turn 取消未清理。
-	if f.Type == "error" && f.Code == "40001" && strings.Contains(f.Message, "already used") {
-		t.Fatalf("turn_abort_1 was not cleaned up on disconnect: %+v", f)
+	if sm.IsTurnActive(s.ID, "turn_abort_1") {
+		t.Fatalf("turn_abort_1 still active 5s after disconnect (not cleaned up)")
 	}
-	_ = readFrame(t, conn2) // drain 下一帧避免主退出时阻塞 writer
+
+	// Spec（docs/remote-api/conversation.md §turn_id）：turn_id 在 session 内永久唯一；
+	// 已提交 user 的 turn_id 复用返回 40001。本测试不重拨同/异 turn_id 起新 turn，
+	// 因为 Hub 是 session 范围广播，conn2 会收到 conn1 turn 在 background 完成的终态帧
+	// （assistant_done turn_abort_1），交叉会引入非确定性；严格测试 turn_id 唯一性应在他处覆盖。
+	// 本测试的核心权威断言：disconnect 触发 activeTurns 移除 turn（IsTurnActive 返 false），
+	// server 不再保留 queued/running 状态——这正是 "Stream disconnect cancels turn" 的 spec 语义.
 }
 
 func TestWSStreamSessionEndOnClose(t *testing.T) {

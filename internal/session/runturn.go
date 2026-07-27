@@ -167,6 +167,20 @@ func (m *Manager) RunTurn(
 	return runErr
 }
 
+// IsTurnActive 判断 (sessionID, turnID) 当前是否仍在 activeTurns 中。
+// 供测试在不进 broker frame 路径的情况下 polling 等 cleanup 完成（如 WS 断线后 turn 退出）。
+// Readers 用 mu.RLock；写入/删除走 m.mu.Lock。
+func (m *Manager) IsTurnActive(sessionID, turnID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	turns := m.activeTurns[sessionID]
+	if turns == nil {
+		return false
+	}
+	_, ok := turns[turnID]
+	return ok
+}
+
 // CancelTurn 查找精确 (sessionID, turnID) 并调用其保存的 CancelCauseFunc。
 // 不存在或已终态返回 ErrTurnNotActive。
 // 不在 Manager.mu 内执行 cancel；只查 handle 后释放锁。

@@ -1351,3 +1351,49 @@ HTTP_PROXY=... go test -count=1 -timeout 240s ./...
 4. 本地 MCPServer（checklist §3）。
 5. Agent/Session/Provider 集成（checklist §9 §2）。
 6. Planner step 1-10（docs/planner/）。
+
+---
+
+## #13 WS flake root-cause fix + session.Manager.IsTurnActive 公开 API (HEAD 待 push)
+
+### 范围
+progress #10 早前记录 TestWSStreamDisconnectCancelsTurn 200ms time.Sleep timing flake 是 "非本系列 commit 引入"——本 commit 彻底 root-cause 修：发现测试本身的两处 spec 违背 + 一个 race，对应最小修复。
+
+### Root cause 三个独立问题
+1. **测试 assumptions 违反 spec**：docs/remote-api/conversation.md §turn_id 明文规定 "turn_id 在 session 内永久唯一；已提交 user 的 turn_id 复用返回 40001"。原测试期望"重拨同 turn_id 应被接受"与此 spec 直接冲突。session.turn.go:51 的 `snap.Messages` 含同 TurnID 则拒绝是 spec-correct，bug 在 test。
+2. **200ms hard-coded Sleep 不可靠**：全项目跑时 CPU 紧迫会让 sleep 提前结束 → conn2 重拨时 conn1 的 turn 还在 activeTurns 中 → 撞 ErrTurnIDConflict，尤其 easy 触发 flake。
+3. **Hub 是 session 范围广播**：conn2 即使拨新 turn_id 也会收到 conn1 在 background 跑完时 publish 的 assistant_done frame（turn_abort_1），抢在 turn_after_disconnect 的 queued/assistant_start 前到达，引入非确定性。
+
+### 修复
+- **session.Manager 新增 IsTurnActive(sessionID, turnID) bool 公开 API**（runturn.go +13 行，mu.RLock 保护）：供测试在不进 frame 路径的情况下 polling 等 cleanup 完成。该 API 也是 Runtime/Remote API 可以查询任意 (sid, turnID) 的权威活动空间状态的有用公开 API（不限于 testing）。
+- **ws_handler_test.go 重写 TestWSStreamDisconnectCancelsTurn（-23/+17 行）**：
+  - 用 polling `sm.IsTurnActive(s.ID, "turn_abort_1")` 直到 false（最多 5s，10ms tick）作为唯一权威断言——这正是"Stream disconnect cancels turn"的 spec 语义。
+  - 删除"重拨同/异 turn_id 起新 turn 应被接受"段——违反 spec（永久唯一）+ Hub 广播污染非确定性，留 turn_id 唯一性/end-to-end turn lifecycle 测试在他处单独覆盖。
+  - 删除 `var _ = strings.HasPrefix` 防 unused stub（strings.Replace 已在 dialWS 实际使用，stub 是死代码）。
+
+### 验证
+```
+go test -count=10 -timeout 120s ./internal/api/ -run TestWSStreamDisconnectCancelsTurn
+  # ok —— 10 轮连续全绿（修复前 5 轮 5 fail）
+go vet ./... # 全项目无 warning
+go build ./... # 18 包全过
+go test -count=1 -timeout 240s ./...
+  # 二次跑全项目 18 包全绿（无 WS flake，无任何 fail）
+```
+
+### 决策
+- **IsTurnActive 作为公开 API 而非 testing helper**：未来 Runtime/observability 可能需要查 turn 是否活动（如 health endpoint 报告 idle/active）；在 session 公开 API 上加这个冷读方法是 1 行成本 + 0 风险，且 ponytail "在 shared 函数加 1 guard 比在每 caller 加 sleep 都重复更小 diff"。
+- **测试只测 "cancels" 单一语义**：Hub 广播跨连接复杂场景属于 turn lifecycle / hub subscribe 设计的范畴，不应在一个"disconnect cancels" 测试里交叉；测试单一断言更符合 isolation 原则。
+- **没有修 200ms Sleep 改 800ms 的治标做法**：即使延长仍是 sleep-race 解，CPU 负载变化时重新触发是早晚事。polling 是 root-cause 修法。
+
+### 副债清理
+- progress #10 早前已记 WS flake；本 commit 后该 flake 已从已知副债清单中移除。
+- progress #11 末尾「下一轮方向 #2 WS flake 根因修复（独立 commit）」已完成。
+
+### 下一轮方向
+progress #11 末尾的下一轮方向余下 4 项：
+1. **重连 + catalog reconciliation + heartbeat**（async runUpstream goroutine + mcp.reconnect 指数退避 + tool 三元一致才 Store 新 handle；docs/mcp/config-ref.md §7.1/§7.2 是权威设计，含 generation + listChanged channel + ticker + lifecycleMu gate）。
+2. SSE / Streamable HTTP transport（checklist §5/§6）。
+3. 本地 MCPServer（checklist §3）。
+4. Agent/Session/Provider 集成（checklist §9 §2）。
+5. Planner step 1-10（docs/planner/）。
