@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/imshuai/yaa/internal/config"
+	"github.com/imshuai/yaa/internal/mcp"
 	"github.com/imshuai/yaa/internal/tool"
 )
 
@@ -45,6 +46,23 @@ func RegisterBuiltin(m *tool.Manager, cfg *config.Config) error {
 		if err := m.Register(t); err != nil {
 			return fmt.Errorf("tool: register builtin %q: %w", r.canonical, err)
 		}
+	}
+	return nil
+}
+
+// RegisterMCPIntrospection 在 MCP Manager Prepare/Activate 完成后注册依赖它的 introspection tool
+// (docs/tool/introspection.md §10 mcp_list). 与 RegisterBuiltin 分开调用是因为 mcpMgr 在
+// runtime.go 启动序中位于 RegisterBuiltin 之后 (docs/tool/manager.md §3 注册序 builtin 先于 MCP proxy,
+// 但 mcp_list 工具本身依赖 MCP Manager 快照 — 它是 introspection tool 而非 MCP proxy, 不改变注册序契约).
+// 缺省 config enabled (config.DefaultToolsConfig 已给 mcp_list Key 设 Enabled=true);
+// 这里通过 config 查询保持与 shell/http 一致: 无论 Enabled 与否都注册以保证 Tool Manager 可列.
+func RegisterMCPIntrospection(m *tool.Manager, cfg *config.Config, mcpMgr *mcp.Manager) error {
+	if mcpMgr == nil {
+		return nil // v1 兼容: MCP 子系统未启用时该 tool 也不注册 (调用方调 Get 返 ErrToolNotFound).
+	}
+	t := NewMCPListTool(mcpMgr)
+	if err := m.Register(t); err != nil {
+		return fmt.Errorf("tool: register builtin %q: %w", t.Name(), err)
 	}
 	return nil
 }

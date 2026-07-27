@@ -124,6 +124,6 @@ v1 副债：listTools 严格 DTO 的 DisallowUnknownFields（当前 request Unma
 - [x] Remote API 不提供 MCP Server 动态 CRUD 或直接 Tool 调用 (handler 只 GET 只读; 无 POST/PUT/DELETE 路由)
 - [x] Runtime shutdown — MCP Manager.Stop(cancelRun + 关闭 clients + close done)；Runtime 已等 Done 后以 context.Background() 再调 Stop 拿 cacheErr，再 fallback 关 tool Manager
 - [x] 本地 MCP Server 使用 `mcp.server.agent_id` 调用 Tool Manager，并校验 Agent Tool 白名单 — NewMCPServerRaw 构造时调 tools.ListForAgent(cfg.AgentID) 取 allowAll 集; ExposedTools 每项必须 enabled + 通过 Agent allowlist, 否则 ErrMCPConfig (server.go §NewMCPServer); handleCallTool 走 s.tools.Execute(scope{AgentID:s.agentID, SessionID:""}) 二次校验 (server.go §handleCallTool); 测试 TestNewMCPServerRejectsExposedToolNotInAgentAllowlist (allowlist=["echo"], ExposedTools=["echo","private"] → ErrMCPConfig 含 "private"+"restricted") + TestNewMCPServerAcceptsAllExposedToolsInAllowlist (正向 Echo+Ls 全过)
-- [ ] 内置 Tool: `mcp_list` — 列出 MCP Server
+- [x] 内置 Tool: `mcp_list` — 列出 MCP Server — builtin.MCPListTool 投影 mcp.Manager.List() []ServerStatus 为按 Name 升序 JSON; schema={server_name?, minLength:1} + additionalProperties:false; 省略 server_name 返全部, 非空过滤单条 (找不到 → IsError=true); runtime.go §mcpMgr Prepare/Activate 后调 builtin.RegisterMCPIntrospection(tm, cfg, mcpMgr) 注册 (mcpMgr nil 时跳过); 测试 TestMCPListTool* (unit 4) + TestRegisterMCPIntrospection (runtime 集成 2)
 - [ ] 指标按 `observability.md` 唯一表实现（`yaa_mcp_servers`, `yaa_mcp_tool_calls_total`, `yaa_mcp_tool_call_duration_seconds`, `yaa_mcp_reconnects_total`, `yaa_mcp_tools`）
 - [ ] 调用链追踪（span: mcp.call_tool, mcp.list_tools）

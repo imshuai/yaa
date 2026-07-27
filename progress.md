@@ -2036,3 +2036,48 @@ go build ./... && go vet ./... && go test -count=1 -timeout 300s ./...   # 18 �
 - **正向测试不启动 Serve**: 只验证 NewMCPServerRaw 返 nil err 即证明 authz 路径通过; Serve 是 lifecycle 层 concern 由 server_stdio_test.go E2E 覆盖, 不重复测.
 - **err 文本断言含 "private"+"restricted"**: docs §6 错误内容是 "exposed tool %q is not enabled or not allowed for agent %q", 测试用 strings.Contains 证明 err 信息真名这俩.
 
+
+## progress #25 — 内置 Tool mcp_list 实现 + runtime 注册接入 + progress #22 flake 修复
+
+**Commit (将提交)**: 本 commit 落地 checklist §9 第 127 行 (内置 Tool mcp_list, 之前 8 个 introspection tools 中全未实现).
+
+**背景**: config/defaults.go 把 14 个 builtin tool 都 enabled=true 注册到配置表 (`mcp_list` 是其中之一), 但 builtin/register.go 只构造 shell/http/file_* 6 个 Tool. introspection group 8 个 (mcp_list/agent_list/...) 完全从未实现 → ToolManager.Get 调返 ToolNotFound. 选 mcp_list 单点实现 + 注册不强行做其他 7 个 (它们当前 disabled-by-stub status quo 也不需要立刻打破).
+
+**实现**:
+- `internal/tool/builtin/mcp_list.go` 新增 (依赖 `*mcp.Manager` 不引 cycle: builtin → mcp, mcp → tool, builtin 与 tool 是不同包):
+  - `MCPListTool` struct 持有 `*mcp.Manager` (持 ref, 不 copy).
+  - `NewMCPListTool(mgr)` 构造.
+  - `Name() = "mcp_list"` + `Description()` + `Parameters()` 严格按 docs/tool/introspection.md §10 schema `{"type":"object","properties":{"server_name":{"type":"string","minLength":1}},"additionalProperties":false}`.
+  - `Execute(ctx, scope, params)`: 取 server_name 可选; 调 `mgr.List()` 后按 Name 升序稳定排序 (docs §1 "列表按稳定主键升序"); server_name 非空按名过滤 (找不到 → `ToolResult{Content:"mcp server %q not found", IsError:true}` docs §1 "不存在的资源返回 IsError=true"); nil → `[]mcp.ServerStatus{}` 防 JSON null (docs §1 "空 slice 编码为 []"); JSON marshal Content string.
+- `internal/tool/builtin/register.go` 加 `RegisterMCPIntrospection(m *tool.Manager, cfg *config.Config, mcpMgr *mcp.Manager)`: mcpMgr nil (MCP 子系统未启用) 时不注册; 否则注册 MCPListTool.
+- `internal/runtime/runtime.go` §mcpMgr Prepare/Activate 后 (line 277) 调 `builtin.RegisterMCPIntrospection(rt.tools, rt.cfg, mcpMgr)`; 注释说明为什么在 RegisterBuiltin 之后单独调 (mcp.Mgr 在 runtime 启动序位于 RegisterBuiltin 之后; 这是 introspection tool 依赖 MCP Manager 快照的合理时序, 不破坏 docs/tool/manager.md §3 "builtin → plugin → MCP proxy").
+
+**测试**:
+- `internal/tool/builtin/mcp_list_test.go` (4 unit):
+  - TestMCPListToolSchema: Parameters JSON 严格匹配 docs §10 (object/server_name string minLength 1 / additionalProperties false).
+  - TestMCPListToolEmptyServersReturnsArray: 空 ServerList → "[]" (非 null).
+  - TestMCPListToolListAllAndFilterName: 多 server (zeta/alpha/mid) → 按 Name 升序 [alpha,mid,zeta]; server_name="mid" → 单条; 找得见.
+  - TestMCPListToolFilterUnknownServerNameIsError: 不存在 server_name → IsError=true.
+- `internal/tool/builtin/register_test.go` (2 集成):
+  - TestRegisterMCPIntrospectionWithNilMCPSkipRegister: mcpMgr nil 不注册 mcp_list (ListForAgent(a1) 不见它).
+  - TestRegisterMCPIntrospectionWithManagerRegistersMCPList: mcpMgr 非 nil → 注册 + ToolManager.Execute(scope{a1}, mcp_list, {}) "[]" (端到端走 Tool Manager allowlist + timeout + 并发门).
+
+**额外修复**: 发现 progress #22 已 push 测试 `TestStreamableHTTPClientGETReceivesServerPushSSE` 存在并发 flake (约 10% / 跑全 package).
+- 根因: tryOpenServerToClientStream 是 `go c.tryOpenServerToClientStream(...)` 异步启动; SSE GET 与 POST init response 共同投 recvCh, 顺序由 goroutine 调度决定. 当 SSE frame 推送时机早于 POST init response, recvCh 第一条是 SSE notification 第二条是 init response; 测试原先按"第一条必 init, 第二条必 notification"断言就误报.
+- 修法 (`streamable_http_test.go` 改): 用 ID 字段区分 init response (`len(msg.ID)>0`) 与 SSE notification (`len(msg.ID)==0 && msg.Method!="notifications/tools/list_changed"`), 收齐两条各一次即 break; 不再假设 recvCh 顺序.
+- 验证: 10 次单跑 + 3 次全 package. 稳定通过. 这是测试修法不是源码 modify (tryOpenServerToClientStream 行为正确, 不该串化; recvCh 是 docs §3.3 "客户端以 JSON-RPC id 关联响应" 设计意图直接体现).
+- 注: 该 flake fix 不占 progress #25 commit 主题 (内含), 但 commit message 单独列出.
+
+**验证**:
+```
+go build ./... && go vet ./... && go test -count=1 -timeout 300s ./...   # 18 包全绿 (3 次全 package 稳定)
+go test -count=1 -timeout 60s ./internal/tool/builtin/ -run "TestMCPListTool|TestRegisterMCPIntrospection" -v   # 6 例 PASS
+go test -count=1 -timeout 60s ./internal/mcp/ -run TestStreamableHTTPClientGETReceivesServerPushSSE   # 10 次稳定通过
+```
+
+**决策记录**:
+- **单做 mcp_list 不做其他 7 个 introspection tools**: 它们依赖不同 Manager (agent_list 需要 agent.Manager, session_list 需要 session.Manager 等), 一次性全做是大重构; ponytail full 选最小可独立验收 = 单个 introspection tool + 注册胶水. 其他 7 个留 stub; Default 注册表中 enabled=true 但实际 ToolManager 没 Register (现有缺失状态), 这与之前的代码状态一致.
+- **RegisterMCPIntrospection 独立函数不在 RegisterBuiltin 内**: 因为 (1) mcpMgr 在 runtime 启动序位于 RegisterBuiltin 之后; (2) 注册序契约 (docs/tool/manager.md §3 "builtin → plugin → MCP proxy") 保证 mcp_list 产生于 MCP Manager 完成时, 不强行互通 RegisterBuiltin. 这种"独立 Register 函数"模式也可扩展给 agent_list 等其他依赖 Manager 的 introspection tool.
+- **测试不假设 recvCh 顺序**: docs §3.3 明确"客户端以 JSON-RPC id 关联响应", 即 message 在 recvCh 中是无序的; 测试应当按 ID 区分而非顺序断言. 修法与设计意图一致.
+- **MCPListTool nil → []**: docs/tool/introspection.md §1 "空 slice 编码为 []" 是 hard 约定 (避免 LLM 收到 null 误解); 此处理同 Remote API `handleListMCPServers items==nil → []`.
+

@@ -290,3 +290,9 @@ func TestRuntimeMemoryRemoteAPIProviderInjected(t *testing.T) {
 		t.Fatalf("body missing code=40401: %s", body)
 	}
 }
+
+// TestRuntimeRegistersMCPListBuiltin 验证 Runtime.Start 把 mcp_list 依赖的 introspection 工具
+// 注册到 Tool Manager:
+// - Tool manager.Execute 可调 (以 mcp_list 作为一个普通 Tool, 走 Agent a1 allowAll).
+// - 输出是合法 JSON array (空 config 默认无服务器 → "[]").
+// docs/mcp/checklist.md §9 第 127 行 (内置 Tool mcp_list) + docs/tool/introspection.md §10.

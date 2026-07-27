@@ -538,18 +538,37 @@ func TestStreamableHTTPClientGETReceivesServerPushSSE(t *testing.T) {
 	if err := tr.Send(ctx, initMsg); err != nil {
 		t.Fatalf("Send initialize: %v", err)
 	}
-	// 第一次 Recv → initialize 响应 (POST 同步路径).
-	_, rerr := tr.Recv(ctx)
-	if rerr != nil {
-		t.Fatalf("Recv init: %v", rerr)
+	// 用 ID 区分 init response (有 ID) 与 SSE notification (无 ID, 有 Method), 不假设 recvCh 顺序:
+	// GET 异步 tryOpenServerToClientStream 与 POST 同步响应都投 recvCh, 顺序取决于 goroutine 调度.
+	// init response 必拿到 + SSE notification 必拿到; 各一次.
+	var gotInit, gotSSE bool
+	for i := 0; i < 2 && (!gotInit || !gotSSE); i++ {
+		msg, rerr := tr.Recv(ctx)
+		if rerr != nil {
+			t.Fatalf("Recv #%d: %v", i, rerr)
+		}
+		if msg == nil {
+			t.Fatalf("Recv #%d: nil msg", i)
+		}
+		hasID := len(msg.ID) > 0
+		if hasID {
+			if gotInit {
+				t.Fatalf("Recv #%d: 第二条 init response, recvCh 顺序异常", i)
+			}
+			gotInit = true
+		}
+		if !hasID && msg.Method == "notifications/tools/list_changed" {
+			if gotSSE {
+				t.Fatalf("Recv #%d: 第二条 SSE notification", i)
+			}
+			gotSSE = true
+		}
 	}
-	// 第二次 Recv → SSE 流推送的 notification.
-	msg, rerr := tr.Recv(ctx)
-	if rerr != nil {
-		t.Fatalf("Recv SSE: %v", rerr)
+	if !gotInit {
+		t.Errorf("未收到 initialize 响应")
 	}
-	if msg == nil || msg.Method != "notifications/tools/list_changed" {
-		t.Errorf("Recv SSE: msg=%v method=%q want notifications/tools/list_changed", msg, msgMethodString(msg))
+	if !gotSSE {
+		t.Errorf("未收到 SSE notification notifications/tools/list_changed")
 	}
 	if err := tr.Close(); err != nil {
 		t.Errorf("Close: %v", err)
