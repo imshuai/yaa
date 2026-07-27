@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -129,7 +130,7 @@ func NewManager(cfg *config.MCPConfig, tm *tool.Manager, logger *slog.Logger) (*
 // 当前 commit: 仅 stdio + auto_start=true 的 server 启动真实连接 ——
 // StdioClient → Connect(ConnectTimeout) → Initialize(InitTimeout) → DiscoverTools → 注册 MCPToolProxy 到 ToolManager.
 // 失败的 server 启动 runUpstream 后会按 mcp.reconnect 自动重连 (本期已落地 Step 2); 仍失败的 final 保持 Error.
-// 其他 transport (sse / streamable_http) 暂保持 Disconnected, 等后续 commit.
+// sse 已接入; streamable_http 暂保持 Disconnected等后续 commit.
 // 任一 server 失败仅标 LastError + Status=Error，不影响其他 server 或 Runtime 启动。
 // ToolManager.Register 失败（罕见：canonical 重名 / 空 description）也只标 LastError，不停止其他工作。
 func (m *Manager) Prepare() error {
@@ -138,8 +139,8 @@ func (m *Manager) Prepare() error {
 		if !e.cfg.AutoStart {
 			continue
 		}
-		if e.transport != "stdio" {
-			// SSE / Streamable HTTP 待后续 commit。
+		if e.transport != "stdio" && e.transport != "sse" {
+			// streamable_http / 未知 transport 待后续 commit.
 			m.mu.Lock()
 			e.status.LastError = "transport not supported in current build"
 			m.mu.Unlock()
@@ -150,8 +151,8 @@ func (m *Manager) Prepare() error {
 	return nil
 }
 
-// connectStdioServer 启动单个 stdio auto_start server：建立 Client + DiscoverTools + 注册 Proxy + 发布初代 generation + 启动 runUpstream goroutine.
-// 失败仅更新 e.status（LastError + Status=Error）不影响其它 server.
+// connectStdioServer 启动单个 stdio/sse auto_start server：建立 Client + DiscoverTools + 注册 Proxy + 发布初代 generation + 启动 runUpstream goroutine.
+// 失败仅更新 e.status (LastError + Status=Error) 不影响其它 server; sse 与 stdio 共享 connectAndDiscover+registerProxies+publishGeneration+runUpstream.
 // 成功后：e.handle 持有 stable ProxyHandle；e.client/generation/tools/status 是初代快照；m.upstreamWG 已 Add(1).
 func (m *Manager) connectStdioServer(e *serverEntry) {
 	handle := &ProxyHandle{}
@@ -186,10 +187,10 @@ func (m *Manager) connectStdioServer(e *serverEntry) {
 // 成功返回 client + 已规范的 normalized/sorted MCPTool 列表.
 // （重连与初次启动共享此 path；catalog 注册由调用方自行决定）.
 func (m *Manager) connectAndDiscover(e *serverEntry) (*Client, []MCPTool, error) {
-	if e.cfg.Command == "" {
-		return nil, nil, fmt.Errorf("stdio server missing command")
+	tr, err := m.buildTransport(e)
+	if err != nil {
+		return nil, nil, err
 	}
-	tr := NewStdioClient(e.cfg.Command, e.cfg.Args, e.cfg.Env, m.logger)
 	client := NewClient(e.name, m.runCtx, tr)
 
 	connTimeout := e.cfg.Timeout
@@ -283,6 +284,28 @@ func (m *Manager) publishGeneration(e *serverEntry, handle *ProxyHandle, client 
 		})
 	}
 	m.mu.Unlock()
+}
+
+// buildTransport 按 e.transport 选择 ClientTransport 实例 (docs/mcp/transport.md §3).
+// 支持 stdio / sse; streamable_http 待后续 commit.
+// config 字段边界已由 config.Validate 保证 (command/url 在 transport 匹配下非空);
+// 这里仅兜底校验防 panic.
+func (m *Manager) buildTransport(e *serverEntry) (ClientTransport, error) {
+	switch e.transport {
+	case "stdio":
+		if e.cfg.Command == "" {
+			return nil, fmt.Errorf("stdio server missing command")
+		}
+		return NewStdioClient(e.cfg.Command, e.cfg.Args, e.cfg.Env, m.logger), nil
+	case "sse":
+		if e.cfg.URL == "" {
+			return nil, fmt.Errorf("sse server missing url")
+		}
+		hc := &http.Client{}
+		return NewSSEClient(e.cfg.URL, hc, e.cfg.Headers, m.logger), nil
+	default:
+		return nil, fmt.Errorf("%w: unsupported transport %q", ErrMCPConfig, e.transport)
+	}
 }
 
 // effectiveToolTimeout 选 server-specific timeout，否则取全局；都 0 则使用 caller deadline only.

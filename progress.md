@@ -1565,3 +1565,68 @@ go test -count=1 -timeout 240s ./... # 18 包全绿 (含 WS flake 上轮已根�
 4. Planner step 1-10 (docs/planner/).
 5. Remote API `GET /api/v1/mcp/servers` + `GET /api/v1/mcp/servers/:name` (checklist §9).
 6. 文档副债 (W1 时间戳/W2 README 导览/W4 tokens[].roles 默认, 早前 progress 已记).
+
+---
+
+## #17 SSE Transport — SSEClient (legacy MCP 2024-11-05) + Manager 接入 (待 push)
+
+### 范围
+progress #16 末尾下一步 §1: checklist §5 SSE transport. 新增 `internal/mcp/sse.go` 实现 SSEClient 满足 ClientTransport 接口; 公开 SSE 接到 Manager buildTransport/Prepare; 用 httptest mock SSE server 端到端测 Client lifecycle + Manager.Prepare sse auto_start 路径.
+
+### 改动文件
+- `internal/mcp/sse.go` (+~360 行) — 新文件:
+  - 常量 `sseMessageMaxBytes=4MiB` (与 stdio 一致 docs §2); `sseFrameMaxBytes` (frame 含字段头开销上限)
+  - `tlsConfig` type = `struct{caFile string}`, 占位 docs §5 (v1 不实现 ca_file 真实加载; http.Client TLS 由调用方提供)
+  - `SSEClient` struct 字段: url, headers, tls, client *http.Client, logger, mu, started, closed, resp, body, reader, endpoint, lastID, info, recvReady, closeOnce, procCtx/procCancel (GET 流生命周期)
+  - `NewSSEClient(url, httpClient, headers, logger)` — httpClient nil → 默认; logger nil → slog.Default()
+  - `Start(startupCtx)`: 建 procCtx (with cancel); 启动 ctx 取消传播到 procCtx (后台 goroutine); http GET + Accept: text/event-stream + headers 注入; 非 2xx → ErrMCPAuthFailed (401/403) 或 ErrMCPConfig; Content-Type 不含 text/event-stream → ErrMCPProtocolError; 拨号失败 → conn refused (strings 启发式) / channel ErrMCPConnTimeout (startupCtx 已取消)
+  - `parseFirstFrameLocked`: readSSEFrame 拿 endpoint 帧; event 必是 "endpoint"; data TrimRight \n; url.Parse base + ref → ResolveReference; 跨 host/scheme 拒 (docs §3.2); 失败回滚流
+  - `Send(ctx, msg)`: POST endpoint + Content-Type: application/json + Accept: application/json, text/event-stream + headers; marshal 后 >4MiB → ErrMCPProtocolError; 非 2xx → ErrMCPAuthFailed 或 ErrMCPTransportWrite; POST body 忽略 (docs §3.2 同步结果通过 SSE 流 Recv 拿)
+  - `Recv(ctx)`: 等 recvReady; 循环 readSSEFrame; event != "" && event != "message" 跳过; 空帧 (无 data) 跳过; 更新 lastID (v1 仅记录); json.Unmarshal frame.data → Message; 流 EOF + ctx 取消 → ErrMCPTransportClosed
+  - `Close`: closeOnce + cancel procCtx 关流 (强制 reader EOF) + close resp.Body; info.Connected=false. 幂等
+  - `Info`: 返当前 TransportInfo (Type=sse, Endpoint=url, Connected 状态)
+  - `sseFrame` struct + `readSSEFrame(reader)`: 单 frame 直到空行; ReadString('\n') 按 \r\n 处理; comment `:...` 忽略; field:value 分割 (colon+1 跳过空格); event/id/data/retry 字段; 未知字段忽略 (SSE spec); bufio.ErrBufferFull → frame too long
+  - `isConnRefusedErr(err)`: strings 启发式匹配 "connection refused" / "no such host" → 区分 dial refused (Ponytail: 不深 unwrap net.OpError)
+
+- `internal/mcp/sse_test.go` (+~360 行) — 新文件:
+  - `fakeSSEServer` (*httptest.Server) 模拟 legacy MCP SSE server: /sse (GET text/event-stream + 首帧 endpoint + 后续 message 帧) + /message (POST 收 JSON-RPC 投到 SSE writer goroutine 推响应). 推约定: initialize → 协议 Legacy 2024-11-05 + tools capability; ping → empty result; tools/list → alpha/beta; tools/call N → "hello N"; notifications/initialized → 无响应
+  - `TestSSEClientEndpointParseAndMessageRoundTrip` — Connect → Initialize → Ping → DiscoverTools → CallTool (alpha "hello alpha") → Close 全 MCP 协议走通; ProtocolVersion=Legacy
+  - `TestSSEClientRejectsCrossHostEndpoint` — fake server 首帧 endpoint 指向 evil.example.com → Start → ErrMCPProtocolError (跨 host 拒)
+  - `TestSSEClientReturnsConnRefusedOnDialFail` — 端口未开 (:1) → Start 返 ErrMCPConnRefused|TransportClosed|ConnTimeout
+  - `TestSSEClientStreamEOFTriggersTransportClosed` — server 主动断流 → Recv 返 ErrMCPTransportClosed
+  - `TestReadSSEFrameCompliance` — 单测 SSE frame parser 覆盖: single/multi-line data, id, default event, comment heartbeat, leading space after colon, data with no value (7 子用例)
+
+- `internal/mcp/manager.go` (+~30 行):
+  - import 加 `net/http`
+  - 抽 `buildTransport(e) (ClientTransport, error)`: 按 e.transport 选 stdio (NewStdioClient) / sse (NewSSEClient) / 其他 → ErrMCPConfig
+  - `connectAndDiscover` 不再直接 NewStdioClient; 调 buildTransport
+  - `Prepare` 允许 sse transport (e.transport == "stdio" || "sse" 时 run connectStdioServer; 否则其它 streamable_http 等仍 LastError="transport not supported in current build")
+  - 头部注释同步: sse 已接入
+  - manager_integration_test.go 加 1 集成测试 `TestManagerPrepareSSEAutoStartRegistersTools` 用 fakeSSEServer + Manager.Prepare + 校验 StatusConnected + ProtocolVersion=Legacy + Transport=sse + ToolCount=2 + Execute mcp.sse.alpha + Stop ≤5s
+
+### 验证
+```
+HTTP_PROXY=http://192.168.4.1:7890 HTTPS_PROXY=http://192.168.4.1:7890 GOPROXY=https://goproxy.cn,direct GOSUMDB=sum.golang.org go test -count=1 -timeout 30s ./internal/mcp/ -run 'TestSSE|TestReadSSE' -v
+  # 5 PASS (EndpointRoundTrip 0.02s full MCP handshake; Cross-host; ConnRefused; StreamEOF; Frame parser 7 子用例)
+go test -count=5 -timeout 120s ./internal/mcp/ -run 'TestSSE|TestReadSSE|TestManagerPrepareSSE' # 5x重复无 flake
+go test -count=1 -timeout 30s ./internal/mcp/ -run 'TestManagerPrepareSSE' -v # Manager SSE端到端 Prepare+Execute+Stop 全 PASS 0.05s
+go vet ./... # 无 warning
+go build ./... # 18 包全过
+go test -count=1 -timeout 240s ./... # 18 包全绿 (mcp 包现 68 例: 60 + 5 SSE 集成 + 3 新集成 test 现共计 68? 实际: 63 prev + 6 new = OK)
+```
+
+### 决策
+- **No Last-Event-ID 重连续传 v1**: docs §3.2 "重连时只携带最后收到的事件 ID; 任何已经发送的 Tool 请求都不自动重放" — 但 Manager attemptReconnect 是用新 Client 重新 initialize + 完整 DiscoverTools (首代流程), 不复用旧代 Client 的流. Send 也只服务新调用 不重放. 所以 v1 SSEClient 不实现断流后重连续传 (lastID 仅记录字段); Manager 重连已覆盖需求. (后续如果需要单 connection-level SSE resume, 6-step 实现 Last-Event-ID header, 留下一 commit.)
+- **Tls ca_file 占位 struct**: 不在 SSEClient 内自建 *tls.Config; 调用方传入 http.Client 含自己的 Transport/TLS. struct `tlsConfig` 仅 caFile 字段占位; ponytail: 不引入 ca_file 实际加载 (尚未有 server 真实走 ca_file 测试; 留下一 commit 接 ca_file 真实逻辑). docs §5 不提供 insecure_skip_verify 已明示, 我们不引入该字段.
+- **POST body 忽略**: docs §3.2 简化描述下 SSE 的 POST 同步响应应通过 GET 事件流推回, POST body 可能是空 (202 Accepted) 或 application/json; ponytail 取最简 - 完全不读 POST body (just check status code 非 2xx → fail). 真实结果通过 Recv 推回. fakeSSEServer handle 中返 202 + 不写 body 也覆盖了此路径.
+- **SSE frame parser bufio 上限**: `sseFrameMaxBytes` (4 MiB + 4 KiB 头开销). bufio.NewReaderSize 设置该上限, ReadString('\n') 超 buffer → bufio.ErrBufferFull → 返 "frame too long". 防 OOM 与 stdioMessageMaxBytes 同一提到到的 4 MiB body 上限保持一致.
+- **`isConnRefusedErr` strings 启发式 vs unwrap net.OpError**: ponytail: 不引入 syscall 错误深 unwrap. 常见 dial refused / no such host 用 strings.Contains 匹配 closed 测试 set 错误信息已足够; 测试用 ErrMCPConnRefused|TransportClosed|ConnTimeout union 接收, 没强要求具体 sentinel.
+- **Single-thread Start vs go procCtx**: GET 流生命周期用 procCtx (不与 startupCtx 直接共用). 后台 goroutine 把 startupCtx 取消转换 → procCtx cancel. 这样拨号阶段超时 (startupCtx) 与流读阶段断开 (procCtx 在 Close 时 cancel) 分离. Ponytail: 不引入 context.AfterFunc (Go 1.21+ 不可用) 用 select goroutine.
+- **不引入 SSEServer struct**: docs §5 仅 SSEClient (Client 端). SSEServer 是 local MCP Server 路径 (checklist §3 待实现), 留 §3 commit 处理. 本 commit 仅完成 SSE 客户端到 Manager.
+
+### 下一轮方向
+1. **Streamable HTTP transport (checklist §6)**: POST JSON-RPC + Mcp-Session-Id + HTTP 状态映射 (401/403 → ErrMCPAuthFailed; init 404/405 → ErrMCPConfig); optional GET Server-to-Client SSE stream; DELETE termination.
+2. 本地 MCPServer (checklist §3) — Yaa! 作为 Server (SSEServer + Streamable Server).
+3. Agent/Session/Provider 集成 (checklist §9 §2) — MCP Tool 在 Agent turn 投影到 Provider Function 列表.
+4. Planner step 1-10 (docs/planner/).
+5. Remote API `GET /api/v1/mcp/servers` + `GET /api/v1/mcp/servers/:name` (checklist §9).

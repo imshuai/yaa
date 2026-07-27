@@ -870,3 +870,69 @@ func TestManagerRunUpstreamListChangedDriftMarksError(t *testing.T) {
 		t.Errorf("post-drift Execute err=%v want ErrMCPUnavailable", err)
 	}
 }
+
+
+// TestManagerPrepareSSEAutoStartRegistersTools 端到端验证 Manager.Prepare 处理 SSE transport:
+// 用 httptest fake SSE server, Manager.Prepare 启动 SSE 上游 + DiscoverTools + 注册稳定 Proxy +
+// runUpstream goroutine + ServerStatus.ProtocolVersion = 2024-11-05 (legacy SSE).
+// ToolManager.Execute 应能调用 mcp.sse.alpha.
+func TestManagerPrepareSSEAutoStartRegistersTools(t *testing.T) {
+	f := newFakeSSEServer(t)
+	tm := buildToolManager(t)
+	cfg := &config.MCPConfig{
+		Servers: []config.MCPServerConfig{{
+			Name:      "sse",
+			Transport: "sse",
+			URL:       f.sseURL,
+			AutoStart: true,
+		}},
+		Timeout:   config.MCPTimeoutConfig{Connect: 5 * time.Second, Init: 5 * time.Second},
+		Reconnect: config.MCPReconnectConfig{Enabled: false, MaxAttempts: 0, InitialDelay: time.Second, MaxDelay: time.Second},
+	}
+	m, err := NewManager(cfg, tm, nil)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer func() {
+		_ = m.Stop(context.Background())
+		<-m.Done()
+	}()
+	if err := m.Prepare(); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	st, ok := m.Get("sse")
+	if !ok {
+		t.Fatalf("sse entry missing")
+	}
+	if st.Status != StatusConnected {
+		t.Fatalf("status=%q want Connected (LastError=%q)", st.Status, st.LastError)
+	}
+	if st.ToolCount != 2 {
+		t.Fatalf("ToolCount=%d want 2", st.ToolCount)
+	}
+	if st.ProtocolVersion == nil || *st.ProtocolVersion != LegacyProtocolVersion {
+		var pv string
+		if st.ProtocolVersion != nil {
+			pv = *st.ProtocolVersion
+		}
+		t.Errorf("ProtocolVersion=%q want %q (legacy SSE)", pv, LegacyProtocolVersion)
+	}
+	if st.Transport != "sse" {
+		t.Errorf("Transport=%q want sse", st.Transport)
+	}
+	scope := tool.ExecutionScope{AgentID: "a1"}
+	if _, err := tm.Execute(context.Background(), scope, "mcp.sse.alpha", map[string]any{}); err != nil {
+		t.Errorf("Execute mcp.sse.alpha: %v", err)
+	}
+	// Stop 也应干净 (<5s) 验证 SSE runUpstream goroutine 退出无死锁.
+	stopCh := make(chan error, 1)
+	go func() { stopCh <- m.Stop(context.Background()) }()
+	select {
+	case err := <-stopCh:
+		if err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return within 5s (SSE runUpstream join deadlock)")
+	}
+}
