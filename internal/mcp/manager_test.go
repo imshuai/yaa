@@ -289,3 +289,41 @@ func TestNewManagerRejectsNilCfg(t *testing.T) {
 		t.Errorf("NewManager(nil): got %v, want ErrMCPConfig", err)
 	}
 }
+
+// Manager.Detail 不存在 name → (zero, false)；存在名字 → (ServerStatus 副本 + 空 Tools 切片, true).
+// 未连接的 server Tools 内部返 (nil, false), Detail 转换为 [] 便于 JSON 序列化为 [] 而非 null.
+func TestManagerDetail(t *testing.T) {
+	cfg := &config.MCPConfig{
+		Servers: []config.MCPServerConfig{
+			{Name: "fs", Transport: "stdio", Command: "npx"},
+		},
+	}
+	m, err := NewManager(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	// 未命中 name → false.
+	d, ok := m.Detail("does-not-exist")
+	if ok {
+		t.Errorf("Detail(missing): ok=true want false; detail=%+v", d)
+	}
+
+	// 命中 fs (disconnected): ServerStatus 投影 + 空 Tools.
+	d, ok = m.Detail("fs")
+	if !ok {
+		t.Fatalf("Detail(fs): ok=false want true")
+	}
+	if d.Name != "fs" {
+		t.Errorf("Detail(fs).Name=%q want fs", d.Name)
+	}
+	if d.Status != StatusDisconnected {
+		t.Errorf("Detail(fs).Status=%q want %q", d.Status, StatusDisconnected)
+	}
+	if d.Tools == nil {
+		t.Errorf("Detail(fs).Tools=nil want [] (nil→[] for JSON [] not null)")
+	}
+	if len(d.Tools) != 0 {
+		t.Errorf("Detail(fs).Tools len=%d want 0", len(d.Tools))
+	}
+}

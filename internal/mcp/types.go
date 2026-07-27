@@ -12,6 +12,8 @@ import (
 	"encoding/json"
 	"errors"
 	"time"
+
+	"github.com/imshuai/yaa/internal/tool"
 )
 
 // ConnectionStatus 是单个上游 MCP 连接的状态机取值。
@@ -154,4 +156,12 @@ type TransportInfo struct {
 	Type      string // stdio / sse / streamable_http
 	Endpoint  string
 	Connected bool
+}
+
+// ServerDetail 是 Remote API GET /api/v1/mcp/servers/:name 的响应 DTO（docs/remote-api/mcp.md §2）。
+// 嵌入 ServerStatus 同字段 + Tools 字段附加当前已发现的 Tool 元数据。
+// 与 ServerStatus 一致不返回 command/args/URL/headers/env/Token 等敏感连接配置。
+type ServerDetail struct {
+	ServerStatus
+	Tools []tool.ToolInfo `json:"tools"`
 }

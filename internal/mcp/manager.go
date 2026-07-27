@@ -800,6 +800,25 @@ func (m *Manager) Tools(name string) ([]tool.ToolInfo, bool) {
 	return nil, false
 }
 
+// Detail 返回指定 server 的 ServerDetail（ServerStatus + Tools 拼装），供
+// Remote API GET /api/v1/mcp/servers/:name 直接响应（docs/remote-api/mcp.md §2）。
+// server 不存在 → (ServerDetail{}, false)；存在但未连接 / 无 Tools → 空切片 + true。
+// （Tools 已 nil→false 的内部约定转为 []tool.ToolInfo{} 便于 JSON 序列化为 [] 而非 null。）
+func (m *Manager) Detail(name string) (ServerDetail, bool) {
+	st, found := m.Get(name)
+	if !found {
+		return ServerDetail{}, false
+	}
+	d := ServerDetail{ServerStatus: cloneServerStatus(st)}
+	if tools, ok := m.Tools(name); ok {
+		d.Tools = tools
+	}
+	if d.Tools == nil {
+		d.Tools = []tool.ToolInfo{}
+	}
+	return d, true
+}
+
 // cloneServerStatus 深拷贝 ServerStatus（ConnectedAt 指针单独复制）。
 func cloneServerStatus(s ServerStatus) ServerStatus {
 	out := s

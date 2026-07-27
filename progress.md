@@ -1971,3 +1971,38 @@ go build ./... && go vet ./... && go test -count=1 -timeout 300s ./...   # 18 �
 - **DELETE 5s timeout 防卡 Close**: parent 用 context.Background() (Close 不应被 Send 的 ctx 取消所阻断); body drain 上限 `streamableRespBodyCap` (16KiB) 防 server 写大 body 卡 Close.
 - **404/405 DELETE 幂等**: docs §3.3 错误表最后一行明示 "DELETE 404/405 幂等忽略"; sendDelete 不分类非 2xx 都不返 err.
 - **handleEnhanced GET 200 path 推完 frame 后 `<-r.Context().Done()` 阻塞**: 前一轮担心 `runSSERecvLoop` 读完 frame 后阻塞在 readSSEFrame. 实测不阻塞因为: (1) 测试 tr.Recv 取出 notification 后立即 tr.Close() → sseCancel 取消 req ctx → runSSERecvLoop 的 ReadString 因 request context cancel 通过 http transport 解除阻塞返 err → graceful return; (2) Server handler 的 `<-r.Context().Done()` 同步解除. 闭环 0.01s.
+
+## progress #23 — Remote API /mcp/servers + /:name 完整 ServerDetail (含 Tools) 真实落地
+
+**Commit (将提交)**: 本 commit 把 :name 端点从平铺 ServerStatus 升级为 docs 规约的 ServerDetail DTO.
+
+**背景**: 上一轮发现 handler 已写 + routes 已注册 + 基础测试已过, 但 `handleGetMCPServer` 只返 `mcp.ServerStatus` 平铺, **未返 docs/remote-api/mcp.md §2 明示的 `ServerDetail` (嵌入 ServerStatus + `Tools []tool.ToolInfo`)**; `MCPServerProvider` 接口只暴露 `List/Get` 没有 `Tools/Detail`. 这是代码不完整 (不是文档错), 按 "审查已有代码是否和修复后文档冲突" 准则补完.
+
+**实现**:
+- `internal/mcp/types.go`: 新增 `type ServerDetail struct { ServerStatus; Tools []tool.ToolInfo \`json:"tools"\` }` 嵌入 ServerStatus; import 加 `tool` (mcp 已有 tool 依赖无 cycle 风险).
+- `internal/mcp/manager.go`: 新增 `Manager.Detail(name) (ServerDetail, bool)` 复合方法. 复用 `Get` + `Tools`: 命中 → ServerStatus 深拷贝 + Tools 深拷贝; 未连接/无 Tools 时 `nil→[]tool.ToolInfo{}` 转 nil 为空切片 (JSON 序列化 `[]` 而非 `null`, 符合 docs §2 JSON 示例).
+- `internal/api/server.go`: `MCPServerProvider` 接口加 `Detail(name) (mcp.ServerDetail, bool)`; 接口注释更新为 "List/Get/Detail 契约".
+- `internal/api/mcp_handler.go`: `handleGetMCPServer` 从 `Get` 切换到 `Detail` (`mm.Detail(name)` 一行拼装, 避免 handler 两次调用); `writeOK(..., d)` 直接返 ServerDetail.
+
+**测试**:
+- `internal/mcp/manager_test.go`: 加 `TestManagerDetail` (未命中 false; 命中 disconnected ServerStatus + 空 Tools 切片 != nil).
+- `internal/api/agent_handler_test.go`:
+  - `mockMCPServerProvider` 加 `detailsBy map[string]mcp.ServerDetail` 字段 + `Detail(name)` 实现 (命中 detailsBy 返回; fallback 走 items 返 ServerStatus + 空 Tools).
+  - 强化 `TestMCPEndpointsReturn200And404`: Get(fs) 子断言加 `tools` 字段存在 + 是空 `[]any` (非 nil/null).
+  - 新增 `TestMCPEndpointsDetailWithTools`: mock 注入 detail.tools 的 server; 验证完整 wire 投影: `name/status` (ServerStatus 平铺) + `tools[0].name="mcp.fs.read"` + `tools[0].source="mcp"` + `tools[0].enabled=true`.
+
+**验证**:
+```
+go build ./...   # 18 包全过
+go vet ./...     # 无 warning
+go test -count=1 -timeout 300s ./...   # 18 包全绿
+go test -count=1 -timeout 60s ./internal/mcp/ -run TestManagerDetail -v   # PASS
+go test -count=1 -timeout 60s ./internal/api/ -run TestMCPEndpoints -v   # 3 例 PASS
+```
+
+**决策记录**:
+- **ServerDetail 在 mcp 包不在 api 包**: docs §2 直接声明 `type ServerDetail struct { mcp.ServerStatus; Tools []tool.ToolInfo }` 暗示属 mcp package; mcp 已经 import tool (proxy.go/manager.go 均有) 无新增 cycle 风险; 让 Detail 逻辑在 Manager 一处拼装比 handler 多次调用更整洁.
+- **Manager.Detail 内部 nil→[] 转换**: `Tools(name)` 内部约定 disconnected server 返 (nil, false); Detail 把这个内部约定转为对外友好的 `[]tool.ToolInfo{}` 让 JSON 输出 `[]` 而非 `null`, 符合 docs §2 JSON 示例 "tools": [...].
+- **MCPServerProvider 接口加 Detail 而非 Tools**: handler 只需 ServerDetail 一次拼装的语义; 暴露 Tools(name) 会强迫接口多个语义方法; Detail 命名直接对齐 docs DTO 名.
+- **不暴露 POST/PUT/DELETE 一类 CRUD**: docs §3 明示 "没有 POST .../tools/:tool、PUT 或 DELETE"; handler 只 GET 只读 (现有 routes 注册也只是 GET); 测试不变也不动.
+- **mockMCPServerProvider 加 detailsBy 而非替换 items**: fallback 路径保证现有 "disconnected fs" List 投影 + Get 测试无需改动; 新加 TestMCPEndpointsDetailWithTools 用 detailsBy 注入完整 ServerDetail.

@@ -128,10 +128,12 @@ func (s *Server) SetSessionManager(sm *session.Manager) {
 
 // MCPServerProvider 由 Runtime 注入，提供 MCP server 只读状态投影给 Remote API。
 // 与 Provider/Tool 等具体 *Manager 注入不同：MCP 作为新模块通过接口隔离，
-// 便于 API 包 handler 测试 mock（详见 docs/mcp/README.md §2 List/Get 契约）。
+// 便于 API 包 handler 测试 mock（详见 docs/mcp/README.md §2 List/Get/Detail 契约）。
+// Detail 返回 ServerDetail（嵌入 ServerStatus + Tools []tool.ToolInfo）供 /:name 端点。
 type MCPServerProvider interface {
 	List() []mcp.ServerStatus
 	Get(name string) (mcp.ServerStatus, bool)
+	Detail(name string) (mcp.ServerDetail, bool)
 }
 
 // SetMemoryProvider 注入 Memory Manager + policy resolver（docs/remote-api/memory.md §1）。

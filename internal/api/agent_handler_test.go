@@ -93,6 +93,8 @@ func agentToolProviderTestEnv(t *testing.T) (*Server, *agent.Manager, *session.M
 // 返回固定 List/Get 投影，避免依赖 internal/mcp.Manager 的 lifecycle。
 type mockMCPServerProvider struct {
 	items []mcp.ServerStatus
+	// detailsBy 按 server name 挂 ServerDetail (含 Tools); Detail 命中时直接返, 不存在走 fallback.
+	detailsBy map[string]mcp.ServerDetail
 }
 
 func (m mockMCPServerProvider) List() []mcp.ServerStatus {
@@ -108,6 +110,19 @@ func (m mockMCPServerProvider) Get(name string) (mcp.ServerStatus, bool) {
 		}
 	}
 	return mcp.ServerStatus{}, false
+}
+
+func (m mockMCPServerProvider) Detail(name string) (mcp.ServerDetail, bool) {
+	if d, ok := m.detailsBy[name]; ok {
+		return d, true
+	}
+	// fallback: items 里命中 → 返 ServerStatus + 空 Tools (与 Manager 非连接状态一致); 不命中 → false.
+	for _, it := range m.items {
+		if it.Name == name {
+			return mcp.ServerDetail{ServerStatus: it, Tools: []tool.ToolInfo{}}, true
+		}
+	}
+	return mcp.ServerDetail{}, false
 }
 
 func doAgentReq(t *testing.T, s *Server, method, path string) (*httptest.ResponseRecorder, Envelope) {
@@ -296,19 +311,74 @@ func TestMCPEndpointsReturn200And404(t *testing.T) {
 		t.Errorf("item=%+v", item)
 	}
 
-	// Get 命中。
+	// Get 命中 → ServerDetail (ServerStatus 字段平铺 + tools 数组字段).
 	rr2, env2 := doAgentReq(t, s, http.MethodGet, "/api/v1/mcp/servers/fs")
 	if rr2.Code != http.StatusOK || env2.Code != 0 {
 		t.Fatalf("Get(fs) status=%d env=%+v", rr2.Code, env2)
 	}
-	if env2.Data.(map[string]any)["name"] != "fs" {
-		t.Errorf("Get(fs).name=%v", env2.Data)
+	d2 := env2.Data.(map[string]any)
+	if d2["name"] != "fs" {
+		t.Errorf("Get(fs).name=%v want fs", d2["name"])
+	}
+	// ServerDetail 嵌入 ServerStatus + 追加 tools; 未连接 server 经 Manager.Detail 转 [] (非 null).
+	toolsRaw, hasTools := d2["tools"]
+	if !hasTools {
+		t.Fatalf("Get(fs).tools missing; want field present ([] for disconnected)")
+	}
+	toolsArr, _ := toolsRaw.([]any)
+	if toolsArr == nil {
+		t.Errorf("Get(fs).tools=%v want [] (JSON [] not null)", toolsRaw)
+	}
+	if len(toolsArr) != 0 {
+		t.Errorf("Get(fs).tools len=%d want 0 (disconnected server has no registered tools)", len(toolsArr))
 	}
 
 	// Get 未命中返 40401。
 	rr3, env3 := doAgentReq(t, s, http.MethodGet, "/api/v1/mcp/servers/does-not-exist")
 	if rr3.Code != http.StatusNotFound || env3.Code != 40401 {
 		t.Errorf("Get(miss): status=%d code=%d, want 404/40401", rr3.Code, env3.Code)
+	}
+}
+
+// TestMCPEndpointsDetailWithTools 覆盖 :name 命中且 detail.tools 非空的真实 ServerDetail wire 投影.
+// docs/remote-api/mcp.md §2 明示 ServerDetail.tools 数组按 ToolInfo 序列化 (name/description/parameters/enabled/source).
+func TestMCPEndpointsDetailWithTools(t *testing.T) {
+	s, _, _ := agentToolProviderTestEnv(t)
+	// 用 mock 注入 detail.tools 的 server (而非用原有 disconnected "fs"), 验证完整 wire 投影.
+	parameters := json.RawMessage(`{"type":"object"}`)
+	s.SetMCPServerProvider(mockMCPServerProvider{
+		items: []mcp.ServerStatus{
+			{Name: "fs", Status: mcp.StatusConnected, Transport: "stdio", ToolCount: 1},
+		},
+		detailsBy: map[string]mcp.ServerDetail{
+			"fs": {
+				ServerStatus: mcp.ServerStatus{Name: "fs", Status: mcp.StatusConnected, Transport: "stdio", ToolCount: 1},
+				Tools: []tool.ToolInfo{
+					{Name: "mcp.fs.read", Description: "Read file", Parameters: parameters, Enabled: true, Source: "mcp"},
+				},
+			},
+		},
+	})
+
+	rr, env := doAgentReq(t, s, http.MethodGet, "/api/v1/mcp/servers/fs")
+	if rr.Code != http.StatusOK || env.Code != 0 {
+		t.Fatalf("Get(fs): status=%d env=%+v", rr.Code, env)
+	}
+	d := env.Data.(map[string]any)
+	if d["name"] != "fs" || d["status"] != string(mcp.StatusConnected) {
+		t.Errorf("Detail(fs) base fields: %+v", d)
+	}
+	toolsRaw, _ := d["tools"]
+	tools, _ := toolsRaw.([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools len=%d want 1", len(tools))
+	}
+	first := tools[0].(map[string]any)
+	if first["name"] != "mcp.fs.read" {
+		t.Errorf("tools[0].name=%v want mcp.fs.read", first["name"])
+	}
+	if first["source"] != "mcp" || first["enabled"] != true {
+		t.Errorf("tools[0] source/enabled mismatch: %+v", first)
 	}
 }
 

@@ -54,10 +54,12 @@ func (s *Server) handleGetMCPServer(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, 40001, "mcp server name required")
 		return
 	}
-	st, found := mm.Get(name)
+	// docs/remote-api/mcp.md §2: /:name 返 ServerDetail (嵌入 ServerStatus 字段 + Tools).
+	// Manager.Detail 一次拼装 ServerStatus 深拷贝 + Tools 深拷贝, 避免 handler 两次调用.
+	d, found := mm.Detail(name)
 	if !found {
 		s.writeError(w, r, http.StatusNotFound, 40401, "mcp server not found")
 		return
 	}
-	writeOK(w, RequestIDFromContext(r.Context()), http.StatusOK, st)
+	writeOK(w, RequestIDFromContext(r.Context()), http.StatusOK, d)
 }
