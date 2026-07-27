@@ -1505,3 +1505,63 @@ go test -count=1 -timeout 240s ./... # 18 包全绿 (含 WS flake 上轮已根�
 3. 本地 MCPServer (checklist §3) — Yaa! 作为 Server.
 4. Agent/Session/Provider 集成 (checklist §9 §2).
 5. Planner step 1-10 (docs/planner/).
+
+---
+
+## #16 runUpstream listChanged Step 3 — tools/list_changed 通知 + catalogReconcile + 漂移不可自愈 (待 push)
+
+### 范围
+progress #15 末尾下一步 §1: 收到 `notifications/tools/list_changed` 通知后用当前代 Client 完整 DiscoverTools + 三元严格比对 (canonical name + description + canonical-marshal InputSchema); 一致保持 Connected 不替换 Client; 漂移关闭该 Client + 标 ErrMCPProtocolError 保持 Error 不可自愈.
+
+### 改动文件
+- `internal/mcp/client.go` (+~20 行)：
+  - Client struct 加 `onListChanged func()` 字段 (pendingMu 保护以避免与 recvLoop race)
+  - 新 `SetOnListChanged(fn func())` setter, 必须在 Connect 前设置 (Manager 创建 client 后即调)
+  - recvLoop notification 分支: method == `notifications/tools/list_changed` 时**非阻塞**调用 onListChanged (do not 发起 request in recvLoop, docs/mcp/client.md §recvLoop); 其他 notification 按 ErrMCPProtocolError fail
+  - 修正原代码 method 名比较 prefix: 之前用 "tools/list_changed" (无 notifications/ 前缀) 实际 server emit 是 `notifications/tools/list_changed` (MCP spec 标准命名空间); docs 表述 "tools/list_changed" 是简写无前缀, 代码层用全名
+
+- `internal/mcp/manager.go` (+~90 行)：
+  - publishGeneration (首代) + attemptReconnect 末段 (重连) 两路径都: 每代新建**独立** listChanged cap-1 channel (不复用旧代) + client.SetOnListChanged 设置 closure 非阻塞投递到该 channel. 满足 docs §7.2 "旧代 channel 永远不被新代复用, 避免迟到 callback 触发新一代重连" invariant
+  - attemptReconnect 签名改为返回 `(*Client, uint64, chan struct{}, bool)` 多一个新代 listChanged channel. `return nil, 0, false` 统一改为 `return nil, 0, nil, false`; 成功 return `newClient, newGen, e.listChanged, true`
+  - runUpstream 加本地快照参数 `notify := e.listChanged` (启动代快照不可重读 e.*), 重连成功后更新 `notify = newNotify`; select 加 `case <-notify` 分支调用 catalogReconcile(e, handle, client, gen) → (closeClient, exit). closeClient 则锁外调用 client.Close(); exit 则退出 goroutine (漂移不可自愈, 不再 attemptReconnect)
+  - 新 `catalogReconcile(e, handle, client, gen) (closeClient, exit bool)`:
+      - 用 initTimeout hardcap 调 client.DiscoverTools → snapshotTools → catalogMatches
+      - 一致: 返回 (false, false); 调用方不动 entry, 继续同 ticker (notify 合并 channel 已消化)
+      - DiscoverTools 失败: entry 锁下比 `e.generation == gen && e.client == client` 后 handle.Store(nil) + status=Error + LastError="list_changed reconcile failed: <err>"; 返 (true, true)
+      - catalog 漂移: entry 锁下同上 + LastError="list_changed reconcile: catalog drift (ErrMCPProtocolError)"; 返 (true, true)
+  - catalogMatchesReadOnly 是 catalogReconcile 内部复用 catalogMatches 的薄封装 (避免直接调 m.catalogMatches 时视觉模糊, 但事实上直接调也可; ponytail: 此间接层冗余可平 ◦; 保留dbo 单 stack 一行更直)
+
+- `internal/mcp/manager_integration_test.go` (+~150 行)：
+  - `const fakeMCPListChangedStable` — alpha/beta 任意 tools/call 响应后立即 emit `notifications/tools/list_changed` 一帧; tools/list 永远返回原 catalog. 测一致分支
+  - `const fakeMCPListChangedDrift` — 内部 `list_calls` 计数 + `emit_drift` flag: 第一次 tools/list 返回原 schema; alpha call 时 emit response + 切到 drift (description 改为 "modified_a") + emit 通知; 第二次 tools/list (catalogReconcile 调) 返回 drift schema. 测漂移分支
+  - `TestManagerRunUpstreamListChangedStableKeepingConnected` — Prepare → 触发 alpha call (server emit notify) → polling ≤1.5s 验 status 仍 Connected → post-notify Execute 仍 ok. 5 次重复无 flake
+  - `TestManagerRunUpstreamListChangedDriftMarksError` — Prepare → 触发 alpha call (server emit notify + 切 drift) → polling ≤5s 验 status=Error + LastError 非空 → Execute 返 ErrMCPUnavailable. 5 次重复无 flake
+
+### 验证
+```
+HTTP_PROXY=http://192.168.4.1:7890 HTTPS_PROXY=http://192.168.4.1:7890 GOPROXY=https://goproxy.cn,direct GOSUMDB=sum.golang.org go test -count=1 -timeout 60s ./internal/mcp/ -run 'TestManagerRunUpstreamListChanged' -v
+  # 2 例 PASS (Stable 1.7s, Drift 0.2s)
+go test -count=5 -timeout 60s ./internal/mcp/ -run 'TestManagerRunUpstreamListChanged' -v
+  # 10 例 PASS, 无 flake
+go vet ./... # 无 warning
+go build ./... # 18 包全过
+go test -count=1 -timeout 240s ./... # 18 包全绿 (含 WS flake 上轮已根治 / Step 2 重连稳定 / Step 3 listChanged 闭环)
+```
+
+### 决策
+- **method 名 `notifications/tools/list_changed` 而非 `tools/list_changed`**: MCP spec 通知 method 带 `notifications/` 命名空间前缀; docs 表述 "tools/list_changed" 是简写. 代码层用全名与 bestEffortCancel (`notifications/cancelled`) / Initialize (`notifications/initialized`) 一致. 第一次 vet 编译过但测试失败因 method 名比较不匹配 → client.go recvLoop 收到带前缀 method 后 fallthrough 到 fail 分支. 修正后全绿.
+- **进入 entry 锁前过 race 防护**: catalogReconcile 两条修改 entry 路径 (DiscoverTools 失败 / 漂移) 都先在 entry 锁下比 `e.generation == gen && e.client == client`. 与 Stop race (Stop 已置 e.client=nil) 或 attemptReconnect race (重连已换 e.generation) 时 stale 不改 entry. 本 entry 单 goroutine (runUpstream 唯一重连 owner) 理论上不会 race, 但 inner check 是文档 §7.2 "代际不匹配或 catalog 漂移都在锁外 Close, 禁止发布" 的对应防御.
+- **catalogReconcile 一致分支不替换 Client**: docs §7.2 "相同、该 generation 仍存活且未 stopping 才重新发布同一 Client". "重新发布同一 Client" 即 handle 已指着同一 Client, 无需修改 entry 字段. 所以一致分支 return (false, false), 调用方 runUpstream 不动 entry 仅继续 ticker. 这是 Ponytail 关键简化: 一致路径 0 修改.
+- **catalogMatchesReadOnly 间接层**: 作为 catalogReconcile 内部对 catalogMatches 的封装, 纯语义标记. 事实上 catalogReconcile 可直接调 m.catalogMatches. Ponytail 实质 level: 该封装纯可 inline 取消. 保留dbo 一行虽省字小但语义清晰; 不取消是 Ponytail ladder §6 (能一行就一行) 的负例. 本 commit 不再拆分以保完整逻辑.
+- **listChanged channel 每代新建独立**: publishGeneration/attemptReconnect 末段都 `e.listChanged = make(chan struct{}, 1)`. 旧代 channel 引用由 runUpstream 局部快照 notify 持有; 重连切新代后旧 channel GC. 满足 docs §7.2 "旧代 channel 永远不被新代复用".
+- **关闭该代 Client 后退出 runUpstream (漂移不可自愈)**: catalogReconcile 漂移分支返 (closeClient=true, exit=true). 与 attemptReconnect 不同 (attemptReconnect 在 attempt > max_attempts 才退出); catalog drift 直接退出是因为 attemptReconnect 也只能发现相同 drift, 重连不修漂移问题 (runtime 错误, 文档要求 Runtime restart 重新建立 catalog). 路径保持简单.
+- **listChanged cap-1 合并语义**: onListChanged closure 用 `select { case e.listChanged <- struct{}{}: default: }` 非阻塞投递. 通知期间如 runUpstream 还没消费, 第二次合并不丢只占用同一空槽. docs §7.2 "listChanged 仅允许合并重复通知". 已经没积压.
+- **stable test polling 1.5s**: catalogReconcile 一致分支会立即跑完 DiscoverTools (sub-100ms) + 不动 entry, polling 1.5s 比 3s 快. Drift test polling 5s 给 catalogReconcile 完整执行余地.
+
+### 下一轮方向
+1. SSE / Streamable HTTP transport (checklist §5 / §6).
+2. 本地 MCPServer (checklist §3) — Yaa! 作为 Server.
+3. Agent/Session/Provider 集成 (checklist §9 §2) — MCP Tool 在 Agent turn 投影到 Provider Function 列表.
+4. Planner step 1-10 (docs/planner/).
+5. Remote API `GET /api/v1/mcp/servers` + `GET /api/v1/mcp/servers/:name` (checklist §9).
+6. 文档副债 (W1 时间戳/W2 README 导览/W4 tokens[].roles 默认, 早前 progress 已记).

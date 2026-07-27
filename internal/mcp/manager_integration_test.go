@@ -629,3 +629,244 @@ func mustNewManager(t *testing.T) *Manager {
 	}
 	return m
 }
+
+// fakeMCPListChangedStable: tools/call 收到 name=="_notify_" 时先回 response, 再 emit
+// notifications/tools/list_changed 一帧. tools/list 永远返回原 schema 不变 (catalog 一致).
+// 用于 TestManagerRunUpstreamListChangedStableKeepingConnected: 验证 listChanged 通知触发
+// catalogReconcile 后 catalog 不漂移 → status 保持 Connected.
+const fakeMCPListChangedStable = `
+import sys, json
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+SERVER_CAPS = {"tools": {}}
+SVR_INFO = {"name": "fake-mcp-listchanged-stable", "version": "0.0.1"}
+
+tools = [
+  {"name": "alpha", "description": "a", "inputSchema": {"type":"object"}},
+  {"name": "beta", "description": "b", "inputSchema": {"type":"object"}},
+]
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except Exception:
+        emit({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+        continue
+    mid = msg.get("id")
+    method = msg.get("method")
+    params = msg.get("params", {})
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": SERVER_CAPS,
+            "serverInfo": SVR_INFO,
+        }})
+        continue
+    if method == "notifications/initialized":
+        continue
+    if method == "ping":
+        emit({"jsonrpc": "2.0", "id": mid, "result": {}})
+        continue
+    if method == "tools/list":
+        emit({"jsonrpc": "2.0", "id": mid, "result": {"tools": tools}})
+        continue
+    if method == "tools/call":
+        name = params.get("name", "")
+        # 任意 tools/call 都先回 response 再 emit notifications/tools/list_changed 一帧.
+        # 模拟上游主动通知: catalog 仍不变 (用同一组 tools), catalogReconcile catalogMatches 一致.
+        emit({"jsonrpc": "2.0", "id": mid, "result": {
+            "content": [{"type":"text","text":"hello " + name}],
+            "isError": False,
+        }})
+        emit({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+        continue
+    emit({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "method not found"}})
+`
+
+// TestManagerRunUpstreamListChangedStableKeepingConnected 触发 tools/list_changed 通知, 但 server
+// tools/list 永远返回原目录 → catalogReconcile catalogMatches 一致 → 状态保持 Connected, Tool 仍可调.
+// 验证 Step 3 "catalog 一致不替换 Client" 路径 (docs §7.2 listChanged 一致分支).
+func TestManagerRunUpstreamListChangedStableKeepingConnected(t *testing.T) {
+	requirePython3(t)
+	tm := buildToolManager(t)
+	cfg := &config.MCPConfig{
+		Servers: []config.MCPServerConfig{{
+			Name:      "lc",
+			Transport: "stdio",
+			Command:   requirePython3(t),
+			Args:      []string{"-c", fakeMCPListChangedStable},
+			AutoStart: true,
+		}},
+		Timeout:   config.MCPTimeoutConfig{Connect: 5 * time.Second, Init: 5 * time.Second},
+		Reconnect: config.MCPReconnectConfig{Enabled: false, MaxAttempts: 0, InitialDelay: time.Second, MaxDelay: time.Second},
+	}
+	m2, err := NewManager(cfg, tm, nil)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer func() {
+		_ = m2.Stop(context.Background())
+		<-m2.Done()
+	}()
+	if err := m2.Prepare(); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if st, _ := m2.Get("lc"); st.Status != StatusConnected || st.ToolCount != 2 {
+		t.Fatalf("prereq: status=%q tools=%d err=%q", st.Status, st.ToolCount, st.LastError)
+	}
+	scope := tool.ExecutionScope{AgentID: "a1"}
+	// 任意 tools/call 触发 server emit response + list_changed notification; 立即触发 catalogReconcile.
+	if _, err := tm.Execute(context.Background(), scope, "mcp.lc.alpha", map[string]any{}); err != nil {
+		t.Fatalf("pre-notify Execute mcp.lc.alpha: %v", err)
+	}
+	// polling ≤1.5s 验证 status 仍 Connected (catalogReconcile 一致分支 不替换 client, 不改状态).
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	var final ServerStatus
+	for time.Now().Before(deadline) {
+		final, _ = m2.Get("lc")
+		if final.Status != StatusConnected {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if final.Status != StatusConnected {
+		t.Fatalf("status=%q want Connected (catalogReconcile 一致分支; LastError=%q)", final.Status, final.LastError)
+	}
+	// Execute 仍能跑 (handle 仍是该代 client).
+	if _, err := tm.Execute(context.Background(), scope, "mcp.lc.alpha", map[string]any{}); err != nil {
+		t.Errorf("post-notify Execute mcp.lc.alpha err=%v want nil", err)
+	}
+}
+
+const fakeMCPListChangedDrift = `
+import sys, json
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+SERVER_CAPS = {"tools": {}}
+SVR_INFO = {"name": "fake-mcp-listchanged-drift", "version": "0.0.1"}
+
+tools_orig = [
+  {"name": "alpha", "description": "a", "inputSchema": {"type":"object"}},
+  {"name": "beta", "description": "b", "inputSchema": {"type":"object"}},
+]
+tools_drifted = [
+  {"name": "alpha", "description": "modified_a", "inputSchema": {"type":"object"}},
+  {"name": "beta", "description": "b", "inputSchema": {"type":"object"}},
+]
+list_calls = 0
+emit_drift = False
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except Exception:
+        emit({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+        continue
+    mid = msg.get("id")
+    method = msg.get("method")
+    params = msg.get("params", {})
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": SERVER_CAPS,
+            "serverInfo": SVR_INFO,
+        }})
+        continue
+    if method == "notifications/initialized":
+        continue
+    if method == "ping":
+        emit({"jsonrpc": "2.0", "id": mid, "result": {}})
+        continue
+    if method == "tools/list":
+        list_calls += 1
+        tools = tools_drifted if emit_drift else tools_orig
+        emit({"jsonrpc": "2.0", "id": mid, "result": {"tools": tools}})
+        continue
+    if method == "tools/call":
+        name = params.get("name", "")
+        if name == "alpha" and emit_drift == False:
+            # 响应 call 后 emit list_changed notification; 同时切到 drift 集合 (下次 tools/list 走漂移).
+            emit({"jsonrpc": "2.0", "id": mid, "result": {
+                "content": [{"type":"text","text":"hello alpha"}],
+                "isError": False,
+            }})
+            emit_drift = True
+            emit({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+            continue
+        emit({"jsonrpc": "2.0", "id": mid, "result": {
+            "content": [{"type":"text","text":"hello " + name}],
+            "isError": False,
+        }})
+        continue
+    emit({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "method not found"}})
+`
+
+// TestManagerRunUpstreamListChangedDriftMarksError 触发 tools/list_changed 后 server 第二次 list 返回
+// 漂移 schema (description 不同). catalogReconcile 检测漂移 → 关 client + 状态 Error + LastError 含
+// catalog drift + Execute 返 ErrMCPUnavailable. 验证 Step 3 "drift 不可自愈" 路径.
+func TestManagerRunUpstreamListChangedDriftMarksError(t *testing.T) {
+	requirePython3(t)
+	tm := buildToolManager(t)
+	cfg := &config.MCPConfig{
+		Servers: []config.MCPServerConfig{{
+			Name:      "lc",
+			Transport: "stdio",
+			Command:   requirePython3(t),
+			Args:      []string{"-c", fakeMCPListChangedDrift},
+			AutoStart: true,
+		}},
+		Timeout:   config.MCPTimeoutConfig{Connect: 5 * time.Second, Init: 5 * time.Second},
+		Reconnect: config.MCPReconnectConfig{Enabled: false, MaxAttempts: 0, InitialDelay: time.Second, MaxDelay: time.Second},
+	}
+	m, err := NewManager(cfg, tm, nil)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer func() {
+		_ = m.Stop(context.Background())
+		<-m.Done()
+	}()
+	if err := m.Prepare(); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if st, _ := m.Get("lc"); st.Status != StatusConnected || st.ToolCount != 2 {
+		t.Fatalf("prereq: status=%q tools=%d err=%q", st.Status, st.ToolCount, st.LastError)
+	}
+	scope := tool.ExecutionScope{AgentID: "a1"}
+	// 触发 server alpha call → server emit response + 通知 + 切 drift 集合.
+	if _, err := tm.Execute(context.Background(), scope, "mcp.lc.alpha", map[string]any{}); err != nil {
+		t.Fatalf("first Execute mcp.lc.alpha: %v", err)
+	}
+	// polling ≤5s 等 status 转 Error (catalogReconcile 标记 drift).
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if s, _ := m.Get("lc"); s.Status == StatusError {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	st, _ := m.Get("lc")
+	if st.Status != StatusError {
+		t.Fatalf("status=%q want Error (LastError=%q)", st.Status, st.LastError)
+	}
+	if st.LastError == "" {
+		t.Errorf("LastError empty; expected catalog drift reason")
+	}
+	// 后续 Execute 应返 ErrMCPUnavailable (handle.Store(nil)).
+	_, err = tm.Execute(context.Background(), scope, "mcp.lc.alpha", map[string]any{})
+	if !errors.Is(err, ErrMCPUnavailable) {
+		t.Errorf("post-drift Execute err=%v want ErrMCPUnavailable", err)
+	}
+}

@@ -59,6 +59,10 @@ type Client struct {
 	// 在 mu 下读写：Initialize 成功后只读。Manager 投影到 ServerStatus.ProtocolVersion。
 	protocolVersion string
 	cancel          context.CancelFunc
+	// onListChanged 由 Manager 设置; recvLoop 检测到 tools/list_changed notification 时
+	// 非阻塞调用本回调. 回调必须快速 (投递 cap-1 channel), 不得在 recvLoop 中发起 request
+	// (docs/mcp/client.md §recvLoop, docs/mcp/config-ref.md §7.2). nil 时 notification 被容忍丢弃.
+	onListChanged  func()
 
 	closeOnce sync.Once
 	failOnce  sync.Once
@@ -89,6 +93,15 @@ func NewClient(name string, runCtx context.Context, transport ClientTransport) *
 		pending:   make(map[uint64]*pendingCall),
 		recvDone:  make(chan struct{}),
 	}
+}
+
+// SetOnListChanged 设置 tools/list_changed notification 投递回调, 必须在 Connect 前调用.
+// fn 由 Manager 注册, 必须自身非阻塞并线程安全; recvLoop 在 notification 路径上直接调用本回调.
+// docs/mcp/client.md §recvLoop: 回调不得在 recvLoop 中发起 request, 仅可向容量为 1 的合并 channel 非阻塞投递.
+func (c *Client) SetOnListChanged(fn func()) {
+	c.pendingMu.Lock()
+	c.onListChanged = fn
+	c.pendingMu.Unlock()
 }
 
 // Status 返回当前状态快照（mu 保护）。
@@ -407,11 +420,16 @@ func (c *Client) runRecvLoop(ctx context.Context) {
 				return
 			}
 		case kindNotification:
-			// v1：notification 不分发回 Manager（onListChanged 待后续 commit 接）。
-			// 仅容忍 tools/list_changed；其他通知按协议错误 fail。
-			if msg.Method != "tools/list_changed" {
+			// 仅容忍 notifications/tools/list_changed; 其他通知按协议错误 fail.
+			// 收到 notifications/tools/list_changed 时非阻塞调用 onListChanged (docs/mcp/client.md §recvLoop):
+			//   - 回调已设: 由 Manager 投递到该代独有的 cap-1 合并 channel (旧代不复用, 避免迟到 callback).
+			//   - 回调未设 (nil): 客忍无声 (manager 未接入 listChanged 路径的 client).
+			if msg.Method != "notifications/tools/list_changed" {
 				c.fail(fmt.Errorf("%w: unsupported notification %s", ErrMCPProtocolError, msg.Method))
 				return
+			}
+			if c.onListChanged != nil {
+				c.onListChanged()
 			}
 		}
 	}

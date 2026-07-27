@@ -16,7 +16,7 @@
 - [x] `Stop()` / `Done()` — 同步幂等 cancelRun；关闭每条已建立的 *Client（Close 幂等）+ 置 handle nil；upstreamWG.Wait 等 runUpstream goroutine 退出；close(done) + ready=false；二次 Stop 返 cache error
 - [x] `runUpstream` heartbeat ticker — stdio auto_start 成功后启动每 entry 唯一 goroutine（30s ticker + 10s Ping timeout）；client.Done() 或 Ping 失败时按 generation compare-and-clear 将 handle.Store(nil)+status=Error+关闭 client；Stop 经 upstreamWG.Wait 同步退出全部 goroutine
 - [x] `runUpstream` 重连 (Step 2 已落地) — Ping/Done() 失败后按 mcp.reconnect 指数退避 (initial * 2^(attempt-1) cap max) 由同一 goroutine 重连创建新 Client (重新 Connect+Initialize+完整 DiscoverTools)；Tool 三元 (canonical name + description + canonical-marshal InputSchema) 精确一致才原子替换 handle (handle.Store + entry 锁下递增 generation)；差异保持 unavailable + LastError 记 catalog drift; max_attempts 耗尽后保持 Error 要求 Runtime 重启
-- [ ] `runUpstream` listChanged 事件路径 (Step 3 待实现) — tools/list_changed notification 投递到该代 listChanged cap-1 channel → runUpstream select 命中 → 用当前代 Client 完整 DiscoverTools + 三元严格比对; 不一致保持 unavailable + ErrMCPProtocolError 要求重启
+- [x] `runUpstream` listChanged 事件路径 (Step 3 已落地) — `notifications/tools/list_changed` notification 由 Client.onListChanged 非阻塞投递到该代独有 listChanged cap-1 channel (旧代不复用); runUpstream select 命中 → catalogReconcile 用当前代 Client 完整 DiscoverTools + 三元严格比对; 一致保持 Connected/不替换 client; 不一致关闭该 Client + handle.Store(nil) + 标 ErrMCPProtocolError 保持 error (不可自愈, 要求 Runtime 重启)
 
 ## 2. MCP Client
 
@@ -34,7 +34,7 @@
 
 ### §2 Client 11 项全部实现 + 副债
 
-v1 副债：onListChanged callback（tools/list_changed 目前容忍无声 callback）；listTools 严格 DTO 的 DisallowUnknownFields（当前 request Unmarshal 包含 EOF 检查）。
+v1 副债：listTools 严格 DTO 的 DisallowUnknownFields（当前 request Unmarshal 包含 EOF 检查）。onListChanged 已在 Step 3 接入并向该代独有 listChanged channel 非阻塞投递.
 
 ## 3. MCP Server（Yaa! 作为 Server）
 

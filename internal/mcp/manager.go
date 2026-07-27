@@ -256,14 +256,15 @@ func (m *Manager) publishGeneration(e *serverEntry, handle *ProxyHandle, client 
 	e.handle = handle
 	e.client = client
 	e.generation = newGen
-	if e.listChanged == nil {
-		e.listChanged = make(chan struct{}, 1)
-	} else {
+	// 每代独有 listChanged cap-1 channel (不复用旧代); docs §7.2: 旧代 channel 永远不被新代复用,
+	// 避免迟到 callback 触发新一代重连/DiscoverTools. 设置 onListChanged 回调向该 channel 非阻塞投递.
+	e.listChanged = make(chan struct{}, 1)
+	client.SetOnListChanged(func() {
 		select {
-		case <-e.listChanged:
+		case e.listChanged <- struct{}{}:
 		default:
 		}
-	}
+	})
 	now := time.Now()
 	e.status.Status = StatusConnected
 	e.status.ConnectedAt = &now
@@ -321,9 +322,14 @@ func (m *Manager) Activate() error {
 // 每次 select 命中失败分支 (client.Done() / Ping 失败) 先 markGenerationFailed compare-and-clear,
 // 再驱动 attemptReconnect 按 mcp.reconnect 指数退避创建新 Client；目录三元严格比对一致才原子替换 handle.
 // 一个 entry 只允许该一个 goroutine 重连；max_attempts 耗尽后停止重连保持 Error/Unavailable.
-// 重连成功后该 goroutine 仍继续 tick 用新 client (ticker.Reset) 不开新 goroutine.
+// 重连成功后该 goroutine 仍继续 tick 用新 client (ticker.Reset) + 新代 notify channel (listChanged
+// 每代独有, docs §7.2 不复用), 不开新 goroutine.
+//
+// 入参: handle 是该 server 所有 Proxy 共享的不变 atomic handle. client/gen/notify 是启动时刻那一代
+// 的快照; runUpstream 在重连成功后切到新代快照 (client/gen/notify 局部变量替换), 不重读 e.*.
 func (m *Manager) runUpstream(e *serverEntry, handle *ProxyHandle, client *Client, gen uint64) {
 	defer m.upstreamWG.Done()
+	notify := e.listChanged // 启动代快照; 不可使用 e.listChanged (会被新代 channel 替换).
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 	for {
@@ -332,12 +338,13 @@ func (m *Manager) runUpstream(e *serverEntry, handle *ProxyHandle, client *Clien
 			return
 		case <-client.Done():
 			m.markGenerationFailed(e, handle, client, gen, "client done", client.Err())
-			newClient, newGen, keepGoing := m.attemptReconnect(e, handle, gen)
+			newClient, newGen, newNotify, keepGoing := m.attemptReconnect(e, handle, gen)
 			if !keepGoing {
 				return
 			}
 			client = newClient
 			gen = newGen
+			notify = newNotify
 			ticker.Reset(heartbeatInterval)
 		case <-ticker.C:
 			pingCtx, cancel := context.WithTimeout(m.runCtx, heartbeatTimeout)
@@ -350,15 +357,88 @@ func (m *Manager) runUpstream(e *serverEntry, handle *ProxyHandle, client *Clien
 				return
 			}
 			m.markGenerationFailed(e, handle, client, gen, "heartbeat failed", err)
-			newClient, newGen, keepGoing := m.attemptReconnect(e, handle, gen)
+			newClient, newGen, newNotify, keepGoing := m.attemptReconnect(e, handle, gen)
 			if !keepGoing {
 				return
 			}
 			client = newClient
 			gen = newGen
+			notify = newNotify
 			ticker.Reset(heartbeatInterval)
+		case <-notify:
+			// docs §7.2: tools/list_changed 通知合并后, runUpstream 用当前 Client 完整 DiscoverTools,
+			// 与冻结快照三元严格比较; 一致保持 Connected, 差异 (catalog drift) 关闭该代 Client + 标
+			// ErrMCPProtocolError 保持 Error; 不可自愈要求 Runtime 重启 (重连路径也不可恢复).
+			closeClient, exit := m.catalogReconcile(e, handle, client, gen)
+			if closeClient {
+				_ = client.Close()
+			}
+			if exit {
+				return
+			}
+			// catalog 一致: handle/状态不变 (Client 不替换), 继续 ticker. 消除重复 notify (非阻塞投递已保证).
+			// 刷新一个非空 notify 帧确保后续仍可感知: noop. listChanged 是合并 channel 不会有积压.
 		}
 	}
+}
+
+// catalogReconcile 处理 tools/list_changed 合并事件 (docs §7.2 listChanged 通知分支):
+//   - 用当前代 client 完整 DiscoverTools (timeout 取 cfg initTimeout hardcap);
+//   - 与 e.tools 冻结快照三元严格比对;
+//   - 一致 → 该代 Client 不替换, handle 保持不变, 状态保持 Connected. 返回 (closeClient=false, exit=false);
+//   - 不一致 (catalog 漂移) → 关闭该代 Client + handle.Store(nil) + 状态 Error + LastError 记 catalog drift.
+//     返回 (closeClient=true, exit=true), 调用方 close client 后退出 runUpstream goroutine (不可自愈).
+//
+// 失败检查 generation 未被替换后才修改 entry; 若与 Stop/重连 race (gen != e.generation 或 client != e.client)
+// 视为 stale 不动 entry, 只对本地 client 路径降级处理 (不关本地 client, 调用方 close 由其他路径 owner 负责).
+// Ponytail: 单文件 helper 不易单测 catalogReconcile, 但现有 catalogMatches 单测覆盖核心比对逻辑;
+// 真实 listChanged 触发路径由 integration test 覆盖.
+func (m *Manager) catalogReconcile(e *serverEntry, handle *ProxyHandle, client *Client, gen uint64) (closeClient bool, exit bool) {
+	// 用 initTimeout hardcap DiscoverTools.
+	initTimeout := m.cfg.Timeout.Init
+	if initTimeout <= 0 {
+		initTimeout = 15 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(m.runCtx, initTimeout)
+	defer cancel()
+	discovered, err := client.DiscoverTools(ctx)
+	if err != nil {
+		// 即使 DiscoverTools 失败也走 catalog drift 不可自愈路径 (本代 Client 不可信).
+		m.mu.Lock()
+		if e.generation == gen && e.client == client {
+			handle.Store(nil)
+			e.client = nil
+			e.status.Status = StatusError
+			e.status.LastError = fmt.Sprintf("list_changed reconcile failed: %v", err)
+			closeClient = true
+			exit = true
+		}
+		m.mu.Unlock()
+		return closeClient, exit
+	}
+	snapshot, _ := snapshotTools(discovered)
+	if m.catalogMatchesReadOnly(e, snapshot) {
+		// catalog 一致: 该代 Client 不替换, 状态保持.
+		return false, false
+	}
+	// catalog 漂移: 标 Error + 关闭该代 Client, 不可自愈.
+	m.mu.Lock()
+	if e.generation == gen && e.client == client {
+		handle.Store(nil)
+		e.client = nil
+		e.status.Status = StatusError
+		e.status.LastError = "list_changed reconcile: catalog drift (ErrMCPProtocolError)"
+		closeClient = true
+		exit = true
+	}
+	m.mu.Unlock()
+	return closeClient, exit
+}
+
+// catalogMatchesReadOnly 是 catalogMatches 的无需 RLock 等价的内部调用 (catalogMatches 自己已加 RLock).
+// 为避免 catalogReconcile 与 catalogMatches 之间循环自定义点名, 直接复用 catalogMatches.
+func (m *Manager) catalogMatchesReadOnly(e *serverEntry, discovered []catalogItem) bool {
+	return m.catalogMatches(e, discovered)
 }
 
 // markGenerationFailed compare-and-clear entry 的 (generation, client) tuple.
@@ -397,10 +477,10 @@ func (m *Manager) markGenerationFailed(e *serverEntry, handle *ProxyHandle, clie
 //        entry 维持 Error/unavailable, 调用方应退出 goroutine.
 // 退避: backoff = initial_delay * 2^(attempt-1) cap max_delay; 期间可被 m.runCtx 中断 (runtime Stop).
 // 比对失败 (catalog 差异) 立即保持 Error 不再退避 (协议错要求 Runtime 重启, 见 docs §7.2 末段).
-func (m *Manager) attemptReconnect(e *serverEntry, handle *ProxyHandle, oldGen uint64) (*Client, uint64, bool) {
+func (m *Manager) attemptReconnect(e *serverEntry, handle *ProxyHandle, oldGen uint64) (*Client, uint64, chan struct{}, bool) {
 	rc := m.cfg.Reconnect
 	if !rc.Enabled {
-		return nil, 0, false
+		return nil, 0, nil, false
 	}
 	maxAttempts := rc.MaxAttempts
 	if maxAttempts < 0 {
@@ -410,7 +490,7 @@ func (m *Manager) attemptReconnect(e *serverEntry, handle *ProxyHandle, oldGen u
 	for {
 		attempt++
 		if attempt > maxAttempts {
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
 		// 指数退避: initial * 2^(attempt-1) cap max_delay. attempt 从 1 起.
 		backoff := rc.InitialDelay
@@ -423,10 +503,10 @@ func (m *Manager) attemptReconnect(e *serverEntry, handle *ProxyHandle, oldGen u
 		}
 		if !sleepInterruptible(m.runCtx, backoff) {
 			// runtime 停止: 立即放弃.
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
 		if m.runCtx.Err() != nil {
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
 		// 构新 client: 复用 connectAndDiscover 完整 path (connect → init → discover).
 		newClient, newTools, err := m.connectAndDiscover(e)
@@ -450,24 +530,32 @@ func (m *Manager) attemptReconnect(e *serverEntry, handle *ProxyHandle, oldGen u
 				e.status.LastError = errMsg
 			}
 			m.mu.Unlock()
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
 		// Stop race: 进入 entry 锁前再确认 runtime 未停止 + 代际未变.
 		if m.runCtx.Err() != nil {
 			_ = newClient.Close()
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
 		m.mu.Lock()
 		if e.generation != oldGen {
 			// 期内已被其它路径替换 (理论上不会, 本 entry 只此 goroutine 重连).
 			m.mu.Unlock()
 			_ = newClient.Close()
-			return nil, 0, false
+			return nil, 0, nil, false
 		}
 		newGen := oldGen + 1
 		e.generation = newGen
 		e.client = newClient
 		handle.Store(newClient)
+		// 同 publishGeneration 每代独立 listChanged channel + 设置 onListChanged 回调.
+		e.listChanged = make(chan struct{}, 1)
+		newClient.SetOnListChanged(func() {
+			select {
+			case e.listChanged <- struct{}{}:
+			default:
+			}
+		})
 		now := time.Now()
 		e.status.Status = StatusConnected
 		e.status.ConnectedAt = &now
@@ -476,7 +564,7 @@ func (m *Manager) attemptReconnect(e *serverEntry, handle *ProxyHandle, oldGen u
 		pv := newClient.ProtocolVersion()
 		e.status.ProtocolVersion = &pv
 		m.mu.Unlock()
-		return newClient, newGen, true
+		return newClient, newGen, e.listChanged, true
 	}
 }
 
