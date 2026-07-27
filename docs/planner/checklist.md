@@ -13,11 +13,11 @@
 
 ## 生成
 
-- [ ] `PlanningInput` 只含当前 Agent 已授权能力
-- [ ] 规划调用继承 turn context，并额外应用规划 timeout
-- [ ] 模型只生成 `steps`；Plan ID/Task 来自可信输入
-- [ ] 使用结构化 JSON 编解码，不从 Markdown fence 截取 JSON
-- [ ] Provider 错误、JSON 错误和校验错误保持可 `errors.Is/As`
+- [x] `PlanningInput` 只含当前 Agent 已授权能力 (LLMPlanner 不投影能力, 接受 Runtime 传入)
+- [x] 规划调用继承 turn context，并额外应用规划 timeout (llm_planner.go: context.WithTimeout)
+- [x] 模型只生成 `steps`；Plan ID/Task 来自可信输入 (DisallowUnknownFields + Plan.ID/Task 固定)
+- [x] 使用结构化 JSON 编解码，不从 Markdown fence 截取 JSON (json.Decoder + Marshal user payload)
+- [x] Provider 错误、JSON 错误和校验错误保持可 `errors.Is/As` (双 `%w` wrap; TestPlan* 验证)
 
 ## 校验
 

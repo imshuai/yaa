@@ -2188,3 +2188,82 @@ go test -count=1 -timeout 60s ./internal/planner/ -v   # 19 例 PASS (validate 1
 2. Runtime 接入 LLMPlanner + Executor (注入依赖 Planner := 真 provider + AgentBinding 加 Planner 字段; Agent turn head → Plan/ValidatePlan/Execute → 结果入 Context).
 3. StepRunner aggregate (tool: ExecutionScope + tool.Manager; llm: Provider.Chat + system message + instruction).
 
+
+## progress #28 — LLMPlanner.Plan (provider.Chat + 严格 JSON 解码 + 可信 Plan 构造 + 错误路径闭环)
+
+### 改动文件清单
+- `internal/planner/llm_planner.go` (新增, ~205 行)
+- `internal/planner/llm_planner_test.go` (新增, ~391 行, 14 顶级测试 + 5 子测试)
+- `docs/planner/checklist.md` (生成 § 5 项勾选)
+- `progress.md` (本节)
+
+### 实现
+LLMPlanner 持 `provider.Provider` + `config.PlannerConfig`, `NewLLMPlanner(p, cfg)` 构造. `Plan(ctx, in)` 按 docs/planner/planner.md §3 第 1..7 步:
+1. `validatePlanningInput(in)`: TurnID/AgentID/Task/Model 非空 + MaxSteps>0 (docs §1 必填, 上界由 Runtime cfg.MaxSteps 规约, 此处只判可判定下界).
+2. `context.WithTimeout(ctx, cfg.Timeout)` 派生规划 ctx (defer cancel).
+3. 模型选择: `cfg.Model != ""` 覆盖 `in.Model`; 否则用 `in.Model` (§3 第 4 步).
+4. 消息构造:
+   - `buildSystemPrompt(in)`: §4 模板, 要求只返 `{"steps":[...]}`, 明示 `max_steps=N`, action∈{tool,llm}, 禁止未列入 Capabilities 的 Tool, 仅 `$step` 引用语法, 拒 markdown fence/prose. 纯字符串描述, 不含 task/Capabilities JSON (那些放 user message).
+   - `buildUserPayload(in)`: `json.Marshal` 结构化对象 `{task, max_steps, capabilities}`, **不字符串拼接能力 JSON** (§3 第 3 步). `nil Capabilities` → `[]Capability{}` 防模型看到 `null`.
+5. `req`: system + user 两 message, ResponseFormat.Type=json_object, MaxTokens=cfg.MaxTokens (pointer), Temperature=cfg.Temperature (pointer). 不携带 Tool definitions (checklist § 集成与安全 "LLM Step 不携带 Tool definitions").
+6. `provider.Chat(planCtx, req)`:
+   - 错误: `fmt.Errorf("%w: %w", ErrPlanGenerate, err)` 双 wrap; `errors.Is(err, context.DeadlineExceeded/Canceled)` 可达 (errors.md §2 "turn context 取消 原样保留 context cause" 在这层最直接支持).
+   - 成功: `usage := resp.Usage` 提取, **无论后续 JSON 校验成败都原样回** (§3 第 4 步硬约束).
+7. `decodePlanResponse(resp.Content)`:
+   - trim 空白; 空响应 → ErrPlanParse (含 "empty model response").
+   - `json.NewDecoder` + `DisallowUnknownFields()` 解 `planResponse{Steps []Step}` (DTO 仅含 Steps, 拒绝 id/task/status/时间戳等顶层字段).
+   - `dec.More()` 必须返 false (拒绝 trailing token).
+   - 错误: `fmt.Errorf("%w: %v", ErrPlanParse, err)`.
+8. 构造可信 Plan: `ID: in.TurnID + ":plan"`, `Task: in.Task`, `Steps: raw.Steps`. 不依赖模型输出 ID/Task (§3 第 6 步).
+
+### 测试 `internal/planner/llm_planner_test.go`
+- `fakeProvider` Mock: 仅 Chat 真实返值, 其它方法 stub. setResponse/setError/chatHook.
+- `TestPlanHappyPath`: 合法两步 (tool http + llm 依赖 s1) → ID="turn-1:plan" / Step 0/1 字段全对 / Usage 原样回 / Chat 仅调一次.
+- `TestPlanRejectsUnknownTopLevelField`: `{"steps":[], "id":"x", "task":"hack"}` → ErrPlanParse (DisallowUnknownFields).
+- `TestPlanRejectsTrailingToken`: `{"steps":[]} extra-junk` → ErrPlanParse (dec.More() 拒).
+- `TestPlanEmptyResponse`: 空白内容 → ErrPlanParse.
+- `TestPlanProviderError`: Chat 返 errors.New(...) → ErrPlanGenerate.
+- `TestPlanContextTimeout`: cfg.Timeout=1ms + hook 等 ctx.Done 后返 ctx.Err → err 双 ErrPlanGenerate + context.DeadlineExceeded (`errors.Is`).
+- `TestPlanContextCancelParent`: parent cancel → err 双 ErrPlanGenerate + context.Canceled.
+- `TestPlanRejectsMissingInput` + 5 子测试: turn_id/agent_id/task/model/max_steps<=0 → ErrPlanGenerate, Chat 不被调用 (gotCnt=0).
+- `TestPlanCfgModelOverridesInput`: cfg.Model="planner-override-model" → req.Model 覆盖.
+- `TestPlanCfgModelEmptyFallsBack`: cfg.Model="" → req.Model="agent-model".
+- `TestPlanRequestShape`: 2 messages (system+user) / user msg 含 task / max_steps / capability name / ResponseFormat.Type=json_object / MaxTokens=999 / Temperature=0.2 / system prompt 含关键词 steps|max_steps|tool|llm|forbidden|JSON.
+- `TestPlanEmptyCapabilitiesEncodesAsArray`: nil → 编码 `[]`.
+- `TestPlanReturnsStepsOrderPreserved`: 三步顺序保留.
+
+### 验证
+```
+go build ./... && go vet ./... && go test -count=1 -timeout 300s ./...   # 21 包全绿
+go test -count=1 -timeout 60s ./internal/planner/   # ok (8 execute + 11 validate + 14 = 60 PASS 含子测试)
+```
+59 PASS (顶级 + subtests). 与 #27 19 例叠加, planner 包测试 38 顶级断言.
+
+### checklist 推进 (docs/planner/checklist.md 生成 § 5 项):
+- [x] PlanningInput 只含当前 Agent 已授权能力 (LLMPlanner 不投影能力, 接受 Runtime 传入)
+- [x] 规划调用继承 turn context + 规划 timeout (context.WithTimeout)
+- [x] 模型只生成 steps, Plan ID/Task 来自可信输入 (DisallowUnknownFields + Plan.ID/Task 固定)
+- [x] 结构化 JSON 编解码, 不从 Markdown fence 截取 (json.Decoder + Marshal user payload)
+- [x] Provider/JSON/校验错误可 errors.Is/As (双 %w wrap; TestPlan* 验证)
+
+### 决策记录
+- **双 `%w` wrap Provider 错误**: `fmt.Errorf("%w: %w", ErrPlanGenerate, err)` 让 `errors.Is(err, context.DeadlineExceeded/Canceled)` 可达. 比 `%v` 字符串化更保留链. Go 1.20 `errors.Is` 按 wrap 链遍历多 `%w`. 这与 errors.md §2 "turn context 取消 原样保留 context cause" 在 LLMPlanner 这层直接做最小支持.
+- **JSON 错误用 `%v` 单 wrap ErrPlanParse**: json.SyntaxError / json.UnmarshalTypeError 内部表层不继承 context 类, 不需双 `%w` 链回; 单 wrap `%w` 保留 ErrPlanParse 链足够 `errors.Is(err, ErrPlanParse)`.
+- **Planner 不投影能力**: docs §1 "Capabilities 只能来自 ToolManager.ListForAgent(AgentID) 的 enabled 授权投影" 是 Runtime 责任, LLMPlanner 假设 in.Capabilities 已经是授权投影. 在 #29 Runtime 接入时由 AgentBinding 投影.
+- **buildUserPayload nil → []**: docs §1 "名称必须唯一" 后半句要求, 但 nil 应该编码为 `[]` (而非 null) 是最自然的 — 模型看到 `[]` 会理解 "无可用 Tool, 全部 step 是 llm action".
+- **system prompt 含 `max_steps=N` literal**: §4 "Prompt 必须同时给出 `max_steps`"; 实测里 prompt 文本写 `Maximum N steps (max_steps=N)` 兼顾自然语言与关键词要求, 不引额外模板引擎.
+- **NewLLMPlanner 不判 cfg.Type**: cfg.Type=disabled 时 Runtime 不构造 LLMPlanner 而是走直接 Agent Loop (docs §1). 把这个分支判别责任留给 Runtime (#29), LLMPlanner 实例自身假定 cfg.Type=llm.
+- **fakeProvider 放 planner_test.go 不导出**: 不需 mockgen / external test_mocks; 单用例复用 internal 接口. 与 executor_test.go 风格一致.
+
+### 未完成下一步 commit
+1. **#29: Runtime 接入 LLMPlanner + Executor** (依赖链清晰):
+   - `internal/runtime`: AgentBinding 加 `planner *planner.LLMPlanner` + `executor *planner.Executor`.
+   - Agent 启动: 从 provider.Manager 拿 provider, 解析 ResolvePlannerConfig(root, agent.Planner), cfg.Type!=disabled 时构造 NewLLMPlanner; ToolManager 投影 `ListForAgent(agentID)` 供 AgentBinding.Planner 调用.
+   - turn head: Plan(in TurnID/AgentID/Task/Model/MaxSteps=cfg.MaxSteps/Capabilities) → ValidatePlan → Executor.Execute → 结果入 Context. ValidatePlan 失败立刻返, 不执行.
+2. **#30: StepRunner aggregate** (Tool + LLM 真实接入):
+   - `internal/planner/step_runner.go` 包装 ToolManager.Execute 与 Provider.Chat 成 StepRunner.
+   - Tool step: `tm.Execute(scope{AgentID,SessionID}, step.Target, boundInput)`; ToolCallCount=1 (执行后硬记录).
+   - LLM step: `provider.Chat` 一次, system message = docs/executor §3.1 固定 prompt, user message = instruction + 其余 JSON (instruction 必须是字符串).
+3. **配置 / 集成 checklist 剩余**:
+   - 配置 § 4 项 (PlannerConfig + disabled + Agent override + restart_required) — 多数已在 config 包就位, 需验收勾选 + 小测试.
+   - 集成与安全 § 6 项 (Runtime 接入后才能勾选, 见 #29/#30).
