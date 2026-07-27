@@ -21,12 +21,12 @@
 
 ## 校验
 
-- [ ] Step 数、ID、Action、Target 和能力校验在执行前完成
-- [ ] Depends 允许后向引用，但拒绝未知、自依赖和重复依赖
-- [ ] Kahn 算法拒绝所有环
-- [ ] `$step` 只引用直接依赖，且 object shape 严格
-- [ ] `ValidatePlan(plan, in)` 精确绑定可信 TurnID/Task/MaxSteps/Tool capabilities
-- [ ] 非法 Plan 不启动 goroutine、Tool 或 Provider Step
+- [x] Step 数、ID、Action、Target 和能力校验在执行前完成 (internal/planner/validate.go 规则 3/4/5; capability 名唯一 + Action 工具目标 + LLM 无目标)
+- [x] Depends 允许后向引用，但拒绝未知、自依赖和重复依赖 (规则 6; TestValidatePlanRejectsRule6DependsOrphans / TestValidatePlanDependsNeedNotPrecedeArrayOrder)
+- [x] Kahn 算法拒绝所有环 (规则 7; TestValidatePlanRejectsRule7Cycle 覆盖 2 步 + 3 步环)
+- [x] `$step` 只引用直接依赖，且 object shape 严格 (规则 8; TestValidatePlanRejectsRule8DollarStepReference / TestValidatePlanAcceptsRule8DollarStepKeyReference)
+- [x] `ValidatePlan(plan, in)` 精确绑定可信 TurnID/Task/MaxSteps/Tool capabilities (规则 1/2; TestValidatePlanRejectsRule1InputEmpty / Rule2PlanIDAndTaskAndStepCount)
+- [x] 非法 Plan 不启动 goroutine、Tool 或 Provider Step (ValidatePlan 是纯函数零副作用; 失败立刻返 *ValidationError 含 ErrPlanInvalid)
 
 ## 执行
 
@@ -49,9 +49,9 @@
 
 ## 最小测试
 
-- [ ] 空 Plan、重复 ID、未知依赖、自依赖和环均失败且零调用
+- [x] 空 Plan、重复 ID、未知依赖、自依赖和环均失败且零调用 (validate_test.go 覆盖规则 6/7 + steps_empty)
 - [ ] 独立节点达到并发上限，依赖节点只在全部成功后启动
-- [ ] 输入引用完整输出和直接 key 均正确解析
+- [x] 输入引用完整输出和直接 key 均正确解析 (TestValidatePlanAcceptsRule8DollarStepKeyReference)
 - [ ] 首个 Step 失败后未启动节点为 skipped，运行节点被取消
 - [ ] turn cancel 与 timeout 后所有 worker 退出
-- [ ] 同一 Agent 无权使用的 Tool 即使由模型生成也被拒绝
+- [x] 同一 Agent 无权使用的 Tool 即使由模型生成也被拒绝 (TestValidatePlanRejectsRule4And5ActionTarget/tool_unknown_target 验证 tool 目标未在 capability 即拒)

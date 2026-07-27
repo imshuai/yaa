@@ -2081,3 +2081,55 @@ go test -count=1 -timeout 60s ./internal/mcp/ -run TestStreamableHTTPClientGETRe
 - **测试不假设 recvCh 顺序**: docs §3.3 明确"客户端以 JSON-RPC id 关联响应", 即 message 在 recvCh 中是无序的; 测试应当按 ID 区分而非顺序断言. 修法与设计意图一致.
 - **MCPListTool nil → []**: docs/tool/introspection.md §1 "空 slice 编码为 []" 是 hard 约定 (避免 LLM 收到 null 误解); 此处理同 Remote API `handleListMCPServers items==nil → []`.
 
+
+## progress #26 — Planner 包起步: 权威类型 + 4 sentinel + ValidationError/ExecutionError + ValidatePlan 完整 DAG 校验
+
+**Commit (将提交)**: Planner 实现的第一步. 起 internal/planner package 翻译 docs/planner/ 的权威契约到 Go:
+1. types.go: PlanningInput / Capability / Plan / Step + Action 常量 (tool|llm).
+2. errors.go: 4 sentinel + ValidationError (Unwrap → ErrPlanInvalid) + ExecutionError (Unwrap → errors.Join(ErrPlanExecution, Cause) Go 1.20 multi-cause).
+3. validate.go: ValidatePlan(plan, in) 纯函数执行 docs/planner/execution.md §1 的 8 条铁律, 一次返回首个确定性错误, 零副作用.
+
+**docs 对照**:
+- planner.md §1 权威类型完全翻译 (含 Plan.ID = TurnID+":plan"; Plan.Task 必须 = in.Task; Plan/Step 不含状态的约束).
+- execution.md §1 八条铁律逐条实现: 可信字段非空 / capability 唯一 / Plan.ID&Task / Steps 数 / Step ID 非空且唯一 / Action enum / tool Target 属 capability / llm Target 必空 / Depends 不重复不自依赖不引用不存在 / Kahn 拓扑无环 / Input $step 引用必须在直接依赖内 + object shape 严格.
+- errors.md §1 sentinel + §1 ValidationError / ExecutionError 类型 + Unwrap 关系.
+- decisions.md PL-005 "先完整校验再执行": ValidatePlan 纯函数零副作用, 任何外部调用前完成.
+
+**验证策略**:
+- ValidatePlan 是纯函数, 不依赖 Provider / ToolManager / Runtime, 单测可完整覆盖 8 条 + 正向 (10+ subcase 反向 case structural valid).
+- 不依赖 provider / tool / mcp 包, 实现含自身依赖零化 (itoa 替 strconv 是 ponytail full 的尽量 stdlib+ 一关键字面选择, 不去花资源引 strconv).
+
+**测试** (`internal/planner/validate_test.go`):
+- TestValidatePlanAcceptsValidBaseline (forward) - 2 step + LLM step + 后向引用有效.
+- TestValidatePlanRejectsRule1InputEmpty (8 subcase): 各字段空 / MaxSteps ≤0 / Capability 重复或空名.
+- TestValidatePlanRejectsRule2PlanIDAndTaskAndStepCount (4 subcase): Plan.ID / Plan.Task / steps 空 / 超 MaxSteps.
+- TestValidatePlanRejectsRule3StepIDUniqueness: 空 step ID / 重复.
+- TestValidatePlanRejectsRule4And5ActionTarget (4 case): 现场 Action / tool 缺 Target / tool Target 不在 capability / llm 带 Target.
+- TestValidatePlanRejectsRule6DependsOrphans (3 case): 自依赖 / 重复依赖 / 不存在依赖.
+- TestValidatePlanRejectsRule7Cycle: 2 step 环 + 3 step 环.
+- TestValidatePlanDependsNeedNotPrecedeArrayOrder: 后向依赖应被接受 (docs §1 "不得要求依赖数组前方").
+- TestValidatePlanRejectsRule8DollarStepReference (3 case): $step 不在 depends / object 含 extra field / 嵌套 $step 无效.
+- TestValidatePlanAcceptsRule8DollarStepKeyReference: {"$step":"fetch"} 整体输出 + {"$step":"fetch","key":"content"} object key + array / literal / num 各值.
+- TestValidationErrorUnwrapIsErrPlanInvalid + TestExecutionErrorUnwrapJoinsPlanExecutionAndCause: errors.Is/As 路径.
+
+**验证**:
+```
+go build ./... && go vet ./... && go test -count=1 -timeout 300s ./...   # 19 包全绿 (internal/planner 新增 0.018s)
+go test -count=1 -timeout 60s ./internal/planner/ -v   # 全 11 例 PASS
+```
+
+**checklist 推进** (docs/planner/checklist.md): 校验 § 全部 6 项勾选完成; 最小测试 § 空 Plan/重复 ID/未知依赖/自依赖和环 + 输入引用完整 key + Tool 拒绝 3 项勾选完成. 共 9 项勾新增.
+
+**决策记录**:
+- **Planner 起步是纯函数 ValidatePlan**: 因不依赖 Provider/ToolManager/Runtime, 单测覆盖完整 8 条纯 algorithm; Provider 版 LLMPlanner / Executor 留下一 commit (依赖 provider + 调度 model), 是更专门的工作. ponytail full 一个 commit 做一件事, 可独立验收.
+- **Validation 一次返回首个错误 不收集所有错误**: docs §1 "一次收集或返回首个确定性错误". 实现选首个错误是最小可用版本, 一个 plan 校验只暴露一处错让上游修. 后续只在真正需要批量报错时扩展 (ItemTestSuite 风格), 现在不造抽象.
+- **errors.Join (Go 1.20) 用于 ExecutionError.Unwrap**: docs §1 明确 "Go 目标为 1.20, 因此多 cause 可使用 errors.Join"; 直接用保持与 docs 一致 + Go 1.20 实际有 errors.Join.
+- **itoa 私有 helper 不引 strconv**: 仅用于错误信息 capability array index, 入 stdlib 已 strconv.Itoa 但不 import 可减少 file surface. 简单 20-byte buffer 覆盖 int 范围够用. ponytail full 选最小依赖.
+- **Kahn slice 队列 + Plan.Steps 数组顺序**: 算法稳定弹 (按 Plan.Steps 数组顺序即时序), 不要求依赖序, 与 docs §1 "数组顺序只用于确定性调度" 一致.
+
+**未完成下一步 commit (留下一轮)**:
+1. LLMPlanner.Plan 实现 (依赖 provider.Provider.Chat): Prompt 构造 + JSON DisallowUnknownFields 严格解码 + Plan{ID/Task} 可信构造 + Provider 错误映射 (ErrPlanGenerate / ErrPlanParse).
+2. Executor.Execute: DAG 调度 + StepRunner + 输入绑定 + 失败即停 + ctx 取消 + PlanResult 状态机 (completed/failed/canceled) + skipped/canceled step 状态.
+3. Runtime 启动 LLMPlanner + Executor 注入 AgentBinding (依赖 provider.Manager + tool.Manager).
+4. Agent turn Pipeline 接 Plan (intelligence integration entry).
+
