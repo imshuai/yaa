@@ -18,10 +18,10 @@
 
 ## Loader
 
-- [ ] `plugins.paths` 相对主配置目录解析并去重
+- [x] `plugins.paths` 相对主配置目录解析并去重
 - [ ] `NewLoader(configDir, paths, logger)` 校验依赖并固定 RPC major；`NewManager` 消费其 typed discovery diagnostics
-- [ ] 每个直接子目录只读取一个 `plugin.yaml`
-- [ ] entry 规范化后不得逃逸 Manifest 目录，并验证可执行权限
+- [x] 每个直接子目录只读取一个 `plugin.yaml`
+- [x] entry 规范化后不得逃逸 Manifest 目录，并验证可执行权限
 - [ ] Unix Socket / Windows loopback TCP endpoint 与启动 nonce
 - [ ] 长期进程使用 `exec.Command`；startup context 取消不会杀死 Ready 进程
 - [ ] nonce 仅经 `YAA_PLUGIN_STARTUP_NONCE` 传入并由 HandshakeResponse constant-time 校验
@@ -29,7 +29,7 @@
 - [ ] Start 依次执行 exec/Dial/Handshake/Init/Ready
 - [ ] 每个 `cmd.Start` 成功路径恰有一个 `cmd.Wait` owner；失败统一 Terminate + endpoint cleanup
 - [ ] 无法解析 ID 的错误只进 diagnostics；已知 ID 的错误建立 error Entry
-- [ ] 重复 ID 全部拒绝，不按路径顺序覆盖
+- [x] 重复 ID 全部拒绝，不按路径顺序覆盖
 - [ ] `RPCClient` 私有持有 transport/process/endpoint；外部只用 Health/Stop/InvokeTool 转发和幂等生命周期方法
 
 ## Manager
