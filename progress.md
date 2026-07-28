@@ -2446,3 +2446,44 @@ evidence 已在现有测试覆盖, 无需补测试.
 
 ### 下一步
 - MCP + planner checklist 仅剩 observability 3 项 (mcp §observability L128-129 + planner "日志与指标不泄露"): 5 个 MCP 指标 + 2 个 span + 日志脱敏. 这是最后一块硬骨头.
+
+## progress #34 — MCP observability §1 server 事件日志接入 (5/6 事件)
+
+### 改动
+- `internal/mcp/manager.go`:
+  - 新增 `safeEndpoint(rawURL string) string` 脱敏 helper (docs/mcp/observability.md §1 末段): 移除 userinfo/query/fragment 只保留 scheme://host/path; 非绝对 URL 原样返回.
+  - 新增 `endpointFor(e *serverEntry) string`: stdio → cfg.Command; sse/streamable_http → safeEndpoint(cfg.URL); nil → "".
+  - `connectAndDiscover` 改签名加 `attempt int` 参数; 入口 emit `mcp.server.connecting` (server, transport, endpoint, attempt); 失败点 emit `mcp.server.error` (err 位置参数 + server/error_type/message 字段) 4 处 (transport_build/connect/initialize/discover).
+  - `publishGeneration` 成功末尾 emit `mcp.server.connected` (server, protocol_version, tool_count).
+  - `attemptReconnect` 成功末尾 emit `mcp.server.connected` (重连成功).
+  - `attemptReconnect` 退避前 emit `mcp.server.reconnect_scheduled` (server, attempt, backoff_ms).
+  - `markGenerationFailed` 锁内抓取 ConnectedAt, 锁外 emit `mcp.server.disconnected` (server, reason, uptime_ms).
+  - 新增 `net/url` import.
+  - `connectStdioServer` caller 传 attempt=1; `attemptReconnect` caller 传 attempt 局部计数.
+- `internal/mcp/observability_test.go`:
+  - TestSafeEndpoint (6 cases 含 userinfo/query/fragment 脱敏) + TestEndpointFor (stdio/sse/nil).
+  - capturingHandler (slog.Handler 自实现; Handle(r slog.Record) + WithAttrs/WithGroup; Enabled 级别过滤) — Go 1.20 slog Handler 签名 `Handle(r Record) error` 无 ctx 参数.
+  - TestManagerEmitsConnectingAndConnectedEvents (真实 stdio fake subprocess Prepare 全程; 断言 connecting+connected 事件 server="fake2" transport="stdio" endpoint=python3 cmd tool_count="2").
+  - TestManagerEmitsErrorEventOnBadStdioCommand (broken binary Prepare; 断言 Status==Error + emit mcp.server.error event error_type 非空).
+
+### Evidence
+- §1 6 事件中的 5 个 server 事件接入 (connecting/connected/disconnected/reconnect_scheduled/error), 含 docs 表头字段; mcp.tool.called 留 #35 commit (proxy.Execute 加 logger + 可与 metrics 接入合并).
+- safeEndpoint endpointFor 覆盖 docs §1 末段 endpoint 脱敏路径; tests 真实 stdio subprocess 端到端验证 happy path + broken binary 失败路径 emit event 准确.
+
+### 决策记录
+- **Logger.Error(msg, err, args) 签名**: docs/AGENTS.md 约束 Error 第二参数 err error; mcp.server.error 字段含 message 时 err 既作位置 2 又显式 repeat err.Error() 作 message 字段, 冗余但保 docs §1 表字段完整. 不改用 Warn (docs 明示 level=error).
+- **markGenerationFailed 锁内 ConnectedAt 锁外 log**: ConnectedAt 是 *time.Time; 锁内 snapshot pointer (避免与 pushGeneration 重连成功 race); 锁外 time.Since 比较再 log. uptime_ms 字段 docs §1 表显式.
+- **connectAndDiscover 加 attempt 参数而非字段**: attempt 是连接尝试号 (首连 1, 重连按 attemptReconnect 局部计数); 不存 serverEntry 因首连/重连共用同一 entry 不可分. 加参数 1 行 caller 改动; Ponytail 不另起结构.
+- **safeEndpoint 不引入新依赖**: stdlib `net/url` 即可, 不引第三方 URL sanitize 库 (Ponytail ladder 第 3 档 stdlib).
+- **capturingHandler Go 1.20 slog 签名**: x/exp/slog v0.0.0-20230202154922 `Handle(r Record) error` 无 ctx; `Attrs(func(Attr))` 无 bool 返回 (与 Go 1.21 stdlib log/slog 不同) — 测试已对齐.
+
+### 验证
+```
+go vet ./... && go build ./...   # OK
+go test -count=1 -timeout 300s ./...   # 21 包全绿
+go test -count=1 -timeout 30s -run 'TestManagerEmits|TestSafeEndpoint|TestEndpointFor' ./internal/mcp/ -v   # 4 PASS
+```
+
+### 下一步
+- progress #35: MCP observability §2 5 个指标 (Gauge/Counter/Histogram 极简自实现, 不引 prometheus client_golang) + `mcp.tool.called` 事件日志 (proxy.Execute 加 logger). 指标 label 不含 request_id/session_id/error (高基数限制详见 docs §2 末段).
+- 之后 progress #36: planner observability — §1 事件日志 (planner.plan.* / planner.step.*) + §2 条件性指标 (依赖既有 metrics sink); planner checklist L48 "日志不泄露" 脱敏勾选.

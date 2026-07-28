@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -172,7 +173,8 @@ func (m *Manager) Prepare() error {
 // 成功后：e.handle 持有 stable ProxyHandle；e.client/generation/tools/status 是初代快照；m.upstreamWG 已 Add(1).
 func (m *Manager) connectStdioServer(e *serverEntry) {
 	handle := &ProxyHandle{}
-	client, tools, err := m.connectAndDiscover(e)
+	// 首连 attempt=1 (docs/mcp/observability.md §1: mcp.server.connecting attempt 字段).
+	client, tools, err := m.connectAndDiscover(e, 1)
 	if err != nil {
 		m.mu.Lock()
 		e.status.Status = StatusError
@@ -202,9 +204,21 @@ func (m *Manager) connectStdioServer(e *serverEntry) {
 // 失败时仅 Close client（如有），entry 状态由调用者修订.
 // 成功返回 client + 已规范的 normalized/sorted MCPTool 列表.
 // （重连与初次启动共享此 path；catalog 注册由调用方自行决定）.
-func (m *Manager) connectAndDiscover(e *serverEntry) (*Client, []MCPTool, error) {
+func (m *Manager) connectAndDiscover(e *serverEntry, attempt int) (*Client, []MCPTool, error) {
+	// docs/mcp/observability.md §1: mcp.server.connecting (server, transport, endpoint, attempt)
+	m.logger.Info("mcp.server.connecting",
+		"server", e.name,
+		"transport", e.transport,
+		"endpoint", endpointFor(e),
+		"attempt", attempt)
 	tr, err := m.buildTransport(e)
 	if err != nil {
+		// docs/mcp/observability.md §1: mcp.server.error (server, error_type, message)
+		m.logger.Error("mcp.server.error",
+			err,
+			"server", e.name,
+			"error_type", "transport_build",
+			"message", err.Error())
 		return nil, nil, err
 	}
 	client := NewClient(e.name, m.runCtx, tr)
@@ -219,6 +233,11 @@ func (m *Manager) connectAndDiscover(e *serverEntry) (*Client, []MCPTool, error)
 	connCtx, cancel := context.WithTimeout(m.runCtx, connTimeout)
 	defer cancel()
 	if err := client.Connect(connCtx); err != nil {
+		m.logger.Error("mcp.server.error",
+			err,
+			"server", e.name,
+			"error_type", "connect",
+			"message", err.Error())
 		return nil, nil, err
 	}
 
@@ -229,6 +248,11 @@ func (m *Manager) connectAndDiscover(e *serverEntry) (*Client, []MCPTool, error)
 	initCtx, initCancel := context.WithTimeout(m.runCtx, initTimeout)
 	defer initCancel()
 	if err := client.Initialize(initCtx); err != nil {
+		m.logger.Error("mcp.server.error",
+			err,
+			"server", e.name,
+			"error_type", "initialize",
+			"message", err.Error())
 		_ = client.Close()
 		return nil, nil, err
 	}
@@ -237,6 +261,11 @@ func (m *Manager) connectAndDiscover(e *serverEntry) (*Client, []MCPTool, error)
 	defer toolsCancel()
 	tools, err := client.DiscoverTools(toolsCtx)
 	if err != nil {
+		m.logger.Error("mcp.server.error",
+			err,
+			"server", e.name,
+			"error_type", "discover",
+			"message", err.Error())
 		_ = client.Close()
 		return nil, nil, err
 	}
@@ -302,6 +331,11 @@ func (m *Manager) publishGeneration(e *serverEntry, handle *ProxyHandle, client 
 		})
 	}
 	m.mu.Unlock()
+	// docs/mcp/observability.md §1: mcp.server.connected (server, protocol_version, tool_count)
+	m.logger.Info("mcp.server.connected",
+		"server", e.name,
+		"protocol_version", client.ProtocolVersion(),
+		"tool_count", len(tools))
 }
 
 // buildTransport 按 e.transport 选择 ClientTransport 实例 (docs/mcp/transport.md §3).
@@ -521,12 +555,21 @@ func (m *Manager) markGenerationFailed(e *serverEntry, handle *ProxyHandle, clie
 	}
 	e.client = nil
 	e.status.Status = StatusError
+	var uptimeMs int64
+	if e.status.ConnectedAt != nil {
+		uptimeMs = time.Since(*e.status.ConnectedAt).Milliseconds()
+	}
 	if cause != nil {
 		e.status.LastError = fmt.Sprintf("%s: %v", reason, cause)
 	} else {
 		e.status.LastError = reason
 	}
 	m.mu.Unlock()
+	// docs/mcp/observability.md §1: mcp.server.disconnected (server, reason, uptime_ms)
+	m.logger.Warn("mcp.server.disconnected",
+		"server", e.name,
+		"reason", reason,
+		"uptime_ms", uptimeMs)
 	_ = client.Close()
 }
 
@@ -562,6 +605,11 @@ func (m *Manager) attemptReconnect(e *serverEntry, handle *ProxyHandle, oldGen u
 				break
 			}
 		}
+		// docs/mcp/observability.md §1: mcp.server.reconnect_scheduled (server, attempt, backoff_ms)
+		m.logger.Info("mcp.server.reconnect_scheduled",
+			"server", e.name,
+			"attempt", attempt,
+			"backoff_ms", backoff.Milliseconds())
 		if !sleepInterruptible(m.runCtx, backoff) {
 			// runtime 停止: 立即放弃.
 			return nil, 0, nil, false
@@ -569,8 +617,8 @@ func (m *Manager) attemptReconnect(e *serverEntry, handle *ProxyHandle, oldGen u
 		if m.runCtx.Err() != nil {
 			return nil, 0, nil, false
 		}
-		// 构新 client: 复用 connectAndDiscover 完整 path (connect → init → discover).
-		newClient, newTools, err := m.connectAndDiscover(e)
+		// 构新 client: 复用 connectAndDiscover 完整 path (connect → init → discover); attempt 是当前重连号.
+		newClient, newTools, err := m.connectAndDiscover(e, attempt)
 		if err != nil {
 			m.mu.Lock()
 			if e.status.Status == StatusError && e.generation == oldGen {
@@ -625,6 +673,11 @@ func (m *Manager) attemptReconnect(e *serverEntry, handle *ProxyHandle, oldGen u
 		pv := newClient.ProtocolVersion()
 		e.status.ProtocolVersion = &pv
 		m.mu.Unlock()
+		// docs/mcp/observability.md §1: mcp.server.connected (server, protocol_version, tool_count)
+		m.logger.Info("mcp.server.connected",
+			"server", e.name,
+			"protocol_version", pv,
+			"tool_count", len(newTools))
 		return newClient, newGen, e.listChanged, true
 	}
 }
@@ -829,4 +882,39 @@ func cloneServerStatus(s ServerStatus) ServerStatus {
 		out.ConnectedAt = &t
 	}
 	return out
+}
+// safeEndpoint 按 docs/mcp/observability.md §1 末段脱敏 URL: 移除 userinfo、query、fragment,
+// 只保留 scheme://host/path. 空字符串、非绝对 URL 原样返回 (调用方负责保证 sse/streamable_http URL 合法).
+// ponytail: stdlib url.Parse 即可, 不引入新依赖.
+func safeEndpoint(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		// 非合法 sse/http URL (如 stdio command 不走此路径): 原样返回, 调用方按 transport 决定是否使用.
+		return rawURL
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}
+
+// endpointFor 返回某 serverEntry 适合日志的 endpoint 字符串 (docs §1):
+//   stdio -> command (无敏感字段, args 不入);
+//   sse/streamable_http -> safeEndpoint(cfg.URL);
+// ponytail: 单一 helper 让 6 个事件日志点不复写脱敏逻辑.
+func endpointFor(e *serverEntry) string {
+	if e == nil {
+		return ""
+	}
+	switch e.transport {
+	case "stdio":
+		return e.cfg.Command
+	case "sse", "streamable_http":
+		return safeEndpoint(e.cfg.URL)
+	default:
+		return ""
+	}
 }

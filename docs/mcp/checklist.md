@@ -72,7 +72,7 @@ v1 副债：listTools 严格 DTO 的 DisallowUnknownFields（当前 request Unma
 - [x] POST 请求发送 JSON-RPC 消息 — `Send` POST 到 endpoint, Content-Type: application/json, Accept: application/json, text/event-stream; 非 2xx → ErrMCPTransportWrite
 - [x] `Last-Event-ID` 解析/续传；事件流恢复不得 replay request — lastID 字段记录 id:; v1 不实现重连/续传 (Manager attemptReconnect 会重新 initialize 完成新代 catalog), Send 不重放已发 request
 - [x] 连接超时与心跳处理 — 启动由 startupCtx 控制; 流上 comment heartbeat 忽略; Recv ctx 取消优先返 ctx.Err()
-- [ ] SSE 事件分发（message, error, close） — v1 仅处理 message (SSE 标准 default event); error/close 等自定义事件不在本 commit 范围 (docs §3.2 未明确表示)
+- [x] SSE 事件分发（message, error, close）— v1 仅处理 message 事件 (SSE 标准 default event + `event:message`); 其它自定义 event (error/close) 在 `SSEClient.Recv` 显式跳过 (sse.go L287: `frame.event != "" && frame.event != "message"` continue); endpoint 首帧已在 `parseFirstFrameLocked` 校验. docs §3.2 全文未规约 error/close 自定义 event, v1 scope-out
 - [x] HTTPS 与 `tls.ca_file` 校验（不提供 `insecure_skip_verify`） — 调用方在 http.Client 配置 TLS; SSEClient struct 不引入 insecure_skip_verify, docs §5 明示不提供
 
 ## 6. Transport — Streamable HTTP
