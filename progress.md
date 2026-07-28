@@ -2384,3 +2384,38 @@ go test -count=1 -timeout 60s ./internal/planner/ -run "TestExecute(FailsOnUnmar
 ### 下一步
 仅剩 checklist 1 项未勾 (§ 集成与安全 "日志与指标不泄露任务/输入/输出/prompt/secret" — 等 observability commit 同步做). planner 包端到端至此完整.
 下一步候选: #32 observability 指标 (yaa_mcp_servers / yaa_planner_plan_steps 5-6 个 + 日志脱敏); 或 MCP 集成 checklist 剩余 § 9 项 (MCP Tool 已在 Session/Provider 上下文真实可用 — 直接补文档勾选 = minimum quick).
+
+## progress #32 — docs/code 冲突修复：Register 签名 + MCP Tool Source 修正 + §9 集成勾选
+
+### 改动
+- `docs/tool/manager.md` §2.1 §3: 原签名 `Register(tool Tool, cfg config.ToolConfig, source string) error` 与现有 ~15 测试 callers + 3 生产 callers（全 1 参 `Register(t)`）冲突；拆为 `Register(t Tool) error` + `RegisterWithSource(t Tool, source string) error`，注释 source ∈ {builtin|plugin|mcp}；`Register(t)` 等价 `RegisterWithSource(t,"builtin")`；§3 launch order 同步。
+- `internal/tool/manager.go`: `validToolSources` 枚举 map + `RegisterWithSource(t, source)` 公开 API；`Register(t)` 委派 `RegisterWithSource(t,"builtin")`；内部 `m.source[name] = source` 显式覆盖（替代旧 `if !sourceOk` 兜底）—— 修复 MCP Tool 经 `tm.Register(proxy)` 时被错标 source="builtin" 的 bug。
+- `internal/mcp/manager.go` L260: `m.tm.Register(proxy)` → `m.tm.RegisterWithSource(proxy, "mcp")`（注释 docs §73 §2.1 §3 + Remote API 投影）。
+- `internal/tool/builtin/register.go`: 两处 `m.Register(t)` → `m.RegisterWithSource(t, "builtin")`（生产 path 显式 source，不依赖默认推断）。
+- `internal/tool/manager_test.go`: 加 strings import + 2 单测（TestRegisterWithSourceLabelsSource / TestRegisterWithSourceRejectsUnknownSource）。
+- `internal/mcp/manager_integration_test.go`: TestManagerToolProxyCallViaToolManager 末尾加 tm.List `mcp.fake.alpha` `Source="mcp"` 断言（真实 stdio 子进程端到端）。
+- `internal/tool/projection_test.go`: 加 TestToToolDefsExposesMCPToolAsFunction（§9 "与 Provider 集成" evidence — MCP canonical `mcp.srv.alpha` 经 RegisterWithSource("mcp") → ToToolDefs defs 含该 alias，Function.Description="remote MCP tool"，ResolveExecutable 返 canon，ListForAgent 含 canon 且 Source="mcp"）。
+- `docs/mcp/checklist.md` L120-121: 勾选 §9 "与 Session 集成" / "与 Provider 集成"。
+
+### Evidence 路径
+- §与 Session 集成 (L120): docs/mcp/integration.md §2 "Agent 的 tools 白名单引用 mcp.<server>.<tool>，每次 Agent 请求从当前 Tool Manager 和 Agent allowlist 投影可用 Tool" — `ToolManager.Execute(scope{AgentID,SessionID}, "mcp.fake.alpha", params)` 在 turn 中可用；evidence = TestManagerToolProxyCallViaToolManager（真实 stdio 子进程端到端，含 AgentID/SessionID scope 调用）。
+- §与 Provider 集成 (L121): ToToolDefs(agentID, history) 把 MCP canonical 包装 `provider.ToolDef{Type:"function", Function:{Name:alias, Description, Parameters}}`；handle_turn.go:200 + runtime.go:177 真实调用；evidence = TestToToolDefsExposesMCPToolAsFunction。
+
+### 决策记录
+- **双签名 `Register(t)` + `RegisterWithSource(t, source)` 而非 docs §73 原 3 参 `Register(t, cfg, source)`**: 现有 ~15 测试 callers + 3 生产 callers 全走 1 参；改 3 参签名破坏面太大且无收益（ToolManager 内部按 configs 兜底已足够）。新建 RegisterWithSource 不破坏 backward compat，docs 对齐后 source 显式从 caller 来，MCP 走 "mcp" 真实生效。Ponytail YAGNI：不引入 cfg 参数。
+- **source 显式覆盖而不兜底 `if !sourceOk`**: 旧 Register 内 `if _, sourceOk := m.source[name]; !sourceOk { m.source[name] = "builtin" }` 仅在 source 未初始化时写；MCP 注册走 `tm.Register(proxy)` 时内部 `m.source["mcp.fake.alpha"]="builtin"` 错标。新实现 `m.source[name] = source` 显式覆盖 caller 指定值，source 不被 config 预定义误导。
+- **RegisterBuiltin 显式走 RegisterWithSource(t,"builtin")**: docs §73 §3 明示 source ∈ {builtin|plugin|mcp}。builtin/register.go 生产 path 显式 source 不依赖默认推断；docs §3 launch order "Register(t)...统一...RegisterWithSource" 描述对齐。
+- **TestToToolDefsExposesMCPToolAsFunction 不启动真实 MCP Server**: MCP canonical `mcp.srv.alpha` 直接走 `RegisterWithSource(t, "mcp")` 通过 ToolManager 统一路径 — 这是 docs §1 "Yaa! Tool 是统一抽象，MCP 仅是来源 + Proxy 注入" 的语义。真实 MCP Server 端到端测由 TestManagerToolProxyCallViaToolManager（real stdio subprocess）覆盖；§121 evidence 用通用 path 即可。
+
+### 验证
+```
+go vet ./... && go build ./...   # OK
+go test -count=1 -timeout 300s ./...   # 21 包全绿 (含 internal/mcp 7.286s, internal/tool 0.073s)
+go test -count=1 -timeout 30s ./internal/tool/ -run "TestRegisterWithSource" -v   # 2 PASS
+go test -count=1 -timeout 60s ./internal/mcp/ -run "TestManagerToolProxyCallViaToolManager" -v   # PASS
+go test -count=1 -timeout 30s ./internal/tool/ -run "TestToToolDefsExposesMCPToolAsFunction" -v   # PASS
+```
+
+### 下一步
+- MCP checklist §8 配置 7 项 (L108-114): 多数由 config.validateMCPConfig 已满足，需补验收勾选 + 可能加小测试。
+- MCP checklist §observability 两项 (L128-129) + planner checklist "日志与指标不泄露" — observability commit 同步做。

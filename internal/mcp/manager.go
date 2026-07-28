@@ -257,7 +257,9 @@ func (m *Manager) registerProxies(e *serverEntry, handle *ProxyHandle, tools []M
 			return fmt.Errorf("tool %q missing description", mt.Name)
 		}
 		proxy := NewMCPToolProxy(e.name, stripServerPrefix(e.name, mt.Name), mt.Description, mt.InputSchema, toolTimeout, handle)
-		if err := m.tm.Register(proxy); err != nil {
+		// docs/tool/manager.md §73 §2.1 §3: MCP Tool source 显式 "mcp", 通过 RegisterWithSource
+		// 覆写 ToolManager.source[name] 为 "mcp", 保证 ToolInfo.Source 字段正确 (Remote API /api/v1/tools 投影).
+		if err := m.tm.RegisterWithSource(proxy, "mcp"); err != nil {
 			return fmt.Errorf("register tool %q: %w", proxy.Name(), err)
 		}
 	}

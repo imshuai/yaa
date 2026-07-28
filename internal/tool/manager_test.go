@@ -1,6 +1,6 @@
 package tool
 
-import (
+import (	"strings"
 	"context"
 	"encoding/json"
 	"errors"
@@ -244,5 +244,66 @@ func TestManagerErrorResultMapping(t *testing.T) {
 		if !got.IsError {
 			t.Fatalf("IsError expected true")
 		}
+	}
+}
+
+// ToolSource 枚举与 RegisterWithSource 行为 (docs/tool/manager.md §73 / §2.1 / §3).
+func TestRegisterWithSourceLabelsSource(t *testing.T) {
+	m := buildTestManager(t)
+	// 默认 Register: Source 字段 = "builtin" — 与现有 echo/tool 一致 (buildTestManager 已注册).
+	for _, ti := range m.List() {
+		if ti.Name == "echo" {
+			if ti.Source != "builtin" {
+				t.Errorf("Register(t) → echo.Source=%q, want \"builtin\"", ti.Source)
+			}
+		}
+	}
+	// RegisterWithSource("mcp"): MCP-like proxy.
+	if err := m.RegisterWithSource(echoTool{name: "mcp.srv.alpha", desc: "remote tool"}, "mcp"); err != nil {
+		t.Fatalf("RegisterWithSource(mcp.srv.alpha) err=%v", err)
+	}
+	found := false
+	for _, ti := range m.List() {
+		if ti.Name == "mcp.srv.alpha" {
+			found = true
+			if ti.Source != "mcp" {
+				t.Errorf("mcp.srv.alpha Source=%q, want \"mcp\"", ti.Source)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("mcp.srv.alpha 不在 List")
+	}
+	// RegisterWithSource("plugin"): plugin 协变。
+	if err := m.RegisterWithSource(echoTool{name: "plugin.handle.bar", desc: "plugin tool"}, "plugin"); err != nil {
+		t.Fatalf("RegisterWithSource(plugin) err=%v", err)
+	}
+	pluginSourceOK := false
+	for _, ti := range m.List() {
+		if ti.Name == "plugin.handle.bar" && ti.Source == "plugin" {
+			pluginSourceOK = true
+		}
+	}
+	if !pluginSourceOK {
+		t.Errorf("plugin.handle.bar 未标 Source=plugin in List")
+	}
+}
+
+// TestRegisterWithSourceRejectsUnknownSource source 超出 {builtin|plugin|mcp} 应被拒绝.
+func TestRegisterWithSourceRejectsUnknownSource(t *testing.T) {
+	m := buildTestManager(t)
+	err := m.RegisterWithSource(echoTool{name: "weird.tool", desc: "should reject"}, "weird_source")
+	if err == nil {
+		t.Fatalf("RegisterWithSource(weird) 应该报 ErrInvalidToolDef, 但返 nil")
+	}
+	if !errors.Is(err, ErrInvalidToolDef) {
+		t.Errorf("err=%v, want ErrInvalidToolDef", err)
+	}
+	if !strings.Contains(err.Error(), "weird_source") {
+		t.Errorf("err=%v should mention 'weird_source'", err)
+	}
+	if _, err := m.Get("weird.tool"); err == nil {
+		t.Errorf("weird.tool 不应被注册")
 	}
 }

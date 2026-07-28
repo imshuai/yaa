@@ -70,7 +70,9 @@ func NewManager(
     logger *slog.Logger,
 ) (*Manager, error)
 
-func (m *Manager) Register(tool Tool, cfg config.ToolConfig, source string) error
+func (m *Manager) Register(tool Tool) error
+func (m *Manager) RegisterWithSource(tool Tool, source string) error
+// source ∈ {builtin|plugin|mcp}; Register(t) 等价于 RegisterWithSource(t, "builtin").
 func (m *Manager) Unregister(name string) error
 func (m *Manager) Get(name string) (Tool, error)
 func (m *Manager) List() []ToolInfo
@@ -107,12 +109,12 @@ Runtime 启动 binding 校验必须对每个 Agent 的当前 definitions 执行�
 
 ## 3. 注册与 enabled
 
-启动顺序固定为 builtin -> plugin proxy -> MCP proxy。`Register`：
+启动顺序固定为 builtin -> plugin proxy -> MCP proxy。`Register(t)` 与 `RegisterWithSource(t, source)` 共用同一注册路径；source 必须位于 `{builtin|plugin|mcp}`，否则 `ErrInvalidToolDef`。未指定的 `Register(t)` 等价于 `source="builtin"`。`Register` 与 `RegisterWithSource` 一起要求：
 
 1. 校验 canonical name 是合法 UTF-8、1..256 bytes 且无 Unicode 控制字符，并校验 source、description 和 Parameters JSON Schema；
 2. 拒绝重复 name；
 3. 深拷贝 schema、配置和 options；
-4. 无论 `cfg.Enabled` 为何都写入注册表。
+4. 无论 `cfg.Enabled` 为何都写入注册表，记录 source 到 `ToolInfo.Source`。
 
 保留 disabled 条目使 Config、`ToolInfo` 和 `ErrToolDisabled` 的语义一致。`Unregister` 只用于 Plugin/MCP Manager 永久停止后的 catalog 清理；暂时断线只把稳定 Proxy 置 unavailable，builtin 不在运行时注销。
 

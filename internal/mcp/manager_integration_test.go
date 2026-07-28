@@ -150,6 +150,21 @@ func TestManagerToolProxyCallViaToolManager(t *testing.T) {
 	if result.IsError {
 		t.Errorf("is_error=true want false")
 	}
+	// 验证 ToolManager.List() 所见 MCP Tool 的 Source 字段 = "mcp"
+	// (docs/tool/manager.md §2.1 §3 + docs/mcp/integration.md §1; 通过 RegisterWithSource 注册路径).
+	tmTools := tm.List()
+	seenMCP := false
+	for _, ti := range tmTools {
+		if ti.Name == "mcp.fake.alpha" {
+			seenMCP = true
+			if ti.Source != "mcp" {
+				t.Errorf("ToolManager.List mcp.fake.alpha Source=%q, want \"mcp\" (经 RegisterWithSource 注册)", ti.Source)
+			}
+		}
+	}
+	if !seenMCP {
+		t.Errorf("ToolManager.List 应含 mcp.fake.alpha, 但没找到; total=%d", len(tmTools))
+	}
 }
 
 // 构造一个 command 不存在的 stdio auto_start server → Prepare 不返错，

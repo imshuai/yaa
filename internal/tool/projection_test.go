@@ -166,3 +166,48 @@ func TestProjectionHistoryOnlyNameNonExecutable(t *testing.T) {
 
 // 确保 json 仍被使用（编译需要）。
 var _ = json.RawMessage(nil)
+
+// TestToToolDefsExposesMCPToolAsFunction 验证 MCP canonical 命前缀 (mcp.<server>.<tool>) 的 Tool
+// 通过 ToToolDefs 进入 ChatRequest.Tools Function 列表 (docs/mcp/checklist.md §9 "与 Provider 集成
+// — MCP Tool 作为 Function 暴露给 LLM" + docs/mcp/integration.md §1 "Yaa! Tool 是统一抽象").
+// 不启动真实 MCP Server; MCP canonical 名字直接 Register 后走 ToolManager.Schema/Name/Description,
+// Agent AllowAll, history empty → defs 列表必含 mcp.srv.alpha 的 alias.
+func TestToToolDefsExposesMCPToolAsFunction(t *testing.T) {
+	m := buildTestManager(t)
+	canon := "mcp.srv.alpha"
+	if err := m.RegisterWithSource(echoTool{name: canon, desc: "remote MCP tool"}, "mcp"); err != nil {
+		t.Fatalf("register mcp tool: %v", err)
+	}
+	p := mustProj(t, m, "a1", nil)
+	defs := p.Defs()
+	found := false
+	for _, d := range defs {
+		if d.Type != "function" {
+			t.Errorf("ToolDef Type=%q want function", d.Type)
+			continue
+		}
+		// canonical 含点号 -> hash alias (provider-safe); ResolveExecutable 通过 alias 可返 canonical.
+		if alias, ok := p.ResolveExecutable(d.Function.Name); ok && alias == canon {
+			found = true
+			if d.Function.Description != "remote MCP tool" {
+				t.Errorf("Function.Description = %q, want \"remote MCP tool\"", d.Function.Description)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("defs 不含 MCP canonical %q 作为 Function. defs=%+v", canon, defs)
+	}
+	// ListForAgent 也应把它列出 (and Source="mcp").
+	listed := false
+	for _, ti := range m.ListForAgent("a1") {
+		if ti.Name == canon {
+			listed = true
+			if ti.Source != "mcp" {
+				t.Errorf("ListForAgent mcp Source=%q, want \"mcp\"", ti.Source)
+			}
+		}
+	}
+	if !listed {
+		t.Errorf("ListForAgent 未含 %q (MCP Tool 不进 Agent 投影, 与 Session 集成 断言失败)", canon)
+	}
+}

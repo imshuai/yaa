@@ -117,8 +117,26 @@ func NewManager(deps Dependencies) (*Manager, error) {
 	return m, nil
 }
 
-// Register 注册一个 Tool（canonical name 来自 Tool.Name()）。
+// 校验 source 枚举. 任何 plugin/mcp 注册器必须显式进入该集合; builtin 是默认.
+// ponytail: 单点声明避免 Register/RegisterWithSource 不同步误收 symbol.
+var validToolSources = map[string]struct{}{
+	"builtin": {},
+	"plugin":  {},
+	"mcp":     {},
+}
+
+// Register 注册一个 Tool（canonical name 来自 Tool.Name()），source 默认记为 "builtin"
+// (docs/tool/manager.md §3). 等价于 RegisterWithSource(t, "builtin").
 func (m *Manager) Register(t Tool) error {
+	return m.RegisterWithSource(t, "builtin")
+}
+
+// RegisterWithSource 注册一个 Tool 并显式记录其 source (builtin|plugin|mcp).
+// docs/tool/manager.md §73 §2.1 §3: source 字段决定 ToolInfo.Source; 其它路径与 Register 一致.
+func (m *Manager) RegisterWithSource(t Tool, source string) error {
+	if _, ok := validToolSources[source]; !ok {
+		return fmt.Errorf("%w: invalid source %q", ErrInvalidToolDef, source)
+	}
 	name := t.Name()
 	if !isValidToolName(name) {
 		return fmt.Errorf("%w: %q", ErrInvalidToolName, name)
@@ -143,9 +161,8 @@ func (m *Manager) Register(t Tool) error {
 		// 未被 config 预定义（plugin/mcp 通常如此），按默认启用。
 		m.configs[name] = config.ToolConfig{Enabled: true, Options: map[string]any{}}
 	}
-	if _, sourceOk := m.source[name]; !sourceOk {
-		m.source[name] = "builtin"
-	}
+	// 显式覆盖 source 为 caller 指定值; config 预定义的 builtin 字段从这里以真实 source 前瞻.
+	m.source[name] = source
 	return nil
 }
 

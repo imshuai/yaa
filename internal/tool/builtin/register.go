@@ -43,7 +43,7 @@ func RegisterBuiltin(m *tool.Manager, cfg *config.Config) error {
 		if err != nil {
 			return fmt.Errorf("tool: construct builtin %q: %w", r.canonical, err)
 		}
-		if err := m.Register(t); err != nil {
+		if err := m.RegisterWithSource(t, "builtin"); err != nil {
 			return fmt.Errorf("tool: register builtin %q: %w", r.canonical, err)
 		}
 	}
@@ -61,7 +61,7 @@ func RegisterMCPIntrospection(m *tool.Manager, cfg *config.Config, mcpMgr *mcp.M
 		return nil // v1 兼容: MCP 子系统未启用时该 tool 也不注册 (调用方调 Get 返 ErrToolNotFound).
 	}
 	t := NewMCPListTool(mcpMgr)
-	if err := m.Register(t); err != nil {
+	if err := m.RegisterWithSource(t, "builtin"); err != nil {
 		return fmt.Errorf("tool: register builtin %q: %w", t.Name(), err)
 	}
 	return nil

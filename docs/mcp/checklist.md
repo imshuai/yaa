@@ -117,8 +117,8 @@ v1 副债：listTools 严格 DTO 的 DisallowUnknownFields（当前 request Unma
 
 - [x] 与 Tool Manager 集成 — Prepare 调 m.tm.Register(MCPToolProxy) 注册每个发现的 Tool；Tools(name) 返 ToolInfo 深拷贝给调用方
 - [x] MCP Tool Proxy 在 Skill / Config.Activate 之前注册 — Runtime 启动序 MCP Prepare 阶段同步完成（internal/runtime §Prepare 先于 Skill Load 与 Activate）
-- [ ] 与 Session 集成（MCP Tool 在 Session 上下文中可用）
-- [ ] 与 Provider 集成（MCP Tool 作为 Function 暴露给 LLM）
+- [x] 与 Session 集成（MCP Tool 在 Session 上下文中可用）
+- [x] 与 Provider 集成（MCP Tool 作为 Function 暴露给 LLM）
 - [x] Remote API: `GET /api/v1/mcp/servers` — 列出 MCP Server (handler handleListMCPServers + mcpServerListData{items}; Manager.List 投影; routes 已注册; 测试 TestMCPEndpointsReturn200And404)
 - [x] Remote API: `GET /api/v1/mcp/servers/:name` — 获取 MCP Server 详情 (ServerDetail = ServerStatus 嵌入 + Tools []tool.ToolInfo; Manager.Detail 一次拼装; handler 返 ServerDetail 非 ServerStatus; 测试 TestMCPEndpointsDetailWithTools 覆盖 wire 投影)
 - [x] Remote API 不提供 MCP Server 动态 CRUD 或直接 Tool 调用 (handler 只 GET 只读; 无 POST/PUT/DELETE 路由)
