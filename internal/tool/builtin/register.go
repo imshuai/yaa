@@ -47,6 +47,14 @@ func RegisterBuiltin(m *tool.Manager, cfg *config.Config) error {
 			return fmt.Errorf("tool: register builtin %q: %w", r.canonical, err)
 		}
 	}
+	// config_query 依赖 current cfg snapshot (RedactedView); 与 Runtime 启动序无前置依赖, 同 RegisterBuiltin 内.
+	if t, err := NewConfigQueryTool(cfg); err == nil {
+		if err := m.RegisterWithSource(t, "builtin"); err != nil {
+			return fmt.Errorf(`tool: register builtin "config_query": %w`, err)
+		}
+	} else {
+		return fmt.Errorf(`tool: construct builtin "config_query": %w`, err)
+	}
 	return nil
 }
 

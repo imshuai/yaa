@@ -35,7 +35,7 @@
 - [ ] File Write Tool（路径校验、创建目录）
 - [ ] File List Tool（路径校验、递归选项）
 - [ ] File Delete Tool（路径校验、安全确认）
-- [ ] Config Query Tool（完整 `config.RedactedView` 后路径查询，脱敏不可关闭）
+- [x] Config Query Tool（完整 `config.RedactedView` 后路径查询，脱敏不可关闭）— internal/tool/builtin/config_query.go: ConfigQueryTool{cfg} Name/Description/Parameters({path:string}) Execute; RedactedView 已脱敏 api_key/Header/env/options-scalar; path dot-segment + array decimal index; miss/through-scalar/non-string param → IsError=true; nil cfg 构造 panic; RegisterBuiltin 注册 + Source=builtin Enabled. Evidence: TestConfigQueryEmptyPath (api_key 原文 not in content) + PathLookupValid + PathMiss + PathThroughScalar + RejectsNonStringPath + NewConfigQueryToolRejectsNilCfg + Registered
 - [ ] Config Reload Tool（统一主配置路径、原子应用、restart_required 摘要）
 - [ ] Runtime Status Tool（版本/uptime/内存/goroutine/统计）
 - [ ] Agent List Tool（状态过滤、摘要信息）

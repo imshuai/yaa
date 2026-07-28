@@ -2583,3 +2583,42 @@ go test -count=1 -timeout 30s ./internal/planner/ -run 'TestPlanEmits|TestExecut
 - 项目核心模块 (agent/api/auth/config/context/logging/mcp/planner/session/skill/storage/tool/runtime/metrics) 已基本完成, 各模块 checklist 大多闭合.
 - Phase 4 剩余: docs/plugin/checklist 52 项 (Plugin 系统从零开始, Protobuf IDL/SDK + 进程外 RPC 大模块).
 - Phase 5: docs/tool/checklist §14.5 (Prometheus 指标已开始落但 Remote API 事件推送未完) + 全局 hot-reload watcher + 优雅关闭 + 性能优化 + Windows 7 兼容 + 文档完善.
+
+## progress #37 — 内置 Tool: config_query (docs/tool/config-tools.md §2, §14.2)
+
+### 改动
+- `internal/tool/builtin/config_query.go` (新建): ConfigQueryTool{cfg *config.Config} 实现 tool.Tool 接口.
+  - Name="config_query" / Description (LLM 识别用) / Parameters schema `{path:string,default:""}` + additionalProperties:false.
+  - Execute: params 取 path (string; 非字符串 → IsError=true) → config.RedicatedView(cfg) → 按 dot-segment 路径遍历 (数组 decimal index) → Marshal 文本返 Content. 空 path 返完整脱敏视图.
+  - 脱敏不可关闭: 不接受 redact_secrets=false; RedactedView 已处理 api_key/Header/env/options scalar.
+  - lookupPath helper (stdlib strings.Split + strconv.Atoi): 未命中字段 / 越界下标 / 穿过标量 → 返 error (调用方映射 ToolResult{IsError:true}).
+  - nil cfg 构造返 error (NewConfigQueryTool).
+- `internal/tool/builtin/register.go`: RegisterBuiltin 末尾加 NewConfigQueryTool(cfg) + RegisterWithSource(t, "builtin"); 与现有 builtin 同源.
+- `internal/tool/builtin/config_query_test.go` (新建): 6 测试覆盖 (EmptyPath api_key 原文不出现 / PathLookupValid log.level=info + log object / PathMiss / PathThroughScalar / RejectsNonStringPath / Rejects nil cfg / Registered via RegisterBuiltin).
+
+### Evidence (docs/tool/config-tools.md §2 全规约对照)
+- v1 §1 边界: 只读 config_query + config_reload (本 commit 只做 query, reload 留 Phase 5 与 ReloadManager 同做).
+- §2 schema 必要字段 path: ✅.
+- §2 "RedactedView 失败是硬错误" ✅ (返 tool.ToolResult{}, fmt.Errorf 包硬错).
+- §2 "未知字段/越界下标/穿过标量返 ToolResult{IsError:true}" ✅.
+- §2 "脱敏不可关闭" ✅ (不接受 redact_secrets 参数).
+- §2 "返回内容是 JSON object/array/scalar 的编码文本" ✅ (json.Marshal target).
+
+### 决策记录
+- **不依赖 ReloadManager**: config_query 只取 cfg 即 Runtime 启动期 load 的 Effective Config (本 tool 构造时由 Runtime 传入), RedactedView 同步 snapshot. ReloadManager 是 Phase 5 任务, 与 config_reload Tool 一起做更合理, 但 config_query 不应被 Phase 5 阻塞 (PhaseConfig core capability).
+- **stdlib path traversal 不引第三方 jsonpath**: docs §2 "v1 不实现转义" — path 字段名本身不含 point, strings.Split('.') 即足够. Ponytail ladder 第 3 档 stdlib 解决.
+- **RegisterBuiltin 内注册 config_query 而非单独 Register 函数**: config_query 走通用 RegisterWithSource("builtin") 不需要 mcpMgr 等额外依赖, 与 shell/http/file 同序. 不引入 RegisterMCPIntrospection 风格的特例函数.
+- **test 不引 strings import 简单 substring 用 containsStr**: 避免 strings import 与测试文件其它 import 冲突; Ponytail 自实现一行替代.
+- **现有 internal/api/config_handler Remote API /api/v1/config 是另一条路径**: 远端 GET HTTP; config_query 是 LLM Tool (经 ToolManager.Execute). 两路径都走 RedactedView 共享脱敏逻辑, docs §2 与 docs/api/INDEX.md 各自规约.
+
+### 验证
+```
+go vet ./... && go build ./...   # OK
+go test -count=1 -timeout 300s ./...   # 22 包全绿
+go test -count=1 -timeout 30s ./internal/tool/builtin/ -run 'TestConfigQuery' -v   # 7 PASS (含 Registered)
+```
+
+### 下一步
+- §14.2 内置 Tool 剩余: file_write/file_list/file_delete (file_test.go 已有但 checklist 未勾, 需 audit) + config_reload (依赖 Phase 5 ReloadManager) + runtime_status + agent_list/inspect + session_list/inspect + tool_list + skill_list + provider_list (introspection 10 个).
+- §14.1 Tool Manager checklist (10 项): 多数已实现未勾, audit-only task 一次 commit 推进多项.
+- §14.5 可观测性: 执行日志 + Prometheus 指标 + Remote API 事件推送 — Phase 5 与已有 metrics 框架接 (本 commit 已建 internal/metrics 框架).
