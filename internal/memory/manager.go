@@ -100,6 +100,44 @@ func NewManager(store ContentStore, em Embedder, fac VectorIndexFactory, clk Clo
 // 正式调用方不应使用此方法；仅同 monorepo 测试包通过包外 mock 来推进时间。
 func (m *Manager) ClockForTest() Clock { return m.clock }
 
+// StartCleanup 启动后台周期 cleanup goroutine, 定期调用 DeleteExpired.
+// docs/memory checklist 行32: cleanup 有稳定顺序、batch 和取消.
+// interval<=0 或 batchSize<=0 表示不启用后台 cleanup (v1 可由外部显式调 DeleteExpired).
+// 幂等: 重复调用不启动多个 worker. Close 会 cancel worker 并等 workerDone.
+func (m *Manager) StartCleanup(ctx context.Context, interval time.Duration, batchSize int) {
+	if interval <= 0 || batchSize <= 0 {
+		return
+	}
+	m.lifecycleMu.Lock()
+	if m.workerCancel != nil {
+		m.lifecycleMu.Unlock()
+		return // 已启动
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	m.workerCancel = cancel
+	m.workerDone = make(chan struct{})
+	m.lifecycleMu.Unlock()
+
+	go m.cleanupWorker(workerCtx, interval, batchSize)
+}
+
+// cleanupWorker 定期执行 DeleteExpired 直到 ctx 取消或 Manager Close.
+func (m *Manager) cleanupWorker(ctx context.Context, interval time.Duration, batchSize int) {
+	defer close(m.workerDone)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// cleanup 每 tick 采样一次 now (docs/memory checklist 行52)
+			now := m.clock.Now()
+			_, _ = m.DeleteExpired(ctx, now, batchSize)
+		}
+	}
+}
+
 func (m *Manager) beginOp() error {
 	m.lifecycleMu.Lock()
 	defer m.lifecycleMu.Unlock()
@@ -307,12 +345,12 @@ func (m *Manager) Put(ctx context.Context, policy config.MemoryPolicy, item Memo
 	l := m.agentLocks.acquire(item.AgentID)
 	defer m.agentLocks.release(l)
 
-	return m.putLocked(ctx, policy, item)
+	return m.putLocked(ctx, policy, item, false)
 }
 
 // putLocked 是 Put 已持有 mutationGate.RLock + Agent keyed lock 后的内部实现。
 // 调用方负责 beginOp/inFlight 与 lock 获取/释放。
-func (m *Manager) putLocked(ctx context.Context, policy config.MemoryPolicy, item MemoryItem) (PutResult, error) {
+func (m *Manager) putLocked(ctx context.Context, policy config.MemoryPolicy, item MemoryItem, promoted bool) (PutResult, error) {
 	if err := validateItem(item); err != nil {
 		return PutResult{}, err
 	}
@@ -365,8 +403,10 @@ func (m *Manager) putLocked(ctx context.Context, policy config.MemoryPolicy, ite
 		return PutResult{}, fmt.Errorf("%w: %v", ErrMemoryStoreUnavailable, cerr)
 	}
 
-	// 事件
-	if commit.Created {
+	// 事件 (docs/memory checklist 行14: Promote 目标发 EventPromoted, 普通Put发Added/Updated)
+	if promoted {
+		m.emit(Event{Type: EventPromoted, AgentID: commit.Stored.AgentID, Layer: commit.Stored.Layer, SessionID: commit.Stored.SessionID, Key: commit.Stored.Key, Version: commit.Stored.Version, At: now})
+	} else if commit.Created {
 		m.emit(Event{Type: EventAdded, AgentID: commit.Stored.AgentID, Layer: commit.Stored.Layer, SessionID: commit.Stored.SessionID, Key: commit.Stored.Key, Version: commit.Stored.Version, At: now, Created: true})
 	} else {
 		m.emit(Event{Type: EventUpdated, AgentID: commit.Stored.AgentID, Layer: commit.Stored.Layer, SessionID: commit.Stored.SessionID, Key: commit.Stored.Key, Version: commit.Stored.Version, At: now})
@@ -929,7 +969,7 @@ func (m *Manager) Promote(ctx context.Context, policy config.MemoryPolicy, sourc
 	}
 	// 直接调用 putLocked：Promote 已持有 mutationGate + Agent keyed lock，
 	// 避免再次 acquire 导致 self-deadlock。
-	return m.putLocked(ctx, policy, target)
+	return m.putLocked(ctx, policy, target, true)
 }
 
 // Reindex 仅按 agentID 全量重建该 Agent 的全部来源索引；持 Agent keyed lock

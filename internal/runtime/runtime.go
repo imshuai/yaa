@@ -152,11 +152,18 @@ func (rt *Runtime) Start(ctx context.Context) error {
 					continue
 				}
 				if _, rErr := mmMgr.Reindex(ctx, policy, ag.ID); rErr != nil {
-					rt.logger.Warn("memory: startup reindex failed, leaving agent degraded",
+					// docs/memory/errors.md §94: fallback_to_keyword=false 时 Reindex 失败 → Runtime Not Ready
+					if !policy.Vector.FallbackToKeyword {
+						rt.rollback()
+						return fmt.Errorf("runtime: memory reindex failed for agent %s (fallback_to_keyword=false): %w", ag.ID, rErr)
+					}
+					rt.logger.Warn("memory: startup reindex failed, leaving agent degraded (fallback_to_keyword=true)",
 						"agent", ag.ID, "error", rErr)
 				}
 			}
 		}
+		// docs/memory checklist 行32: 后台周期 cleanup worker
+		mmMgr.StartCleanup(ctx, rt.cfg.Memory.ExpireInterval, rt.cfg.Memory.ExpireBatchSize)
 	} else {
 		rt.components["memory"] = "disabled"
 	}
