@@ -34,7 +34,18 @@ Endpoint 日志只记录 `scheme://host/path`，移除 userinfo、query 和 frag
 
 指标 label 不包含 request ID、Session ID、错误消息或其他高基数字段。
 
-## 3. 健康快照
+## 3. 调用链追踪
+
+若 Runtime 启用既有 trace sink，MCP 只发两类 span：
+
+```text
+mcp.list_tools           # Prepare/重连成功后的完整分页 tools/list
+mcp.call_tool            # ToolManager.Execute → MCPToolProxy → 上游 tools/call
+```
+
+Span 属性使用与指标相同的稳定字段（`server`、`tool`、`transport`）；`request_id` 只在调用方提供时附加。错误 span 记录错误类型（`transport_build` / `connect` / `initialize` / `discover` / `timeout`），不附加原始错误体、Header、Token、参数或 Tool 结果。Yaa! v1 未集成 OpenTelemetry 或其它 trace sink 时，本节不强制实现，由 Runtime 在 Phase 5 统一接入；MCP 侧的事件日志（§1）和指标（§2）已落地。
+
+## 4. 健康快照
 
 ```go
 type HealthReport struct {

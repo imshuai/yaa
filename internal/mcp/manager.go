@@ -40,6 +40,9 @@ type Manager struct {
 	logger *slog.Logger
 	tm     *tool.Manager
 
+	// metrics 在 SetMetrics 注入后非 nil; v1 不强制依赖, nil 时所有 metrics 接入点 nop.
+	metrics *mcpMetrics
+
 	// entries 是配置中声明的上游 server，列表投影源。每 entry 持有运行时状态。
 	entries []serverEntry
 
@@ -180,6 +183,11 @@ func (m *Manager) connectStdioServer(e *serverEntry) {
 		e.status.Status = StatusError
 		e.status.LastError = err.Error()
 		m.mu.Unlock()
+		// docs/mcp/observability.md §2: yaa_mcp_servers{error} 切到 error, 初始 disconnected 减 1.
+		if mm := m.metrics; mm != nil {
+			mm.serversGauge.Dec(string(StatusDisconnected), e.transport)
+			mm.serversGauge.Inc(string(StatusError), e.transport)
+		}
 		return
 	}
 	// 首 Register：本期首代必须注册稳定 Proxy 才能供 ToolManager 调用。
@@ -191,6 +199,11 @@ func (m *Manager) connectStdioServer(e *serverEntry) {
 		e.status.Status = StatusError
 		e.status.LastError = err.Error()
 		m.mu.Unlock()
+		// docs/mcp/observability.md §2: yaa_mcp_servers{error}.
+		if mm := m.metrics; mm != nil {
+			mm.serversGauge.Dec(string(StatusDisconnected), e.transport)
+			mm.serversGauge.Inc(string(StatusError), e.transport)
+		}
 		return
 	}
 	m.publishGeneration(e, handle, client, tools, 0)
@@ -286,6 +299,10 @@ func (m *Manager) registerProxies(e *serverEntry, handle *ProxyHandle, tools []M
 			return fmt.Errorf("tool %q missing description", mt.Name)
 		}
 		proxy := NewMCPToolProxy(e.name, stripServerPrefix(e.name, mt.Name), mt.Description, mt.InputSchema, toolTimeout, handle)
+		// docs/mcp/observability.md §1 §2: Proxy 注入 logger + metrics, Execute 时 emit mcp.tool.called
+		// 与 yaa_mcp_tool_calls_total{server,tool,result} + yaa_mcp_tool_call_duration_seconds.
+		localName := stripServerPrefix(e.name, mt.Name) // 远端 Tool 原始名, 不带 mcp.<server>. 前缀 (低基数 label).
+		proxy.SetObs(m.logger, m.metrics, localName)
 		// docs/tool/manager.md §73 §2.1 §3: MCP Tool source 显式 "mcp", 通过 RegisterWithSource
 		// 覆写 ToolManager.source[name] 为 "mcp", 保证 ToolInfo.Source 字段正确 (Remote API /api/v1/tools 投影).
 		if err := m.tm.RegisterWithSource(proxy, "mcp"); err != nil {
@@ -336,6 +353,11 @@ func (m *Manager) publishGeneration(e *serverEntry, handle *ProxyHandle, client 
 		"server", e.name,
 		"protocol_version", client.ProtocolVersion(),
 		"tool_count", len(tools))
+	// docs/mcp/observability.md §2: yaa_mcp_servers{status,transport} 与 yaa_mcp_tools{server}.
+	if mm := m.metrics; mm != nil {
+		mm.serversGauge.Set(1, string(StatusConnected), e.transport)
+		mm.toolsGauge.Set(int64(len(tools)), e.name)
+	}
 }
 
 // buildTransport 按 e.transport 选择 ClientTransport 实例 (docs/mcp/transport.md §3).
@@ -570,6 +592,11 @@ func (m *Manager) markGenerationFailed(e *serverEntry, handle *ProxyHandle, clie
 		"server", e.name,
 		"reason", reason,
 		"uptime_ms", uptimeMs)
+	// docs/mcp/observability.md §2: yaa_mcp_servers{error,transport} 增, yaa_mcp_tools{server}=0.
+	if mm := m.metrics; mm != nil {
+		mm.serversGauge.Set(1, string(StatusError), e.transport)
+		mm.toolsGauge.Set(0, e.name)
+	}
 	_ = client.Close()
 }
 
@@ -625,6 +652,10 @@ func (m *Manager) attemptReconnect(e *serverEntry, handle *ProxyHandle, oldGen u
 				e.status.LastError = fmt.Sprintf("reconnect attempt %d: %v", attempt, err)
 			}
 			m.mu.Unlock()
+			// docs/mcp/observability.md §2: yaa_mcp_reconnects_total{error}.
+			if mm := m.metrics; mm != nil {
+				mm.reconnectsCounter.Inc(e.name, "error")
+			}
 			continue
 		}
 		// 目录三元严格比对 (canonical name + description + canonical-marshal InputSchema).
@@ -639,6 +670,10 @@ func (m *Manager) attemptReconnect(e *serverEntry, handle *ProxyHandle, oldGen u
 				e.status.LastError = errMsg
 			}
 			m.mu.Unlock()
+			// docs/mcp/observability.md §2: yaa_mcp_reconnects_total{error} (catalog drift = 协议错).
+			if mm := m.metrics; mm != nil {
+				mm.reconnectsCounter.Inc(e.name, "error")
+			}
 			return nil, 0, nil, false
 		}
 		// Stop race: 进入 entry 锁前再确认 runtime 未停止 + 代际未变.
@@ -678,6 +713,12 @@ func (m *Manager) attemptReconnect(e *serverEntry, handle *ProxyHandle, oldGen u
 			"server", e.name,
 			"protocol_version", pv,
 			"tool_count", len(newTools))
+		// docs/mcp/observability.md §2: yaa_mcp_servers{connected}, yaa_mcp_tools, yaa_mcp_reconnects_total{success}.
+		if mm := m.metrics; mm != nil {
+			mm.serversGauge.Set(1, string(StatusConnected), e.transport)
+			mm.toolsGauge.Set(int64(len(newTools)), e.name)
+			mm.reconnectsCounter.Inc(e.name, "success")
+		}
 		return newClient, newGen, e.listChanged, true
 	}
 }

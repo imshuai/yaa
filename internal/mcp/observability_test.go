@@ -4,8 +4,11 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/imshuai/yaa/internal/config"
+	"github.com/imshuai/yaa/internal/metrics"
+	"github.com/imshuai/yaa/internal/tool"
 
 	"golang.org/x/exp/slog"
 )
@@ -166,5 +169,139 @@ func TestManagerEmitsErrorEventOnBadStdioCommand(t *testing.T) {
 	}
 	if !wantErr {
 		t.Errorf("missing mcp.server.error event; msgs=%v", msgs)
+	}
+}
+
+// TestManagerMetricsExposeConnectEvents 验证 docs/mcp/observability.md §2 两个指标在 stdio
+// auto_start 启动后实际被更新: yaa_mcp_servers{connected,stdio}=1 与 yaa_mcp_tools{fake3}=2.
+func TestManagerMetricsExposeConnectEvents(t *testing.T) {
+	r := metrics.NewRegistry()
+	tm := buildToolManager(t)
+	cfg := &config.MCPConfig{Servers: []config.MCPServerConfig{fakeStdioServerConfig(t, "fake3", true)}}
+	m, err := NewManager(cfg, tm, nil)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer func() {
+		_ = m.Stop(context.Background())
+		<-m.Done()
+	}()
+	m.SetMetrics(r)
+	if err := m.Prepare(); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	st, ok := m.Get("fake3")
+	if !ok || st.Status != StatusConnected {
+		t.Fatalf("want fake3 Connected, got %v ok=%v", st, ok)
+	}
+	// SetMetrics 后 axon 断言各种清单
+	// yaa_mcp_servers: 初始所有都是 Disconnected; Prepare 成功 fake3 切到 Connected
+	serversGauge := r.Get("yaa_mcp_servers")
+	if serversGauge == nil {
+		t.Fatalf("yaa_mcp_servers not registered")
+	}
+	g, ok := serversGauge.(*metrics.Gauge)
+	if !ok {
+		t.Fatalf("yaa_mcp_servers type=%T", serversGauge)
+	}
+	if v := g.Value(string(StatusConnected), "stdio"); v != 1 {
+		t.Errorf("yaa_mcp_servers{connected,stdio}=%d want 1", v)
+	}
+
+	toolsGauge := r.Get("yaa_mcp_tools").(*metrics.Gauge)
+	if v := toolsGauge.Value("fake3"); v != 2 {
+		t.Errorf("yaa_mcp_tools{fake3}=%d want 2", v)
+	}
+}
+
+// TestManagerMetricsExposeReconnectErrorEvent 验证 docs/mcp/observability.md §2
+// broken binary 启动后: yaa_mcp_servers{error,stdio}=1; 不再触发 connected/tool_count.
+func TestManagerMetricsExposeReconnectErrorEvent(t *testing.T) {
+	r := metrics.NewRegistry()
+	cfg := &config.MCPConfig{
+		Servers: []config.MCPServerConfig{{
+			Name:      "broken2",
+			Transport: "stdio",
+			Command:   "/nonexistent/binary",
+			AutoStart:  true,
+		}},
+		Reconnect: config.MCPReconnectConfig{Enabled: false, InitialDelay: 10 * 1e9, MaxDelay: 10 * 1e9},
+	}
+	m, err := NewManager(cfg, buildToolManager(t), nil)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer func() {
+		_ = m.Stop(context.Background())
+		<-m.Done()
+	}()
+	m.SetMetrics(r)
+	if err := m.Prepare(); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	st, ok := m.Get("broken2")
+	if !ok || st.Status != StatusError {
+		t.Fatalf("want broken2 Error, got %v ok=%v", st, ok)
+	}
+	serversGauge := r.Get("yaa_mcp_servers").(*metrics.Gauge)
+	// 初始 Disconnected Set(1) 在 SetMetrics 时刷入
+	if v := serversGauge.Value(string(StatusDisconnected), "stdio"); v != 0 {
+		t.Errorf("yaa_mcp_servers{disconnected,stdio}=%d want 0 (Prepare 应切到 connected/error)", v)
+	}
+	if v := serversGauge.Value(string(StatusError), "stdio"); v != 1 {
+		t.Errorf("yaa_mcp_servers{error,stdio}=%d want 1", v)
+	}
+}
+
+// TestManagerMetricsToolCallCaptured 验证 docs/mcp/observability.md §1 §2:
+// 真实 stdio auto_start + ToolManager.Execute 远端调用触发 mcp.tool.called 事件 +
+// yaa_mcp_tool_calls_total{server,tool,result="success"} Counter 与
+// yaa_mcp_tool_call_duration_seconds{server,tool} Histogram 被观测.
+func TestManagerMetricsToolCallCaptured(t *testing.T) {
+	requirePython3(t)
+	th := &capturingHandler{level_: slog.LevelInfo}
+	logger := slog.New(th)
+	r := metrics.NewRegistry()
+	tm := buildToolManager(t)
+	cfg := &config.MCPConfig{Servers: []config.MCPServerConfig{fakeStdioServerConfig(t, "fake4", true)}}
+	m, err := NewManager(cfg, tm, logger)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer func() {
+		_ = m.Stop(context.Background())
+		<-m.Done()
+	}()
+	m.SetMetrics(r)
+	if err := m.Prepare(); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	scope := tool.ExecutionScope{AgentID: "a1"}
+	if _, err := tm.Execute(ctx, scope, "mcp.fake4.alpha", map[string]any{}); err != nil {
+		t.Fatalf("ToolManager.Execute: %v", err)
+	}
+	// 断言日志 mcp.tool.called 已 emit, 字段 server=fake4 tool=alpha
+	th.mu.Lock()
+	msgs := append([]string(nil), th.msgs...)
+	attrs := append([]map[string]string(nil), th.attrs...)
+	th.mu.Unlock()
+	seenCalled := false
+	for i, msg := range msgs {
+		if msg == "mcp.tool.called" && attrs[i]["server"] == "fake4" && attrs[i]["tool"] == "alpha" {
+			seenCalled = true
+		}
+	}
+	if !seenCalled {
+		t.Errorf("missing mcp.tool.called event in logs; msgs=%v", msgs)
+	}
+	callCounter := r.Get("yaa_mcp_tool_calls_total").(*metrics.Counter)
+	if v := callCounter.Value("fake4", "alpha", "success"); v != 1 {
+		t.Errorf("yaa_mcp_tool_calls_total{fake4,alpha,success}=%d want 1", v)
+	}
+	durHist := r.Get("yaa_mcp_tool_call_duration_seconds").(*metrics.Histogram)
+	if c := durHist.Count("fake4", "alpha"); c != 1 {
+		t.Errorf("yaa_mcp_tool_call_duration_seconds count(fake4,alpha)=%d want 1", c)
 	}
 }

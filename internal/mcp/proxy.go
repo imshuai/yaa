@@ -3,11 +3,14 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/imshuai/yaa/internal/tool"
+
+	"golang.org/x/exp/slog"
 )
 
 // ProxyHandle 是同一上游所有稳定 Proxy 共享的 handle。
@@ -45,6 +48,13 @@ type MCPToolProxy struct {
 	schema      json.RawMessage
 	timeout     time.Duration // 0 表示只使用 Tool Manager 的 caller deadline
 	handle      *ProxyHandle
+
+	// 可选 observability 注入 (SetObs): logger 用于 docs §1 mcp.tool.called 事件;
+	// m.okMetrics 用于 docs §2 yaa_mcp_tool_calls_total{server,tool,result}
+	// 与 yaa_mcp_tool_call_duration_seconds{server,tool}. nil 时接入点 nop.
+	logger      *slog.Logger
+	metrics     *mcpMetrics
+	localName   string // 远端 original tool 名 (docs §1 tool 字段; 低基数 label)
 }
 
 // NewMCPToolProxy 构造稳定 Proxy。handle 不可为 nil；description 不可为空（由 Manager 校验）。
@@ -58,6 +68,18 @@ func NewMCPToolProxy(server, remoteName, description string, schema json.RawMess
 		timeout:     timeout,
 		handle:      handle,
 	}
+}
+
+// SetObs 注入 observability 依赖 (docs/mcp/observability.md §1 §2).
+// logger nil → 用 slog.Default(); metrics nil → metrics 接入点 nop (v1 不强制);
+// localName 是远端原始 tool 名 (不带 mcp.<server>. 前缀), 作为 docs §1 tool 字段 与 §2 metric label.
+func (p *MCPToolProxy) SetObs(logger *slog.Logger, mm *mcpMetrics, localName string) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	p.logger = logger
+	p.metrics = mm
+	p.localName = localName
 }
 
 // Name 返回 canonical Yaa! Tool name: mcp.<server>.<remote>。
@@ -96,6 +118,7 @@ func (p *MCPToolProxy) Execute(ctx context.Context, scope tool.ExecutionScope, p
 		}
 	}
 	defer stopTimeout()
+	beginAt := time.Now()
 	result, err := client.CallTool(callCtx, p.remoteName, params)
 	if ctx.Err() != nil {
 		return tool.ToolResult{}, context.Cause(ctx)
@@ -103,7 +126,31 @@ func (p *MCPToolProxy) Execute(ctx context.Context, scope tool.ExecutionScope, p
 	if callCtx.Err() != nil {
 		return tool.ToolResult{}, context.Cause(callCtx)
 	}
-	return toToolResult(result, err)
+	// docs/mcp/observability.md §1: mcp.tool.called (server, tool, duration_ms, is_error)
+	// docs §2: yaa_mcp_tool_calls_total{server,tool,result} + yaa_mcp_tool_call_duration_seconds.
+	duration := time.Since(beginAt)
+	result2, terr := toToolResult(result, err)
+	isErr := terr != nil
+	rtype := "success"
+	switch {
+	case err == ErrMCPToolTimeout || errors.Is(err, context.DeadlineExceeded) || (callCtx.Err() != nil && context.Cause(callCtx) == ErrMCPToolTimeout):
+		rtype = "timeout"
+	case isErr:
+		rtype = "error"
+	}
+	if p.logger != nil {
+		p.logger.Info("mcp.tool.called",
+			"server", p.server,
+			"tool", p.localName,
+			"duration_ms", duration.Milliseconds(),
+			"is_error", isErr)
+	}
+	if mm := p.metrics; mm != nil {
+		mm.toolCallsCounter.Inc(p.server, p.localName, rtype)
+		mm.toolCallDurHist.Observe(duration.Seconds(), p.server, p.localName)
+	}
+	// 错误信息不上报 metrics label (docs §2 末段: label 不含错误消息等高基数).
+	return result2, terr
 }
 
 // toToolResult 把 MCP CallToolResult + wire err 映射为 Yaa! ToolResult

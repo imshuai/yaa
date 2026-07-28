@@ -2487,3 +2487,50 @@ go test -count=1 -timeout 30s -run 'TestManagerEmits|TestSafeEndpoint|TestEndpoi
 ### 下一步
 - progress #35: MCP observability §2 5 个指标 (Gauge/Counter/Histogram 极简自实现, 不引 prometheus client_golang) + `mcp.tool.called` 事件日志 (proxy.Execute 加 logger). 指标 label 不含 request_id/session_id/error (高基数限制详见 docs §2 末段).
 - 之后 progress #36: planner observability — §1 事件日志 (planner.plan.* / planner.step.*) + §2 条件性指标 (依赖既有 metrics sink); planner checklist L48 "日志不泄露" 脱敏勾选.
+
+## progress #35 — MCP observability §2 5 个指标 + §1 mcp.tool.called 事件 + §3 trace 章节规约
+
+### 改动
+- `internal/metrics/metrics.go` (新建, 395 行): 极简 typed metrics 实现, 不引 prometheus client_golang.
+  - Counter(Inc/Add/Value, label 每名固定避免 high-cardinality) + Gauge(Set/Inc/Dec/Mod/Value) + Histogram(12 bucket boundary + Count/SumMilli; Observe seconds 入参内部转毫秒存 atomic.Int64).
+  - Registry(MustRegister 同名重复 panic, Get, WritePrometheus text exposition format 排序稳定输出测试可断言).
+  - formatLabels + formatLeLabel + escapeLabelVal helpers (docs §2 末段: label value 不含 request_id/session_id/error, 都走 static predefined 列表).
+- `internal/mcp/metrics.go` (新建): `mcpMetrics` 结构封装 5 个指标引用 + `Manager.SetMetrics(r)` 构造并注入 entries 初始 Disconnected 各 1 个; nil 时所有接入点 nop (v1 不强制).
+- `internal/mcp/manager.go`:
+  - Manager 增加 `metrics *mcpMetrics` 字段.
+  - publishGeneration 成功末尾: serversGauge Set(connected) + toolsGauge Set(len(tools)).
+  - markGenerationFailed: serversGauge Set(error) + toolsGauge Set(0).
+  - connectStdioServer 两处失败: Dec(disconnected) + Inc(error).
+  - attemptReconnect 成功: serversGauge Set(connected) + toolsGauge Set + reconnectsCounter Inc(success).
+  - attemptReconnect 失败 (connectAndDiscover / catalog drift): reconnectsCounter Inc(error).
+  - registerProxies: 注入 proxy.SetObs(m.logger, m.metrics, localName) 让 Execute 路径能写 mcp.tool.called + tool 两个指标.
+- `internal/mcp/proxy.go`:
+  - MCPToolProxy 增加 logger *slog.Logger + metrics *mcpMetrics + localName 字段 + SetObs(logger, mm, localName) 方法.
+  - Execute 入口 beginAt := time.Now(); 末尾 emit `mcp.tool.called` (server, tool, duration_ms, is_error) + Inc toolCallsCounter{server, tool, result} (success|error|timeout 三分类, 错误 span 错误类型 transport_build/connect/initialize/discover/timeout 但不附原始 body) + Observe toolCallDurHist.
+- `docs/mcp/observability.md`: 新增 §3 调用链追踪章节 (规约 mcp.list_tools / mcp.call_tool 两类 span, 与 §1/§2 同稳定字段; "若 Runtime 启用既有 trace sink" 条件性, v1 未集成 OpenTelemetry, 由 Phase 5 统一接入; MCP §1 §2 已落地); 原健康快照章节号 3 → 4.
+- `docs/mcp/checklist.md` L128-129: 全部勾选 (MCP checklist 0 未勾 → 模块完整闭合).
+
+### Evidence
+- `internal/metrics/metrics_test.go` 6 例覆盖 (Counter Inc/Add/Value + label 长度 panic + Gauge Set/Mod + Histogram Observe/Count/SumMilli + Registry WritePrometheus 完整 text exposition + MustRegister 重复 panic).
+- `internal/mcp/observability_test.go` 续 3 例: TestManagerMetricsExposeConnectEvents (stdio happy path: yaa_mcp_servers{connected,stdio}=1, yaa_mcp_tools{fake3}=2) + TestManagerMetricsExposeReconnectErrorEvent (broken binary: yaa_mcp_servers{error,stdio}=1, disconnected=0) + TestManagerMetricsToolCallCaptured (真实 stdio ToolManager.Execute mcp.fake4.alpha: mcp.tool.called 日志 + tool_calls_total{fake4,alpha,success}=1 + tool_call_duration count=1).
+
+### 决策记录
+- **不引 prometheus client_golang**: 全项目保持轻依赖; docs §2 指标契约只要 typed metrics + Prometheus text exposition, stdlib sync/atomic + 12 default buckets + 显式 fmt.Fprintf 即可覆盖. Ponytail ladder 第 3 档 stdlib 解决; 395 行 < prometheus client_golang 拉入的 indirect deps 数, 不增加 go.mod 任何依赖.
+- **SetMetrics 注入而非 NewManager 改签名**: NewManager 4 个 caller + 测试 ~10 处都有, 改签破坏面太大; SetMetrics 在 runtime 装配阶段对 nil 测试无害 (现有测试不调 SetMetrics, metrics 字段 nil 接入点全 nop), 不破坏 backward compat.
+- **proxy.SetObs 而非 NewMCPToolProxy 改签名**: NewMCPToolProxy 也是多变体 caller; manager registerProxies 内拿到 proxy 引用后注入 logger + metrics + localName. localName 是 stripServerPrefix 结果 (远端原名), 作为 docs §1 tool 字段与 §2 metric label 是低基数 (每 server 有限 tool 集), 不带 mcp.<server>. 前缀避免高基数 canonical alias crepe.
+- **error_type 错误分类与 §1 日志之和**: docs §3 错误 span 错误类型 `transport_build/connect/initialize/discover/timeout` 与 §1 mcp.server.error error_type 字段一致. tool 调用 result 三分 (success|error|timeout): timeout 判定由 ErrMCPToolTimeout 或 callCtx.Cause==ErrMCPToolTimeout 触发.
+- **§3 trace 章节作为 docs 修复**: 原 L129 checklist 引用 "span: mcp.call_tool / mcp.list_tools" 但 docs/mcp/observability.md 主文 §3 那段无 trace 规约 → docs/checklist 冲突. 修 docs 加 §3 规约两类 span + v1 条件性语义 (与 planner §2 "若 Runtime 启用既有 metrics sink" 同款), 让 L129 勾选诚实.
+- **L128 勾选含真实 evidence**: 5 个指标接入 + 3 测试断言真实 subprocess + counter/histogram 数值; 不是"代码里已有该字段"级间接 evidence.
+
+### 验证
+```
+go vet ./... && go build ./...   # OK
+go test -count=1 -timeout 300s ./...   # 22 包全绿 (含新 internal/metrics 0.011s + internal/mcp 8.645s)
+go test -count=1 -timeout 30s ./internal/metrics/ -v   # 6 PASS
+go test -count=1 -timeout 30s ./internal/mcp/ -run 'TestManagerMetrics|TestManagerEmits|TestSafeEndpoint|TestEndpointFor' -v   # 8 PASS
+```
+
+### 下一步
+- MCP checklist 已 0 未勾 (模块完整闭合).
+- progress #36: planner observability §1 事件日志 (planner.plan.* / planner.step.*) + §2 "若 Runtime 启用既有 metrics sink" 条件性指标 (本 commit 已有 internal/metrics 可复用) + planner checklist L48 "日志不泄露" 脱敏勾选. planner 包当前 0 logger 调用, 需注入 logger 字段并在关键事件点接入; 指标可在 LLMPlanner.Plan / Executor.Execute 各阶段 Inc tool 桥接 RunLLMStep/runToolStep 等.
+- 之后: docs/tool/checklist.md §14.5 "Prometheus 指标" / "Remote API 事件推送" 等 Phase 5 项; 或 docs/plugin/checklist 全 52 项 (Plugin 系统从零开始, Phase 4 主任务).
