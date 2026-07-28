@@ -170,3 +170,71 @@ func TestFileReadBase64(t *testing.T) {
 		t.Fatalf("base64=%q", r.Content)
 	}
 }
+
+// TestFileListRecursive 测试 recursive=true 全量遍历子目录文件 + 子目录以分隔符结尾标记.
+func TestFileListRecursive(t *testing.T) {
+	d := tmpDir(t)
+	// d/b.txt
+	_ = os.WriteFile(filepath.Join(d, "b.txt"), []byte("1"), 0o644)
+	// d/sub/c.txt
+	_ = os.MkdirAll(filepath.Join(d, "sub"), 0o755)
+	_ = os.WriteFile(filepath.Join(d, "sub", "c.txt"), []byte("2"), 0o644)
+	// d/sub/deep/d.txt
+	_ = os.MkdirAll(filepath.Join(d, "sub", "deep"), 0o755)
+	_ = os.WriteFile(filepath.Join(d, "sub", "deep", "d.txt"), []byte("3"), 0o644)
+
+	list, _ := NewFileList(fileCfgWithAllowed([]string{d}, nil))
+	r, err := list.Execute(context.Background(), tool.ExecutionScope{AgentID: "a"}, map[string]any{
+		"path":      d,
+		"recursive": true,
+	})
+	if err != nil {
+		t.Fatalf("Execute err: %v", err)
+	}
+	if r.IsError {
+		t.Fatalf("IsError unexpected: %s", r.Content)
+	}
+	var got []string
+	if jerr := json.Unmarshal([]byte(r.Content), &got); jerr != nil {
+		t.Fatalf("unmarshal: %v (%s)", jerr, r.Content)
+	}
+	// 期望: b.txt + sub/ (dir) + sub/c.txt + sub/deep/ (dir) + sub/deep/d.txt
+	want := map[string]bool{
+		"b.txt":          true,
+		"sub" + string(filepath.Separator): true,
+		filepath.Join("sub", "c.txt"):       true,
+		filepath.Join("sub", "deep") + string(filepath.Separator): true,
+		filepath.Join("sub", "deep", "d.txt"): true,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got=%v want %d items", got, len(want))
+	}
+	for _, g := range got {
+		if !want[g] {
+			t.Errorf("unexpected entry %q; got=%v", g, got)
+		}
+	}
+}
+
+// TestFileListNonRecursiveDefault 校验 recursive=false / 未传只列顶层条目.
+func TestFileListNonRecursiveDefault(t *testing.T) {
+	d := tmpDir(t)
+	_ = os.WriteFile(filepath.Join(d, "top.txt"), []byte("1"), 0o644)
+	_ = os.MkdirAll(filepath.Join(d, "inner"), 0o755)
+	_ = os.WriteFile(filepath.Join(d, "inner", "nested.txt"), []byte("2"), 0o644)
+
+	list, _ := NewFileList(fileCfgWithAllowed([]string{d}, nil))
+	// 不传 recursive.
+	r, _ := list.Execute(context.Background(), tool.ExecutionScope{AgentID: "a"}, map[string]any{"path": d})
+	var got []string
+	_ = json.Unmarshal([]byte(r.Content), &got)
+	// 期待只看到 top.txt + inner, 不含 inner/nested.txt.
+	if len(got) != 2 {
+		t.Errorf("non-recursive len=%d want 2; got=%v", len(got), got)
+	}
+	for _, g := range got {
+		if strings.Contains(g, string(filepath.Separator)) {
+			t.Errorf("non-recursive should not contain nested path: %q", g)
+		}
+	}
+}

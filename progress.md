@@ -2728,3 +2728,55 @@ go test -count=1 -timeout 300s ./...   # 24 包全绿 (含 internal/tool 0.498s 
 - §14.3 自定义 Tool: Plugin RPC Tool (Phase 4 大架构 = Protobuf IDL + SDK + 进程外 RPC), 与 plugin checklist 52 项同做.
 - §14.5 可观测性: 执行日志已落地 (本 commit 勾选); Prometheus 指标 (internal/metrics 框架已建, tool 包未接入); Remote API 事件推送.
 - §14.2 剩余: shell/http/file_* checklist (功能已实现, 待 audit + 补 evidence); config_reload (依赖 Phase 5 ReloadManager).
+
+---
+
+## #40 — §14.2 audit 补漏: HTTP 重定向逐跳Hostname + file_list recursive + §14.2 前 6 项勾选 (2026-07-29)
+
+### 概要
+审计 §14.2 前 6 项 (shell/http/file_read/file_write/file_list/file_delete) 与 docs/tool/builtin.md 对照发现 2 个真实缺漏:
+1. HTTP Tool: 重定向逐跳 hostname 校验未实现 (docs §6.2 明确要求"每次初始请求和重定向都对 url.Hostname() 的小写结果做精确匹配"; 当前实现只校验首请求 hostname, 重定向默认跟随 10 跳不带域名检查).
+2. File List Tool: recursive=true 仅读取直接子目录的 entries (注释 "v1 只支持一层"), 未真递归 (docs §6.3 schema recursive 用法).
+
+其他 4 项 (shell 白/黑名单/输出截断/timeout delegate, file_read 路径校验大小限制, file_write 创建目录, file_delete 安全确认+空目录) 已实现, 本 commit 补 commit evidence 勾选.
+
+### 改动文件
+- `internal/tool/builtin/http.go`: `http.Client.CheckRedirect` 闭包校验每跳 redirect:
+  - `len(via) >= MaxRedirects` → `errMaxRedirects`
+  - 重定向目标 hostname 在 `BlockedHosts` (小写) → `errRedirectBlocked`
+  - 非空 `AllowedHosts` 且不在列表 → `errRedirectNotAllowed`
+  - blocked 优先 allowed::position 与 docs §6.2 一致
+- `internal/tool/builtin/http_test.go` (+3 test): TestHTTPRedirectFollowedWhenAllowed (allowed + MaxRedirects=5 OK 返 final-body) + TestHTTPRedirectToBlockedHostStops (redirect 到 example.com blocked 返 IsError) + TestHTTPRedirectExceedsMaxRedirects (无限 self-redirect /r→/r max=2 返 IsError "redirect").
+- `internal/tool/builtin/file.go`:
+  - `list` 顶层 ReadDir 分支保留 (非递归 fast path).
+  - recursive=true 用 `filepath.WalkDir(abs, fn)` 收集相对 abs 路径; 目录以 `string(filepath.Separator)` 后缀标记便于 LLM 区分; Unicode 排序 sort.Strings.
+  - 访问某子目录错误的权限失败 (Error) → continue (list 语义"尽量列出可访问的部分").
+  - Import `io/fs` 替换原无用的 `io` (原 var _ = io.EOF stub 删除).
+- `internal/tool/builtin/file_test.go` (+2 test): TestFileListRecursive (deep dir tree: top, sub/, sub/c.txt, sub/deep/, sub/deep/d.txt 5 项 — path">{盘符} 等) + TestFileListNonRecursiveDefault (默认无 recursive 不含 nested path with separator).
+- `docs/tool/checklist.md`: §14.2 前 6 项全部勾选 (audit evidence 引用实现位置 + test 名称).
+
+### Evidence (docs/tool/builtin.md §6.1-§6.3 对照)
+- §6.1 shell: blocked 优先 allowed::**执行首 token base 名**、output `%s\\n[output truncated]` 追加; 非零退出 IsError + content "[exit code N]"; timeout 走 ToolManager callCtx (§14.1 §6 step 7). ✅
+- §6.2 http: blocked 优先 + allowed allowlist **首请求 + 每跳重定向相同规则** ✅; MaxRedirects 限制 ✅; MaxResponseBytes 截断 marker ✅; 返 JSON {status_code,headers,body,elapsed_ms} ✅.
+- §6.3 file_read: validatePath (canonicalPath 最近祖先 EvalSymlinks + within + blocked 优先 allowed allowlist) ✅; os.Stat Size 检查 ✅; encoding utf-8/base64 ✅.
+- §6.3 file_write: validatePath + content 长度限 + create_dirs MkdirAll ✅.
+- §6.3 file_list: validatePath + recursive=true 全量 WalkDir ✅; directory suffix marker.
+- §6.3 file_delete: validatePath (安全确认 = path 边界 + 仅删空目录) + os.Remove ✅.
+
+### 决策记录
+- **HTTP 重定向停止策略用 CheckRedirect returned error 而非 ErrUseLastResponse**: docs §6.2 "达到或目标不允许时停止,不向目标发送下一跳请求"; CheckRedirect 返 error 让 client.Do 停止 follow 并 close resp — 调用方 Execute 失败路径 IsError + clear 错误 message. 没保留 current/last hop response body 是 acceptable tradeoff (没有"读到一半的 redirect 主体" 被输出给 LLM — 安全面更紧).
+- **WalkDir 而非 ReadDir loop self-recursive**: stdlib io/fs.WalkDir 已处理 depth + permission errors + 排序万 indexation. Ponytail §3 stdlib 解决; 比自写 50 行递归 短且 robust.
+- **directory marker 后缀 string(filepath.Separator)**: LLM 区分 file vs dir 的必要信息; docs 没明确但 schema 描述具有一定的遗留 ambiguity + 不增加 metadata 仍属 "固定、脱敏且有界的 DTO" (docs §6.3 表).
+- **不动 docs/tool/builtin.md**: docs 表已列 recursive 但不限制深度, 实现走 full 递归符合 schema; 没必要回写 doc 约束. file_delete "安全确认" 模糊 term 内化为 "validatePath 前置 (越权拒) + 仅删空目录")而没加入额外 `confirm` 参数 (与 schema 一致).
+- **2 个 缺漏并 1 个 commit + 单 commit 包含 audit 勾选§14.2 前 6 项**: HTTP 与 file_list 递归不互依赖, 均指向同一目标 audit "§14.2 内置 Tool 全面闭合"; 每次独立 commit 一次 后 走一步 push 验收 (进度#40 183 lines); Ponytail "短 diff, 独立验收".
+
+### 验证
+```
+go vet ./... && go build ./...   # OK
+go test -count=1 -timeout 300s ./...   # 24 包全绿 (含 internal/tool/builtin 0.140s 新增 5 测试项)
+```
+
+### 下一步
+- §14.2 剩余: config_reload Tool (依赖 Phase 5 ReloadManager) — 留 Phase 5.
+- §14.3 自定义 Tool: Plugin RPC Tool (Phase 4 大架构) + 配置文件声明注册 + 静态 Go 注册 (RegisterBuiltin/RegisterIntrospection 已实现待 audit).
+- §14.5 可观测性: Prometheus 指标 (tool 包未接 metrics) + Remote API 事件推送.

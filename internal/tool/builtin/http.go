@@ -28,6 +28,13 @@ type EffectiveHTTPOptions struct {
 	MaxResponseBytes int
 }
 
+// HTTPTool 重定向校验失败 sentinel (docs §6.2 "达到或目标不允许时停止").
+var (
+	errMaxRedirects      = fmt.Errorf("too many redirects")
+	errRedirectBlocked   = fmt.Errorf("redirect to blocked host")
+	errRedirectNotAllowed = fmt.Errorf("redirect to host not in allowlist")
+)
+
 func NewHTTP(cfg config.ToolConfig) (*HTTPTool, error) {
 	o := EffectiveHTTPOptions{
 		MaxRedirects:     5,
@@ -42,8 +49,36 @@ func NewHTTP(cfg config.ToolConfig) (*HTTPTool, error) {
 	o.AllowedHosts = asStrSlice(cfg.Options["allowed_hosts"])
 	o.BlockedHosts = asStrSlice(cfg.Options["blocked_hosts"])
 	return &HTTPTool{
-		opts:   o,
-		client: &http.Client{},
+		opts: o,
+		client: &http.Client{
+			// docs/tool/builtin.md §6.2: 每次初始请求和重定向都对 url.Hostname()
+			// 的小写结果做精确匹配; blocked 优先, 非空 allowed 是 allowlist.
+			// 达到 max_redirects 或目标不允许时停止, 不向目标发送下一跳请求.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= o.MaxRedirects {
+					return errMaxRedirects
+				}
+				host := strings.ToLower(req.URL.Hostname())
+				for _, b := range o.BlockedHosts {
+					if strings.ToLower(b) == host {
+						return errRedirectBlocked
+					}
+				}
+				if len(o.AllowedHosts) > 0 {
+					ok := false
+					for _, a := range o.AllowedHosts {
+						if strings.ToLower(a) == host {
+							ok = true
+							break
+						}
+					}
+					if !ok {
+						return errRedirectNotAllowed
+					}
+				}
+				return nil
+			},
+		},
 	}, nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -89,5 +90,96 @@ func TestHTTPExecutePostBody(t *testing.T) {
 	_ = json.Unmarshal([]byte(r.Content), &out)
 	if !strings.HasPrefix(out.Body, "got:payload") {
 		t.Fatalf("body=%q", out.Body)
+	}
+}
+
+// ===== HTTP 重定向逐跳域名校验 (docs/tool/builtin.md §6.2) =====
+
+// TestHTTPRedirectFollowedWhenAllowed 目标在 allowed 列表中, follow OK 返最终 body.
+func TestHTTPRedirectFollowedWhenAllowed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/start":
+			http.Redirect(w, r, "/final", http.StatusFound)
+		case "/final":
+			_, _ = w.Write([]byte("final-body"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	// 解析 srv URL 取 hostname (127.0.0.1), 作为 allowed.
+	parsed, _ := url.Parse(srv.URL)
+	host := parsed.Hostname()
+	h, _ := NewHTTP(config.ToolConfig{Enabled: true, Options: map[string]any{
+		"allowed_hosts":  []any{host},
+		"max_redirects": 5,
+	}})
+	r, err := h.Execute(context.Background(), tool.ExecutionScope{AgentID: "a"}, map[string]any{
+		"url": srv.URL + "/start",
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if r.IsError {
+		t.Fatalf("unexpected IsError: %s", r.Content)
+	}
+	var out struct{ Body string `json:"body"` }
+	_ = json.Unmarshal([]byte(r.Content), &out)
+	if out.Body != "final-body" {
+		t.Errorf("body=%q want final-body", out.Body)
+	}
+}
+
+// TestHTTPRedirectToBlockedHostStops 重定向目标 host 在 blocked → 不向其发送请求, 返 IsError.
+func TestHTTPRedirectToBlockedHostStops(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/start":
+			// 重定向到 example.com (blocked).
+			http.Redirect(w, r, "https://example.com/x", http.StatusFound)
+		default:
+			_, _ = w.Write([]byte("should-not-reach"))
+		}
+	}))
+	defer srv.Close()
+	parsed, _ := url.Parse(srv.URL)
+	h, _ := NewHTTP(config.ToolConfig{Enabled: true, Options: map[string]any{
+		"blocked_hosts": []any{"example.com"},
+	}})
+	r, err := h.Execute(context.Background(), tool.ExecutionScope{AgentID: "a"}, map[string]any{
+		"url": srv.URL + "/start",
+	})
+	if err != nil {
+		t.Fatalf("Execute err: %v", err)
+	}
+	if !r.IsError {
+		t.Fatalf("expected IsError=true (blocked redirect); content=%s", r.Content)
+	}
+	// 由于 client 调 first hostname (127.0.0.1) 是允许的, checkRedirect 在 pull 上新 redirect 应拒.
+	_ = parsed
+}
+
+// TestHTTPRedirectExceedsMaxRedirects 达到 max_redirects → IsError.
+func TestHTTPRedirectExceedsMaxRedirects(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// /r 持续重定向到自己.
+		http.Redirect(w, r, "/r", http.StatusFound)
+	}))
+	defer srv.Close()
+	h, _ := NewHTTP(config.ToolConfig{Enabled: true, Options: map[string]any{
+		"max_redirects": 2,
+	}})
+	r, err := h.Execute(context.Background(), tool.ExecutionScope{AgentID: "a"}, map[string]any{
+		"url": srv.URL + "/r",
+	})
+	if err != nil {
+		t.Fatalf("Execute err: %v", err)
+	}
+	if !r.IsError {
+		t.Fatalf("expected IsError=true (max_redirects); content=%s", r.Content)
+	}
+	if !strings.Contains(r.Content, "redirect") {
+		t.Errorf("content=%q should mention redirect", r.Content)
 	}
 }

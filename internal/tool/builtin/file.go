@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -168,18 +168,47 @@ func (f *fileTool) write(ctx context.Context, abs string, params map[string]any)
 	return tool.ToolResult{Content: "wrote " + fmt.Sprintf("%d", len(content)) + " bytes"}, nil
 }
 
+// list 对 abs 做 (可选递归) 目录列举, 输出按相对路径升序的 JSON 数组.
+// recursive=true → 用 filepath.WalkDir 全量遍历含子目录 (docs/tool/builtin.md §6.3 schema recursive).
+// 输出项是相对 abs 的路径 (filepath.Separator 分隔), 不含 abs 本身 (基点).
 func (f *fileTool) list(ctx context.Context, abs string, params map[string]any) (tool.ToolResult, error) {
 	recursive, _ := params["recursive"].(bool)
-	entries, err := os.ReadDir(abs)
+	if !recursive {
+		entries, err := os.ReadDir(abs)
+		if err != nil {
+			return tool.ToolResult{Content: "list: " + err.Error(), IsError: true}, nil
+		}
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		sort.Strings(names)
+		b, _ := json.Marshal(names)
+		return tool.ToolResult{Content: string(b)}, nil
+	}
+	// recursive: WalkDir 收集所有相对路径 (非根).
+	var names []string
+	err := filepath.WalkDir(abs, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// 访问失败 → 仍继续 (list 的语义是 "尽量列出可访问的部分").
+			return nil
+		}
+		if p == abs {
+			return nil
+		}
+		rel, rerr := filepath.Rel(abs, p)
+		if rerr != nil {
+			return nil
+		}
+		// 标记目录后缀以便 LLM 区分; 不含 metadata 不暴露 stat.
+		if d.IsDir() {
+			rel += string(filepath.Separator)
+		}
+		names = append(names, rel)
+		return nil
+	})
 	if err != nil {
 		return tool.ToolResult{Content: "list: " + err.Error(), IsError: true}, nil
-	}
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		names = append(names, e.Name())
-		if recursive && e.IsDir() {
-			// Ponytail：仅列举直接子目录的 entries，深度无限递归省略；v1 只支持一层。
-		}
 	}
 	sort.Strings(names)
 	b, _ := json.Marshal(names)
@@ -262,5 +291,3 @@ func validatePath(path string, allowed, blocked []string) (string, error) {
 	return target, nil
 }
 
-// 引入 io 以避免未使用 import（实际未直接使用，但保留保险）。
-var _ = io.EOF
