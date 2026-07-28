@@ -302,6 +302,7 @@ func (m *Manager) runDirectTurn(
 			batch = append(batch, session.AppendInput{
 				Message: provider.Message{
 					Role:       "tool",
+					Name:        calls[i].Function.Name, // canonical name (docs/tool/context.md §8.1)
 					ToolCallID: calls[i].ID,
 					Content:    r.Content,
 				},

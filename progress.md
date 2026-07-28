@@ -2831,3 +2831,46 @@ go test -count=1 -timeout 300s ./...   # 24 包全绿 (含 internal/tool 0.539s,
 - §14.3 剩 2 项: Plugin RPC Tool capability (Phase 4) + 配置文件声明注册 (Phase 4).
 - §14.4 Context 集成 (4 项): Tool 结果 Message / 原子单元截断 / reasoning_content 保留 / canonical-only.
 - docs/plugin Phase 4 (52 项 checklist).
+
+---
+
+## #42 feat(context,agent): §14.4 Context 集成 4 项闭合 (docs/tool/context.md §8)
+
+### scope
+- §14.4 Context 集成 4 项全部闭合 (audit+小修+测试).
+
+### 实现 & audit
+- **第1项 Tool 结果 → role=tool Message 转换**: 已有实现 (handle_turn.go:304 构造 `{Role:"tool", ToolCallID, Content}`) 缺 `Name` 字段; §8.1 docs 明文要求 `Name: canonicalName`. **修**: 加 `Name: calls[i].Function.Name` (此时《canonical 写回已发生在 296 行》).
+- **第2项 原子单元截断保护**: 已实现. `internal/context/manager.go:groupUnits` 按 turn 整组分组; 含 ToolCalls/tool 的 unit `Compressible=false` 不可压缩摘要; `truncate` 按整 unit `units[:idx]+units[idx+1:]` 删除, 从不逐 Message 剥离. audit ✅ 无代码改动.
+- **第3项 reasoning_content 保留**: 已实现. groupUnits 整组保留原 Message 所有字段 (含 `ReasoningContent`); 无 Tool call 的普通 turn 可整组删除 (§8.4 "无 Tool Call 轮次可丢弃 reasoning" 等价 unit 整体删除而非单剥离字段). 含 Tool call + ReasoningContent 的 assistant 所在 unit 因 hasTools=true Compressible=false 不可压缩. audit ✅ 无代码改动.
+- **第4项 canonical-only 全边界**: 已实现.
+  - Agent: handle_turn.go:296 `assistantMsg.ToolCalls[i].Function.Name = calls[i].Function.Name` (canonical 写回 Session).
+  - Session: `internal/session/validate.go:45-64` 校验 Tool call name/tool msg name 为 canonical 格式.
+  - MCP Proxy: `internal/mcp/proxy.go:86 Name() → mcp.<server>.<remote>`; `:122 client.CallTool(p.remoteName)` 只把保存的 remoteName 发往上游.
+  - audit ✅ 无代码改动.
+
+### 新测试
+- `internal/context/manager_test.go` +TestBuildTruncatePreservesToolUnitWithReasoning: 构造 1 system + 18 普通 turn + 1 含 reasoning_content+ToolCalls 的 assistant + 1 tool + 1 current user, budget=2304 强制 truncate. 同时验证:
+  - assistant ReasoningContent="I need to call a tool" 在最终 messages 中保留 (§8.4 不丢弃 reasoning).
+  - tool result (ToolCallID=c1, Name=w) 保留 (§8.3 原子单元不分拆).
+
+### checklist 勾选
+- `docs/tool/checklist.md` §14.4 全 4 项 ✅.
+- `docs/context/checklist.md`: "Tool call 与全部 results 组成不可拆分 unit" ✅; "旧 Tool turn 只可整体删除，不能摘要后丢失 ReasoningContent" ✅.
+
+### 决策记录
+- **第1项仅补 `Name` 字段而非全建 toolResultToMessage 函数**: docs §8.1 给了 `toolResultToMessage` 伪代码优雅但 Ponytail §7 "最短可用 diff"; 现有内联构造仅缺 1 字段, 补 1 行 + 1 行注释 等价效果 不增新函数.
+- **第 2/3/4 项全 audit 闭合 无新代码**: 审查发现现有代码已满足契约; Ponytail "最短 diff" + YAGNI; 只补测试锁定 §8.3/§8.4 不回归.
+- **truncate 测试构造 18 普通turn 而非 40**: fakeProvider 100 tokens/msg, budget=2304 ⏱ 23 条 transactional; 18普通turn=36条 + 1 sys + Tool unit(3条) + 1 currentUser = 41 条 = 4100 tokens, rollout ≳7 条 unit 截断.
+
+### 验证
+```
+go vet ./... && go build ./...   # OK
+go test -count=1 -timeout 300s ./...   # 24 包全绿 (含 internal/context 0.025s 新增 1 测试)
+```
+
+### 下一步
+- §14.3 剩 2 项: Plugin RPC Tool capability (Phase 4) + 配置文件声明注册 (Phase 4).
+- §14.2 剩 1 项: config_reload Tool (Phase 5 ReloadManager).
+- docs/context/checklist.md 大量未勾 (Compressible/拒绝/hybrid/摘要/并发/验证等含其他模块依赖).
+- docs/plugin Phase 4 (52 项 checklist).

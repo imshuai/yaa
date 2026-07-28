@@ -55,10 +55,10 @@
 
 ### 14.4 Context 集成
 
-- [ ] Tool 结果 → `role="tool"` Message 转换
-- [ ] 原子单元（assistant+tool）截断保护
-- [ ] 深度思考模式下 reasoning_content 保留
-- [ ] Session、Remote、Planner 和 Tool Manager 只使用 canonical name；MCP Proxy 接收 canonical name、只把保存的 `remoteName` 发往上游，任何边界都不持久化 alias
+- [x] Tool 结果 → `role="tool"` Message 转换
+- [x] 原子单元（assistant+tool）截断保护
+- [x] 深度思考模式下 reasoning_content 保留
+- [x] Session、Remote、Planner 和 Tool Manager 只使用 canonical name；MCP Proxy 接收 canonical name、只把保存的 `remoteName` 发往上游，任何边界都不持久化 alias
 
 ### 14.5 可观测性
 

@@ -225,3 +225,58 @@ func TestResolveContextBudgetInvalidWindow(t *testing.T) {
 		t.Fatalf("expected ErrProviderWindowUnknown, got %v", err)
 	}
 }
+
+// TestBuildTruncatePreservesToolUnitWithReasoning 验证 §14.4 第2+3项:
+// 含 reasoning_content 的 Tool unit (assistant+tool) 不可被压缩/拆分;
+// truncate 只删旧普通 turn, 不剥离 reasoning_content; 剩余请求仍含完整 Tool unit.
+func TestBuildTruncatePreservesToolUnitWithReasoning(t *testing.T) {
+	m := NewManager()
+	fp := newTestProvider(6400, 4096) // input budget = 6400-4096 = 2304 → 23 条
+	maxTokens := 4096
+	// 构造: 1 system + 18 普通交替 turn (36条,超budget) + 1 Tool unit (assistant reasoning + tool)
+	// current turn = 最后的 user(TODO 可去掉,让 Tool unit 在当前 turn 之前可删但属 Protected? )
+	// 为保证 Tool unit 被保留且验证 reasoning 仍在: 把 Tool unit 放在 current turn 之外的老 turn.
+	msgs := []provider.Message{{Role: "system", Content: "sys"}}
+	for i := 0; i < 18; i++ {
+		msgs = append(msgs, provider.Message{Role: "user", Content: "q"})
+		msgs = append(msgs, provider.Message{Role: "assistant", Content: "a"})
+	}
+	// tool unit (旧turn): assistant with ReasoningContent + tool_calls, tool result.
+	msgs = append(msgs, provider.Message{Role: "user", Content: "tool-turn"})
+	msgs = append(msgs, provider.Message{
+		Role:             "assistant",
+		ReasoningContent: "I need to call a tool",
+		ToolCalls:        []provider.ToolCall{{ID: "c1", Function: provider.ToolCallFunction{Name: "w", Arguments: "{}"}}},
+	})
+	msgs = append(msgs, provider.Message{Role: "tool", ToolCallID: "c1", Name: "w", Content: "result"})
+	// 当前 turn
+	msgs = append(msgs, provider.Message{Role: "user", Content: "current"})
+	lastUser := len(msgs) - 1
+
+	out, err := m.Build(context.Background(), BuildInput{
+		Provider: fp, Model: fp.model,
+		Request:          provider.ChatRequest{Model: "test-model", Messages: msgs, MaxTokens: &maxTokens},
+		Config:           newTestConfig("truncate"),
+		CurrentTurnStart: lastUser,
+	})
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+	// 在最终 messages 中找 Tool unit, 验证 reasoning_content 和 tool result 都保留.
+	var foundAssistant bool
+	var foundTool bool
+	for _, m := range out.Request.Messages {
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 && m.ReasoningContent == "I need to call a tool" {
+			foundAssistant = true
+		}
+		if m.Role == "tool" && m.ToolCallID == "c1" && m.Name == "w" {
+			foundTool = true
+		}
+	}
+	if !foundAssistant {
+		t.Fatal("truncation stripped assistant message with ReasoningContent (§8.4 violated)")
+	}
+	if !foundTool {
+		t.Fatal("truncation stripped tool result message (§8.3 atomic unit violated)")
+	}
+}

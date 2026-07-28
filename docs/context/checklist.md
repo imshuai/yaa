@@ -29,10 +29,10 @@
 ## Unit 与策略
 
 - [ ] system、当前 user 和当前 Tool chain 受保护
-- [ ] Tool call 与全部 results 组成不可拆分 unit
+- [x] Tool call 与全部 results 组成不可拆分 unit
 - [ ] orphan/重复/缺失 Tool result 返回 `ErrInvalidMessageSequence`
 - [ ] 旧普通 turn 可摘要或整体删除
-- [ ] 旧 Tool turn 只可整体删除，不能摘要后丢失 `ReasoningContent`
+- [x] 旧 Tool turn 只可整体删除，不能摘要后丢失 `ReasoningContent`
 - [ ] `reject` 超限直接返回 `ErrContextOverflow`
 - [ ] `truncate` 每次删除最旧可删除 unit 后重新估算
 - [ ] `hybrid` 按 threshold、target ratio、min messages、preserve recent 工作
