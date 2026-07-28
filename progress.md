@@ -3134,3 +3134,73 @@ go test -count=1 -timeout 300s ./...   # 24 包全绿
 - **memory 32/39** (剩7: 行15/16/27 并发测试, 行28 vector状态序列, 行52/53 Phase 5 ReloadManager, 行56 Health结构).
 - **session 58/58 ✅**, **config 51/74**, **mcp 82/82 ✅**, **planner 34/34 ✅**.
 - 下一模块: context 38项审计 OR plugin Phase 4 52项.
+
+---
+
+## #50-#53 Plugin MVP: Manifest + Loader + 依赖图 (2025-07-29)
+
+### 进度
+本会话完成 plugin 模块 MVP 阶段 4 个 commit:
+- `f2bc263` #50 — Manifest 解析校验 + 15 sentinel error (checklist 行12-14)
+- `fb50ce0` #51 — Loader Discover + 路径解析去重 + matchCapabilities (checklist 行21/23/24/32)
+- `608dcdc` #52 — SemVer 版本校验 (requires_runtime + dependency range, checklist 行17)
+- `0edaefb` #53 — Manager + 依赖图拓扑排序 (checklist 行37/38/40/47)
+
+**plugin checklist 12/52 ✅**
+
+### 实现
+
+#### `internal/plugin/errors.go` (35行)
+- 15 稳定 error 对齐 docs/plugin/errors.md §1 (NotFound/ManifestInvalid/ConfigInvalid/DependencyMissing/CircularDependency/RuntimeIncompatible/ProcessStart/ConnectionTimeout/ProtocolIncompatible/InitFailed/CapabilityConflict/CallFailed/CallTimeout/Unavailable/PermissionDenied)
+- 6 内部细分 error (ManifestNotFound/EntryNotFound/EntryEscape/DuplicateID/UnknownCapability/DependencyVersion)
+
+#### `internal/plugin/types.go` (108行)
+- Manifest/Dependency/CapabilityDescriptor/PluginDescriptor/DiscoveryDiagnostic
+- PluginState (discovered|starting|ready|error|stopped) + Entry + HealthStatus(struct: Level/Message/Timestamp)
+- HealthLevelHealthy/Degraded/Unhealthy/Unknown 常量
+- HandshakeResponse/ReadyResponse/HealthResponse/ToolRequest/ToolResponse RPC 类型
+
+#### `internal/plugin/manifest.go` (123行)
+- LoadManifest: os.ReadFile + yaml.NewDecoder.KnownFields(true) (严格未知字段)
+- ValidateManifest: id (regexp) + version + protocol_version="1" + entry + provides (type=tool/name/description/schema/duplicate) + dependencies (id/version)
+- ResolveEntry: filepath.Join + Rel + 逃逸检测 (.. / IsAbs)
+
+#### `internal/plugin/loader.go` (283行)
+- NewLoader: configDir abs + paths 去重 + nil logger 校验
+- Discover: 子目录扫描 + LoadManifest + ValidateManifest + ResolveEntry + validateEntryExecutable
+- 重复 ID 全部拒绝 → 各自 diagnostic; 无法解析 ID → 空 PluginID; 已解析 ID → 携带 partial Descriptor
+- matchCapabilities: type/name/description/schema 集合精确相等 + mapsEqual 递归
+
+#### `internal/plugin/version.go` (130行)
+- parseVersionRange: >=,<=,>,<,= 空格分隔 + canonicalSemVer (v 前缀)
+- versionInRange + satisfiesConstraint (semver.Compare)
+- ValidateRuntimeVersion (requires_runtime range 对 runtime 版本) + ValidateDependencies (range 格式校验)
+
+#### `internal/plugin/manager.go` (174行)
+- Manager struct: lifecycleMu/wg/stopping/stopOnce + runCtx/runCancel
+- NewManager: Discover 合并 descriptor + diagnostics → error Entry + entries[] enabled/config 合并 (clonePluginConfig 递归)
+- EntrySnapshot 只读 + DiscoveryDiagnostics public
+
+#### `internal/plugin/dependency.go` (155行)
+- resolveDependencies: Kahn 拓扑排序 (稳定 tiebreak sort.Strings queue) + 缺失/循环/版本不匹配 dep 检测 + fail
+- effectiveEnabled: 显式 Enabled > Manifest.DefaultEnabled
+- requireReadyDependencies: non-optional dep 必须 ready (helper)
+
+### 测试 (34 项)
+- manifest_test.go: 9 (valid/missingID/badProtocol/nonTool/dupName/escape/valid/unknownField/loadFile)
+- version_test.go: 16 (range parse + inRange 13 case + RuntimeVersion + Dependencies + Canonical)
+- loader_test.go: 5 (NewLoader dedup/nilLogger/relative/absolute + Discover valid/missing/duplicate/escape/nonexec)
+- manager_test.go: 12 (NewManager merges 3 + ResolveDep 5 + effective 2 + clone deep)
+
+### 验证
+```
+go vet ./... && go build ./...   # OK
+go test -count=1 -timeout 300s ./...   # 25 包全绿
+```
+
+### 下一步
+**plugin 12/52 剩 40 项**:
+- **RPC + proto** (行10-11, 15, 22, 25-33): 需引入 gRPC 依赖 — 较大基础设施 commit
+- **Manager 启动/重启/关闭** (行39, 41-52): StartAll/monitor/StopAll + RPCClient/ProxyHandle/PluginToolProxy
+- **配置边界** (行56-60): startup/stop/health timeout + restart config 校验
+- **集成与验证** (行62-73): Tool Proxy/RBAC/Secret/指标/单元+集成测试
