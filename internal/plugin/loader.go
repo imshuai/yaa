@@ -133,8 +133,9 @@ func (l *Loader) Discover() (descriptors []PluginDescriptor, diagnostics []Disco
 				byIDDiag[pluginID] = append(byIDDiag[pluginID], diag)
 				continue
 			}
-			// 校验 requires_runtime 和 dependency version
-			if rErr := validateRuntimeVersion(manifest); rErr != nil {
+			// 校验 dependency version 是有效 SemVer range 格式
+			// (requires_runtime 校验在 Start 阶段, 需要外部注入 runtime 版本)
+			if rErr := ValidateDependencies(manifest); rErr != nil {
 				desc := &PluginDescriptor{ManifestPath: manifestPath, Manifest: manifest, EntryPath: entryPath}
 				diag := DiscoveryDiagnostic{
 					PluginID:   pluginID,
@@ -201,16 +202,6 @@ func validateEntryExecutable(entryPath string) error {
 	if info.Mode().Perm()&0o111 == 0 {
 		return fmt.Errorf("%w: no execute permission", ErrPluginEntryNotFound)
 	}
-	return nil
-}
-
-// validateRuntimeVersion 校验 requires_runtime SemVer range 对当前 Runtime 兼容.
-// docs/plugin/config-ref.md §2: requires_runtime 是 SemVer range, 如 ">=0.1.0 <1.0.0".
-// docs/plugin/checklist.md 行17: requires_runtime 使用 SemVer parser.
-// TODO: 需要当前 Runtime 版本. 暂时跳过 — 需要 Runtime 注入版本号.
-func validateRuntimeVersion(m Manifest) error {
-	// ponytail: requires_runtime 校验需要 Runtime 版本号注入, MVP 先跳过.
-	// Manager 构造时调用方提供 runtime 版本后在此处校验.
 	return nil
 }
 

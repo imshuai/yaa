@@ -14,7 +14,7 @@
 - [x] `provides[]` 只接受 `tool`，且 name/description/schema 必填
 - [ ] Manifest capabilities 与 Ready capabilities 的 type/name/description/schema 集合一致
 - [ ] `entries[].config` 在启动进程前通过 `config_schema`
-- [ ] `requires_runtime`、dependency version 使用 SemVer parser
+- [x] `requires_runtime`、dependency version 使用 SemVer parser
 
 ## Loader
 
