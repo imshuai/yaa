@@ -185,13 +185,7 @@ func (m *Manager) ToToolDefs(agentID string, history []provider.Message) (*Provi
 				if other, dup := aliasToCanonical[alias]; dup && other != name {
 					return nil, fmt.Errorf("%w: history %q and %q alias to %q", ErrToolAliasCollision, other, name, alias)
 				}
-				// history-only：只补 union map，不动 executable（aliasToCanonical）。
-				// 注意：若 alias 碰巧已对应某 executable canonical，但当前 history name 与其不同，
-				// 上面的 dup 分支已捕获。若 alias 已被自身使用（identity）则跳过，避免覆盖。
-				if _, exists := aliasToCanonical[alias]; !exists {
-					// 仅占位，不写 executable。
-					_ = exists
-				}
+				// history-only: 不写 aliasToCanonical (executable 反查表), 仅 union map.
 				canonicalToAlias[name] = alias
 			}
 		case "tool":

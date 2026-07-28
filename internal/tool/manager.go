@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/exp/slog"
 
@@ -31,7 +32,8 @@ type Manager struct {
 	agents map[string]agentBinding
 
 	// 并发Gate
-	global sema
+	global   sema
+	sessions map[string]sema // per-session gate, lazy。
 }
 
 type agentBinding struct {
@@ -77,6 +79,7 @@ func NewManager(deps Dependencies) (*Manager, error) {
 		source:    map[string]string{},
 		agents:    map[string]agentBinding{},
 		global:    newSema(tc.MaxConcurrent),
+		sessions: map[string]sema{},
 	}
 	// 复制 builtin 配置（深拷贝 options）。
 	for name, bc := range tc.Builtin {
@@ -256,7 +259,12 @@ func (m *Manager) CheckPermission(agentID, toolName string) bool {
 	return allowed
 }
 
-// Execute 单次执行 Tool，按 Manager §6 流程。
+// Execute 单次执行 Tool，按 docs/tool/manager.md §6 流程。
+//
+// 步骤: scope.AgentID 校验 → find Tool → enabled → allowlist → JSON Schema 校验 →
+// effective timeout → Session gate → global gate → callCtx(WithCancelCause + AfterFunc) →
+// retry loop (DefaultMaxRetry + RetryableError + 指数退避, 同一 callCtx) → caller/child cause 检查 →
+// 结果截断 (MaxResultTokens via Provider estimator) → 结构化日志 → 释放 gate.
 func (m *Manager) Execute(ctx context.Context, scope ExecutionScope, toolName string, params map[string]any) (ToolResult, error) {
 	if scope.AgentID == "" {
 		return ToolResult{}, fmt.Errorf("%w: empty agent id", ErrPermissionDenied)
@@ -274,13 +282,16 @@ func (m *Manager) Execute(ctx context.Context, scope ExecutionScope, toolName st
 	if !m.CheckPermission(scope.AgentID, toolName) {
 		return ToolResult{}, fmt.Errorf("%w: %q", ErrPermissionDenied, toolName)
 	}
-	// JSON Schema 校验。Ponytail v1 跳过 JSON Schema validator 等重型手段；
-	// 校验 params 必须为 json.RawMessage decode 后回声：保留原始 error。
-	if err := validateParams(t.Parameters(), params); err != nil {
+	// JSON Schema 校验 (docs/tool/manager.md §6 step 4 + docs/tool/errors.md §9.1).
+	// nil params 视为空 object (decoded-from-{}), 与 ExecuteBatch 的 decodeArgs 路径一致.
+	if params == nil {
+		params = map[string]any{}
+	}
+	if err := validateJSONSchema(t.Parameters(), params); err != nil {
 		return ToolResult{}, fmt.Errorf("%w: %v", ErrInvalidParams, err)
 	}
 
-	// 计算 effective timeout：Tool 上层 inherited default。
+	// 计算 effective timeout (docs §6 step 5: Tool 上层 inherited default; 0..MaxTimeout).
 	timeout := cfg.Timeout
 	if timeout <= 0 {
 		timeout = m.cfg.Tools.DefaultTimeout
@@ -289,7 +300,30 @@ func (m *Manager) Execute(ctx context.Context, scope ExecutionScope, toolName st
 		timeout = m.cfg.Tools.MaxTimeout
 	}
 
-	// 获取 global gate。
+	maxRetry := m.cfg.Tools.DefaultMaxRetry
+	if maxRetry < 0 {
+		maxRetry = 0
+	}
+
+	// Session/global gate (docs §6 step 6 空可选; Session 非空时先获取再获取 global; 任一可被 caller 取消).
+	var sessSem sema
+	if scope.SessionID != "" {
+		sessSem = m.sessGate(scope.SessionID)
+	}
+	acquireSem := func(s sema) error {
+		select {
+		case s <- struct{}{}:
+			return nil
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		}
+	}
+	if sessSem != nil {
+		if err := acquireSem(sessSem); err != nil {
+			return ToolResult{}, err
+		}
+		defer func() { <-sessSem }()
+	}
 	select {
 	case m.global <- struct{}{}:
 		defer func() { <-m.global }()
@@ -297,7 +331,7 @@ func (m *Manager) Execute(ctx context.Context, scope ExecutionScope, toolName st
 		return ToolResult{}, context.Cause(ctx)
 	}
 
-	// callCtx with timeout。
+	// callCtx with timeout 与 retry 共享同一 (docs §6 step 7).
 	callCtx, cancel := context.WithCancelCause(ctx)
 	timer := time.AfterFunc(timeout, func() { cancel(ErrToolTimeout) })
 	defer func() {
@@ -305,14 +339,130 @@ func (m *Manager) Execute(ctx context.Context, scope ExecutionScope, toolName st
 		cancel(nil)
 	}()
 
-	result, err := t.Execute(callCtx, scope, params)
-	if ctx.Err() != nil {
-		return ToolResult{}, context.Cause(ctx)
+	beginAt := time.Now()
+	var result ToolResult
+	var err error
+	for attempt := 0; attempt <= maxRetry; attempt++ {
+		result, err = t.Execute(callCtx, scope, params)
+		// docs §6 step 8: caller cause 先于 child cause 先于 retryable.
+		if ctx.Err() != nil {
+			return ToolResult{}, context.Cause(ctx)
+		}
+		if callCtx.Err() != nil {
+			return ToolResult{}, context.Cause(callCtx)
+		}
+		// 成功 (含 IsError) 或已耗尽重试 → 终止.
+		if err == nil {
+			break
+		}
+		// docs §6 step 8: RetryableError opt-in; 参数错误 / cancel / timeout / IsError 不重试 (docs 明文列出).
+		if result.IsError {
+			break
+		}
+		var retryable RetryableError
+		if !errors.As(err, &retryable) || !retryable.Retryable() {
+			break
+		}
+		if attempt == maxRetry {
+			break
+		}
+		// 指数退避 (Ponytail: 100ms, 200ms, 400ms… 上限沿用 ×2; 同一 callCtx 可被 caller 或 timeout 取消).
+		backoff := time.Duration(100*(1<<attempt)) * time.Millisecond
+		if backoff <= 0 {
+			backoff = 100 * time.Millisecond
+		}
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return ToolResult{}, context.Cause(ctx)
+		case <-callCtx.Done():
+			return ToolResult{}, context.Cause(callCtx)
+		}
 	}
-	if callCtx.Err() != nil {
-		return ToolResult{}, context.Cause(callCtx)
+
+	// docs §6 step 9: 使用 Agent Provider 的 token estimator 将 Content 限制到 max_result_tokens.
+	if err == nil && !result.IsError {
+		result.Content = m.truncateResult(scope.AgentID, result.Content)
+	}
+
+	// docs §6 step 10: 结构化日志, 不含 params/content.
+	if m.logger != nil {
+		m.logger.Info("tool.execute",
+			"agent", scope.AgentID,
+			"session", scope.SessionID,
+			"tool", toolName,
+			"duration_ms", time.Since(beginAt).Milliseconds(),
+			"is_error", result.IsError,
+		)
 	}
 	return result, err
+}
+
+// sessGate 返回某 Session 的并发信号量, 按 SessionID 复用. 懒构造 + Manager 的 sessionGates map.
+func (m *Manager) sessGate(sessionID string) sema {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sessions == nil {
+		m.sessions = map[string]sema{}
+	}
+	if sg, ok := m.sessions[sessionID]; ok {
+		return sg
+	}
+	n := m.cfg.Tools.MaxConcurrentPerSession
+	if n < 1 {
+		n = 1
+	}
+	sg := newSema(n)
+	m.sessions[sessionID] = sg
+	return sg
+}
+
+// truncateResult 使用 Agent Provider 的 token estimator 将 Content 估算并截断到 MaxResultTokens.
+// doc §6 step 9 "使用 Agent Provider 的 token estimator 将 Content 限制到 max_result_tokens".
+//
+// ponytail: 没必要在 v1 加 future-tool 的 estimator 路径; 直接复用 provider.EstimateInputTokens
+// (4-char/token 启发), 通过 1 条 user message 估算. max_tokens<=0 时不截断 (兼容 disabled).
+func (m *Manager) truncateResult(agentID, content string) string {
+	maxT := m.cfg.Tools.MaxResultTokens
+	if maxT <= 0 || content == "" {
+		return content
+	}
+	// 找 Agent provider (cfg.Agents -> providers.Get).
+	ag := m.agentConfig(agentID)
+	if ag == nil {
+		return content
+	}
+	p, perr := m.providers.Get(ag.Provider)
+	if perr != nil {
+		return content
+	}
+	// 包装为 ChatRequest 单消息估算 token 数 (复用 provider 内部 char/4 启发).
+	req := &provider.ChatRequest{Messages: []provider.Message{{Role: "user", Content: content}}}
+	n, eerr := p.EstimateInputTokens(context.Background(), req)
+	if eerr != nil || n <= maxT {
+		return content
+	}
+	// 截断: maxT token ≈ maxT*4 字符 (与 provider 启发一致); 末尾追加省略号标记截断 (不含 params).
+	byteLimit := maxT * 4
+	if byteLimit <= 0 || byteLimit >= len(content) {
+		return content
+	}
+	// UTF-8 边界对齐: 不切断 rune.
+	cut := byteLimit
+	for cut > 0 && !utf8.RuneStart(content[cut-1]) {
+		cut--
+	}
+	return content[:cut] + "[…truncated]"
+}
+
+// agentConfig 返回某 Agent 的 config.AgentConfig 副本 (深 copy 字段不必, 只读).
+func (m *Manager) agentConfig(agentID string) *config.AgentConfig {
+	for i := range m.cfg.Agents {
+		if m.cfg.Agents[i].ID == agentID {
+			return &m.cfg.Agents[i]
+		}
+	}
+	return nil
 }
 
 // ExecuteBatch 顺序保持的并发 batch。每个 call 的 name 必须是 canonical（不反查 alias）。
@@ -387,20 +537,6 @@ func ErrorResult(err error) ToolResult {
 		message = "tool execution timed out"
 	}
 	return ToolResult{Content: message, IsError: true}
-}
-
-// validateParams 在 v1 不接 JSON Schema validator，而是验证 params 是可序列化 map（保留原 nil 兼容）。
-// Ponytail：若 Parameters 为空 schema 必须接受空对象；后续接入完整 validator。
-func validateParams(schema json.RawMessage, params map[string]any) error {
-	_ = schema
-	if params == nil {
-		return errors.New("params must be object")
-	}
-	// 抽样编码确保 map 可序列化（避免 channel/func）。
-	if _, err := json.Marshal(params); err != nil {
-		return fmt.Errorf("params not serializable: %w", err)
-	}
-	return nil
 }
 
 func decodeArgs(args string) (map[string]any, error) {

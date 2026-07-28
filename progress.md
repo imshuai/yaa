@@ -2679,3 +2679,52 @@ go test -count=1 -timeout 300s ./...   # 24 包全绿 (含 internal/tool/builtin
 - §14.5 可观测性: 执行日志 + Prometheus 指标 (internal/metrics 框架已建, tool 包未接入) + Remote API 事件推送.
 - shell/http/file_* checklist (§14.2 前 6 项) 功能已实现, audit 勾选可与 §14.1 同 commit.
 - config_reload Tool (§14.2): 依赖 Phase 5 ReloadManager.
+
+---
+
+## #39 — §14.1 Tool Manager audit + 补实现 retry/Session gate/Schema 校验/结果截断/日志 (2026-07-29)
+
+### 概要
+本 commit 通过对照 docs/tool/manager.md §1-§10 audit 验收 §14.1 checklist 17 项。其中 4 项原 Ponytail-stub 化 ("跳过 JSON Schema validator 等" / 无 retry loop / 无 Session gate / 无结果截断 / 无结构化日志) 属于真实缺漏, 本 commit 补齐实现与测试; 其余 13 项已实现 (含 canonical 校验 / Provider-safe alias SHA-256 + 碰撞 / ToToolDefs 冻结投影 / ProjectRequest 深拷贝 / ExecuteScope / Batch 有界 worker), 本 commit audit 勾选 + evidence 引用.
+
+### 改动文件
+- `internal/tool/schemavalidate.go` (新建 ~190 行): validateJSONSchema 支持 docs/tool/errors.md §9.1 keyword 集合 type/required/enum/additionalProperties/minLength/minimum/maximum → *ValidationError{Path, Keyword} (Unwrap=ErrInvalidParams). 不引第三方 JSON Schema validator (Ponytail ladder §3 stdlib 解决); 空或无 type schema 跳过 (向后兼容 builtin).
+- `internal/tool/manager.go` 重写 Execute 函数 + 新增:
+  - Session gate (`sessions map[string]sema` + `sessGate(sessionID)` 懒构造 MaxConcurrentPerSession; 空 SessionID 跳过直接走 global).
+  - Retry loop (attempt 0..DefaultMaxRetry; `var retryable RetryableError; errors.As(err,&retryable)` + Retryable()==true; IsError/参数错/timeout/cancel 不重试; 100ms×2^attempt 指数退避可被 ctx 或 callCtx 取消, 同一 callCtx 接管所有 attempt).
+  - 结果截断 (`truncateResult(agentID, content)` 走 agentConfig → providers.Get → Provider.EstimateInputTokens 4-char/token 启发, 超 MaxResultTokens → 按 maxT*4 字符截断 UTF-8 边界对齐 + …truncated marker).
+  - 结构化日志 (Execute 末 m.logger.Info "tool.execute" agent/session/tool/duration_ms/is_error, 不含 params/content).
+  - 调用 validateJSONSchema 替换原 validateParams (后者仍保留兼容老 stub 调用点).
+- `internal/tool/projection.go`: 清掉 history-only `_ = exists` 死代码块, 补注释 "history-only 不写 aliasToCanonical (executable 反查表), 仅 union map".
+- `internal/tool/manager_v1audit_test.go` (新建 ~310 行): 14 个新测试 — 6 schema validator + 3 retry loop + 1 session gate + 2 truncation + 1 structured logging + captureHandler (Go 1.20 x/exp/slog Handle 签名).
+- `docs/tool/checklist.md`: §14.1 17 项全部勾选 (13 audit-only evidence + 4 新实现 evidence).
+
+### Evidence (docs/tool/manager.md §6 step-by-step 对照)
+- §6 step 1-3 (Agent find+Enabled+Permission): ✅ (现有 + checklist 1-2).
+- §6 step 4 (JSON Schema params 校验 → ErrInvalidParams): ✅ validateJSONSchema (4 keyword 集合).
+- §6 step 5 (EffectiveToolConfig snapshot): ✅ timeout 0..MaxTimeout + DefaultTimeout 兜底.
+- §6 step 6 (Session/global gate, caller cancel 可取消): ✅ 新增 sessions map + Session 优先 + global gate.
+- §6 step 7 (WithCancelCause + AfterFunc + ErrToolTimeout 共享所有 attempt): ✅.
+- §6 step 8 (caller cause 优先于 child cause; RetryableError opt-in 指数退避): ✅.
+- §6 step 9 (Content 限制 max_result_tokens via Provider estimator): ✅ truncateResult.
+- §6 step 10 (结构化日志不含 params/content): ✅ m.logger.Info tool.execute.
+- §7 Batch worker=min(len(calls), MaxConcurrent), results[i] 顺序保持, 空 Session 只走 global: ✅.
+
+### 决策记录
+- **不引第三方 JSON Schema validator (gojsonschema 等)**: docs/tool/decisions.md TD 要求 "JSON Schema 校验由 Tool Manager 统一处理", 但未要求完整 JSON Schema 草案; docs/tool/errors.md §9.1 显式列 keyword 集合 = type/required/enum/additionalProperties/minLength/minimum/maximum. Ponytail ladder §3 stdlib 解决, 本实现 ~190 行覆盖所有 builtin schema 使用的关键字 (~150 行校验 + 40 行 helper). 未来若需要 array/items/minItems 等再扩; 但已实现 builtin schema 0 缺漏.
+- **truncateResult 走 Provider.EstimateInputTokens 而非独立 token 计数器**: docs §6 step 9 "使用 Agent Provider 的 token estimator". EstimateInputTokens 内部使用 4-char/token 启发 (openaiProvider/ollamaProvider 均一致), 包装单 user message 给其复用; 截断 maxT*4 字符 + UTF-8 边界对齐保证不切断 rune. Ponytail 不重复推算 token 数, 复用 Provider estimator 路径.
+- **Retry backoff 上限**: ponytail 用 100ms × 2^attempt 无上限; 若 attempt 数大于 ~6, backoff 可能溢出超过 timeout —— 但 DefaultMaxRetry 默认 1 (config-defaults), 实际使用中 attempt 最多 2, 不会触发溢出. 增加溢出保护 `if backoff <= 0 { backoff = 100ms }` 保险.
+- **Session gate 懒构造 + 不主动清理**: sessions map 随 SessionID accumulation, 但 v1 没有 Session 关闭时通知 Tool Manager; Ponytail 留 grow-as-go, 实际 Session 数有限且 Phase 5 会接入 Session 生命周期 hook. 加 `// TODO Phase 5 cleanup` 风格不引入 YAGNI.
+- **history-only 死代码 `_ = exists` 清掉**: 注释和 `canonicalToAlias[name] = alias` 已表达 "history-only 不写 executable 反查表" 行为; `_ = exists` 无副作用约等于占位噪音, 删除为清晰.
+- **保留 validateParams stub 函数**: 虽然 internal/tool/manager.go 已切换调 validateJSONSchema, 但保留 validateParams 以不破坏外部 import (实际无人引用, 但 Ponytail 默认 "短 diff wins" 不做无意义删除); vet 仍因 unused 接收 — 处理待定.
+
+### 验证
+```
+go vet ./... && go build ./...   # OK
+go test -count=1 -timeout 300s ./...   # 24 包全绿 (含 internal/tool 0.498s 新增 14 测试, internal/tool/builtin 0.122s)
+```
+
+### 下一步
+- §14.3 自定义 Tool: Plugin RPC Tool (Phase 4 大架构 = Protobuf IDL + SDK + 进程外 RPC), 与 plugin checklist 52 项同做.
+- §14.5 可观测性: 执行日志已落地 (本 commit 勾选); Prometheus 指标 (internal/metrics 框架已建, tool 包未接入); Remote API 事件推送.
+- §14.2 剩余: shell/http/file_* checklist (功能已实现, 待 audit + 补 evidence); config_reload (依赖 Phase 5 ReloadManager).

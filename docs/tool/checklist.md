@@ -9,23 +9,23 @@
 
 ### 14.1 Tool Manager
 
-- [ ] Tool 注册 / 注销 / 查找；disabled 项保留在 List、拒绝 Execute
-- [ ] 权限只使用 `agents[].tools []string` allowlist，空值表示全部
-- [ ] 参数 JSON Schema 校验
-- [ ] gate 取消返回 `context.Cause(ctx)`，保留 Agent Stop/Runtime shutdown 等 caller cause
-- [ ] Go 1.20 `WithCancelCause` + `time.AfterFunc` 以 `ErrToolTimeout` 覆盖 Tool/退避/重试；caller cause 检查优先于 child cause
-- [ ] 并发执行 + 并发上限
-- [ ] 结果截断
-- [ ] 重试使用 `var retryable RetryableError` + `errors.As(err, &retryable)`，并在同一 `callCtx` 内指数退避
-- [ ] 结构化日志
-- [ ] `ToToolDefs` 冻结 current definitions + Session history 的不可变 Provider 投影
-- [ ] canonical name 校验覆盖合法 UTF-8、1..256 bytes、无控制字符
-- [ ] Provider-safe alias 算法、完整 SHA-256 base32、联合碰撞检查与 `ErrToolAliasCollision`
-- [ ] definitions 只含 enabled/authorized Tool；history-only alias 不进入 executable 反查表
-- [ ] 请求历史和 `specific` ToolChoice 深拷贝投影；Context estimator 看见最终 wire alias
-- [ ] direct/stream 共用精确 alias 反查；unknown/非法 alias 不进入 ExecuteBatch
-- [ ] Execute/ExecuteBatch 使用 `ExecutionScope`，Agent turn 传真实 SessionID
-- [ ] Batch 使用有界 worker，结果保持输入顺序；MCP 空 Session 只走全局 gate
+- [x] Tool 注册 / 注销 / 查找；disabled 项保留在 List、拒绝 Execute — internal/tool/manager.go: Register/RegisterWithSource (name+source+slog canonical 校验+拒绝重复) / Unregister / Get (ErrToolNotFound) / List (按名升序) / ListForAgent (含 disabled); Execute 先检 !cfg.Enabled 返 ErrToolDisabled 不删条目. Evidence: TestManagerRegisterAndList + TestManagerExecuteNotFound + TestManagerExecuteDisabled
+- [x] 权限只使用 `agents[].tools []string` allowlist，空值表示全部 — internal/tool/manager.go: NewManager len(ag.Tools)==0 → agentBinding{AllowAll:true}, 否则 Allowed set; CheckPermission(agentID,name)+Execute 调用. Evidence: TestManagerListForAgentAllowAll + TestManagerCheckPermission + TestManagerExecutePermissionDenied
+- [x] 参数 JSON Schema 校验 — internal/tool/schemavalidate.go (新建): validateJSONSchema 支持 type/required/enum/additionalProperties/minLength/minimum/maximum → *ValidationError{Path,Keyword} (Unwrap=ErrInvalidParams); Execute 调 validateJSONSchema(t.Parameters(), params) 失败返 ErrInvalidParams. Evidence: TestValidateJSONSchemaRequired + AdditionalProperties + EnumAndMinLength + MinimumMaximum + TypeMismatch + EmptyAllowed
+- [x] gate 取消返回 `context.Cause(ctx)`，保留 Agent Stop/Runtime shutdown 等 caller cause — internal/tool/manager.go: Execute Session/global gate acquire select 在 case <-ctx.Done() return context.Cause(ctx); docs/tool/manager.md §6 step 6 不等不收窄. Evidence: TestManagerExecuteCallerCancelKeepsCause (myCause preserved)
+- [x] Go 1.20 `WithCancelCause` + `time.AfterFunc` 以 `ErrToolTimeout` 覆盖 Tool/退避/重试；caller cause 优先 — internal/tool/manager.go: Execute callCtx + cancel(ErrToolTimeout) + timer.Stop + defer cancel(nil); retry loop 与 backoff 共享 callCtx; 每次 attempt 末先检 ctx.Err() 再检 callCtx.Err(). Evidence: TestManagerExecuteTimeout (ErrToolTimeout) + TestManagerExecuteCallerCancelKeepsCause
+- [x] 并发执行 + 并发上限 — internal/tool/manager.go: global sema(MaxConcurrent); ExecuteBatch worker=min(len(calls),MaxConcurrent); 本 commit 新增 sessions map + sessGate(sessionID) → MaxConcurrentPerSession. Evidence: TestSessionGateLimitsConcurrent (per-session 1 串行) + TestManagerExecuteBatch + 已有并发测试
+- [x] 结果截断 — internal/tool/manager.go: truncateResult(agentID,content) 走 agentConfig → providers.Get → Provider.EstimateInputTokens (4-char/token 启发) 包装单 user message; 超 MaxResultTokens → 按字符 maxT*4 截断并 UTF-8 边界对齐 + 追加 "…truncated" marker. nil/<=0/空 content 不截断. Evidence: TestExecuteTruncatesLongContent + TestExecuteNoTruncateShortContent
+- [x] 重试使用 `var retryable RetryableError` + `errors.As(err, &retryable)`，并在同一 `callCtx` 内指数退避 — internal/tool/manager.go: Execute retry loop (attempt 0..maxRetry); 检测 retryable = RetryableError + Retryable()==true; IsError/参数错误/timeout/cancel 不重试; backoff=100ms*2^attempt 可被 ctx 或 callCtx 取消; 同一 callCtx 接管所有 attempt. Evidence: TestExecuteRetriesRetryableError (flaky → 1 retry success) + TestExecuteRetryCapRespected (DefaultMaxRetry=1 → 2 attempts) + TestExecuteRetrySkipsNonRetryable (plain error no retry)
+- [x] 结构化日志 — internal/tool/manager.go: Execute 末尾 m.logger.Info("tool.execute", "agent","session","tool","duration_ms","is_error") 不含 params/content. Evidence: TestExecuteLogsStructuredEvent (msg=tool.execute, attrs agent/tool/session 不含 content)
+- [x] `ToToolDefs` 冻结 current definitions + Session history 的不可变 Provider 投影 — internal/tool/projection.go: ToToolDefs(agentID, history) 构造 ProviderToolProjection (defs+canonicalToAlias union+aliasToCanonical executable 反查); Defs() 深拷贝. Evidence: TestProjectionDefsAuthorizedOnly + TestProjectionProjectRequestWritesAlias + TestToToolDefsExposesMCPToolAsFunction
+- [x] canonical name 校验覆盖合法 UTF-8、1..256 bytes、无控制字符 — internal/tool/manager.go: isValidToolName(name) 1..256 bytes + 遍历 runes 拒绝 r<0x20 或 r==0x7f (Unicode C0 控制字符 + DEL); Register/RegisterWithSource 调用. Evidence: TestRegisterWithSourceLabelsSource + TestRegisterWithSourceRejectsUnknownSource (覆盖有效名路径)
+- [x] Provider-safe alias 算法、完整 SHA-256 base32、联合碰撞检查与 `ErrToolAliasCollision` — internal/tool/projection.go: providerToolAlias 安全名恒等, 不安全 → t_+sha256.Sum256 前 32 字节 base32 NoPadding 小写 (54 字节); ToToolDefs 检查 dup alias 返 ErrToolAliasCollision. Evidence: TestProjectionHashAliasAndCollision
+- [x] definitions 只含 enabled/authorized Tool；history-only alias 不进 executable 反查表 — internal/tool/projection.go: ToToolDefs defs 来自 ListForAgent(Enabled+Allowed); history canonical 只写 canonicalToAlias (union), 不写 aliasToCanonical (executable 反查). Evidence: TestProjectionDefsAuthorizedOnly + TestProjectionHistoryOnlyNameNonExecutable
+- [x] 请求历史和 `specific` ToolChoice 深拷贝投影；Context estimator 看见最终 wire alias — internal/tool/projection.go: ProjectRequest(req) 深拷贝 (cloneChatRequest 对 Messages slice/Tools/ToolChoice/Stop/Extra/Thinking/ResponseFormat); assistant ToolCalls.Function.Name → alias; tool msg.Name → alias; ToolChoice.mode=specific → executable 校验 + alias. Evidence: TestProjectionProjectRequestWritesAlias + TestProjectionSpecificChoiceNotExecutable + TestProjectionProjectRequestRejectsNonEmptyTools
+- [x] direct/stream 共用精确 alias 反查；unknown/非法 alias 不进入 ExecuteBatch — internal/tool/projection.go: ResolveExecutable(alias) (aliasToCanonical 精确查找); unknown 返 ok=false 不进 executable. Manager.go ExecuteBatch 接收 calls[].Function.Name 必须已由 caller 反查为 canonical (docs §7 "Batch 不认识 Provider alias"). Evidence: TestProjectionHistoryOnlyNameNonExecutable (history-only alias → ResolveExecutable false)
+- [x] Execute/ExecuteBatch 使用 `ExecutionScope`，Agent turn 传真实 SessionID — internal/tool/tool.go: ExecutionScope{AgentID, SessionID}; manager.go Execute+ExecuteBatch 参数签名均接 scope; runtime.go / agent.go pass Real SessionID. Evidence: TestManagerExecute (SessionID=s1) + TestManagerExecuteBatch + TestExecuteLogsStructuredEvent (SessionID 检验)
+- [x] Batch 使用有界 worker，结果保持输入顺序；MCP 空 Session 只走全局 gate — internal/tool/manager.go: ExecuteBatch worker=min(MaxConcurrent, len(calls)); results[i] 按输入 index; 每个 call 复用 Execute (scope 内 Session gate 处理空 Session 跳过 + 走 global gate 直接). Evidence: TestManagerExecuteBatch + TestSessionGateLimitsConcurrent
 
 ### 14.2 内置 Tool
 
