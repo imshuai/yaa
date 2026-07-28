@@ -68,6 +68,7 @@ type Manager struct {
 	closeOnce    sync.Once
 	closeDone    chan struct{}
 	closeErr     error
+	metrics      *memoryMetrics // yaa_memory_* 指标; nil → nop
 }
 
 // agentIndexState 是某 agent 向量索引的指针与 degrade 标记。
@@ -406,13 +407,17 @@ func (m *Manager) putLocked(ctx context.Context, policy config.MemoryPolicy, ite
 	// 事件 (docs/memory checklist 行14: Promote 目标发 EventPromoted, 普通Put发Added/Updated)
 	if promoted {
 		m.emit(Event{Type: EventPromoted, AgentID: commit.Stored.AgentID, Layer: commit.Stored.Layer, SessionID: commit.Stored.SessionID, Key: commit.Stored.Key, Version: commit.Stored.Version, At: now})
+		m.opInc("put", "ok")
 	} else if commit.Created {
 		m.emit(Event{Type: EventAdded, AgentID: commit.Stored.AgentID, Layer: commit.Stored.Layer, SessionID: commit.Stored.SessionID, Key: commit.Stored.Key, Version: commit.Stored.Version, At: now, Created: true})
+		m.opInc("put", "ok")
 	} else {
 		m.emit(Event{Type: EventUpdated, AgentID: commit.Stored.AgentID, Layer: commit.Stored.Layer, SessionID: commit.Stored.SessionID, Key: commit.Stored.Key, Version: commit.Stored.Version, At: now})
+		m.opInc("put", "ok")
 	}
 	for _, ev := range commit.Evicted {
 		m.emit(Event{Type: EventEvicted, AgentID: ev.AgentID, Layer: ev.Layer, SessionID: ev.SessionID, Key: ev.Key, Version: ev.Version, At: now})
+		m.evictedInc(policy.EvictionPolicy)
 	}
 
 	// 索引维护：vector 未启用 -> 固定 ready；
@@ -515,17 +520,20 @@ func (m *Manager) putIndex(ctx context.Context, stored MemoryItem, victims []Mem
 	if err != nil || len(vectors) == 0 {
 		m.markDegraded(stored.AgentID, "embedder")
 		m.emit(Event{Type: EventDegraded, AgentID: stored.AgentID, At: m.clock.Now(), Reason: "embedder"})
+			m.degradedSet("embedder", 1)
 		return IndexDegraded
 	}
 	vec := vectors[0]
 	if m.embedder.Dimension() != 0 && len(vec) != m.embedder.Dimension() {
 		m.markDegraded(stored.AgentID, "embedder")
 		m.emit(Event{Type: EventDegraded, AgentID: stored.AgentID, At: time.Now(), Reason: "embedder"})
+			m.degradedSet("embedder", 1)
 		return IndexDegraded
 	}
 	if isZeroVector(vec) {
 		m.markDegraded(stored.AgentID, "embedder")
 		m.emit(Event{Type: EventDegraded, AgentID: stored.AgentID, At: time.Now(), Reason: "embedder"})
+			m.degradedSet("embedder", 1)
 		return IndexDegraded
 	}
 	ai.mu.Lock()
@@ -534,6 +542,7 @@ func (m *Manager) putIndex(ctx context.Context, stored MemoryItem, victims []Mem
 			ai.status = IndexDegraded
 			ai.mu.Unlock()
 			m.emit(Event{Type: EventDegraded, AgentID: stored.AgentID, At: time.Now(), Reason: "index_upsert"})
+				m.degradedSet("index", 1)
 			return IndexDegraded
 		}
 	}
@@ -915,6 +924,7 @@ func (m *Manager) DeleteExpired(ctx context.Context, before time.Time, limit int
 	now := before
 	for _, it := range deleted {
 		m.emit(Event{Type: EventExpired, AgentID: it.AgentID, Layer: it.Layer, SessionID: it.SessionID, Key: it.Key, Version: it.Version, At: now})
+		m.expiredInc("ttl")
 	}
 	return len(deleted), nil
 }
@@ -1002,6 +1012,7 @@ func (m *Manager) Reindex(ctx context.Context, policy config.MemoryPolicy, agent
 	if err != nil {
 		m.markDegraded(agentID, "reindex")
 		m.emit(Event{Type: EventDegraded, AgentID: agentID, At: now, Reason: "reindex"})
+			m.degradedSet("index", 1)
 		return 0, fmt.Errorf("%w: %v", ErrMemoryReindexFailed, err)
 	}
 	if len(items) == 0 {
@@ -1022,6 +1033,7 @@ func (m *Manager) Reindex(ctx context.Context, policy config.MemoryPolicy, agent
 	if err != nil || len(vectors) != len(items) {
 		m.markDegraded(agentID, "reindex")
 		m.emit(Event{Type: EventDegraded, AgentID: agentID, At: now, Reason: "reindex"})
+			m.degradedSet("index", 1)
 		return 0, fmt.Errorf("%w: %v", ErrMemoryReindexFailed, err)
 	}
 	// 临时 index
@@ -1031,6 +1043,7 @@ func (m *Manager) Reindex(ctx context.Context, policy config.MemoryPolicy, agent
 		if uerr := tmp.Upsert(ctx, ref, vec); uerr != nil {
 			m.markDegraded(agentID, "reindex")
 			m.emit(Event{Type: EventDegraded, AgentID: agentID, At: now, Reason: "reindex"})
+				m.degradedSet("index", 1)
 			return 0, fmt.Errorf("%w: %v", ErrMemoryReindexFailed, uerr)
 		}
 	}
@@ -1040,6 +1053,7 @@ func (m *Manager) Reindex(ctx context.Context, policy config.MemoryPolicy, agent
 	ai.index = tmp
 	ai.status = IndexReady
 	ai.mu.Unlock()
+	m.reindexInc("ok")
 	return len(items), nil
 }
 
