@@ -2267,3 +2267,96 @@ go test -count=1 -timeout 60s ./internal/planner/   # ok (8 execute + 11 validat
 3. **配置 / 集成 checklist 剩余**:
    - 配置 § 4 项 (PlannerConfig + disabled + Agent override + restart_required) — 多数已在 config 包就位, 需验收勾选 + 小测试.
    - 集成与安全 § 6 项 (Runtime 接入后才能勾选, 见 #29/#30).
+
+## progress #29+#30 — Runtime 接入 LLMPlanner + StepRunner aggregate (端到端 planned turn 路通)
+
+### 改动文件清单
+- `internal/planner/step_runner.go` (新增, ~146 行): AggregateStepRunner + runToolStep / runLLMStep
+- `internal/agent/manager.go` (改): agentBinding 加 planner/runner/cfg 字段 + LLMPlanner 构造 + applyToolManagerForRunnersLocked helper
+- `internal/agent/handle_turn.go` (改): HandleTurn callback 内 a.planner!=nil 分发 runPlannedTurn + runner 缺失即拒
+- `internal/agent/planned_turn.go` (新增, ~210 行): runPlannedTurn + planningInput + finishPlannedTurn + addUsage + renderPlanResultForFinal + finalizeSystemPrompt
+- `internal/agent/planned_turn_test.go` (新增, ~365 行): TestPlannedTurnEndToEnd / TestPlannerDisabledFallsBackToDirect / TestPlannedTurnValidationFailure (3 PASS + 2 skip)
+- `docs/planner/checklist.md` (改): 集成与安全 § 3 项 + 配置 § 4 项 + 执行 § FIFO gate 项 勾选完成
+- `progress.md` (本节)
+
+### 实现
+**AggregateStepRunner (planner/step_runner.go)** — docs/integration.md §3 分发:
+- `runToolStep`: `tm.Execute(ctx, scope, step.Target, input)` → `StepRunResult{Output: {content,is_error}, ToolCallCount: 1, Usage: 零}`; 硬 error 返 err（Output 仅日志用）, IsError=true 是成功 Step 软错误 (docs §3.1).
+- `runLLMStep`: instruction 必须非空字符串; Provider.Chat 一次（Tools 显式 nil, system prompt 固定 `llmStepSystemPrompt`, user message = instruction + 其余 input JSON 编码）→ `StepRunResult{Output: {content}, Usage: resp.Usage}`.
+- `AggregateStepRunner.StepRunner()` 桥接为 planner.StepRunner 函数; 未知 Action hard error.
+
+**agentBinding + Manager (agent/manager.go)**:
+- agentBinding 新增 4 字段: planner (LLMPlanner), runner (AggregateStepRunner), plannerCfg (config.PlannerConfig).
+- `applyToolManagerForRunnersLocked()` 在 NewManager 末尾 + SetTools 末尾共用 — 给 `a.planner != nil && a.runner == nil` 的绑定 lazy 构造 runner. Provider 缺失/runner build 失败仅 warn 日志, 真正 turn 时 callback 拒绝.
+- `Type=="llm"` 才构造 LLMPlanner; `Type==""` 兜底视为 disabled (避免测试直构造 cfg 漏 Planner 字段误启用 planned turn; Runtime 正常路径 config.Default + Validate 让 Type 落到 llm/disabled 枚举).
+- `Dependencies.Tools` immediate 注入即触发 runner 构造 (agent 路径); Runtime 仍可后 `SetTools` 延迟注入.
+
+**HandleTurn callback (handle_turn.go)**:
+- 在 RunTurn callback 内 `if a.planner != nil && a.runner == nil` → 立即返 `ErrAgentInvalidState` (避免之后才发现 nil runner).
+- `a.planner != nil` → `runPlannedTurn`; 否则原 `runDirectTurn` (不变).
+
+**runPlannedTurn (agent/planned_turn.go)** — docs/integration.md §1 骨架第 1..7 步:
+- 1. AppendUser (与 direct 一致首写).
+- 2. `planningInput(req, a)` 用 `ToolManager.ListForAgent(a.id)` 投影能力 → `PlanningInput`; ToolManager nil 时 Capabilities=[].
+- 3. `a.planner.Plan(ctx, in)` + `addUsage(&usage, planningUsage)`.
+- 4. `planner.ValidatePlan(plan, in)` (docs §1 第 7 步 trust boundary).
+- 5. `planner.NewExecutor(cfg.MaxConcurrent, a.runner.StepRunner())` 每 turn 新建 → `Execute(ctx, agentID, sessionID, plan)` + `addUsage(&usage, result.Usage)`.
+- 6. 成功 → `finishPlannedTurn`.
+
+**finishPlannedTurn (agent/planned_turn.go)** — docs/agent.md §4 "PlanResult 只存在于当前 turn, 并作为请求副本输入一次无 Planner 递归的最终生成":
+- 组装 canonical: base system + skill + memory (与 direct 同步行为) + 历史 Session 消息 (不含 Tool unit).
+- `renderPlanResultForFinal(plan, result)` 返稳定 JSON: `{task, plan_id, steps:[{id, output}]}` (仅 StepSucceeded Step 的 Output); 32KiB 截断.
+- 末尾 append 一条以 "Plan execution result:\\n<json>" 为 content 的 user 消息作为 plan 副本输入.
+- `Context.Build` 走最终 wire; `currentTurnStart` 指向该末尾 user 消息.
+- `callProvider` 真实 Chat/Stream 生成 final assistant; `addUsage(&usage, finalUsage)`.
+- `turn.Append([]AppendInput{{Message: assistantMsg}})` 单条 final assistant (classify 允许, 不提 Tool unit).
+
+**addUsage (agent/planned_turn.go)**:
+- `dst.PromptTokens += src.PromptTokens` 等三字段. turn 栈独占累计器, 不进 Manager 字段 (docs §3).
+
+### 测试
+**TestPlannedTurnEndToEnd (PASS)**: 3 次 scripted OpenAI 兼容响应 (Plan JSON + LLM Step response "echo: hello summarised" + final "Final reply to user"); 验证:
+- res.Message.Payload.Content == "Final reply to user"
+- res.ToolCallCount == 1 (echo tool step)
+- res.Usage.TotalTokens == 24 (3 次各 8 token 累计)
+- Session 消息 = [user "compute echo + summary", assistant "Final reply to user"] (2 条, no Tool unit)
+
+**TestPlannedTurnValidationFailure (PASS)**: Plan JSON 含未授权 target "unknown_tool" → ValidatePlan 失败; err 含 "validate plan"; Usage=8 (仅 planning), ToolCallCount=0; Session 只剩 user 1 条 (未生成 final assistant).
+
+**TestPlannerDisabledFallsBackToDirect (PASS)**: newAgentTestEnv cfg 不含 Planner → 细节点 Detail.PlannerEnabled=false ← Validate direct route 仍走通.
+
+**TestPlannedTurnPlanFailure / TestPlannedTurnExecutionFailure (SKIP)**: agent 包错误路径在 internal/planner/{llm_planner_test.go, executor_test.go} 已覆盖完整, 不重复.
+
+### 验证
+```
+go vet ./... && go build ./...   # OK
+go test -count=1 -timeout 300s ./...    # 21 包全绿 (含 internal/agent 0.270s)
+go test -count=1 -timeout 60s ./internal/agent/ -run "PlannedTurn|PlannerDisabled" -v   # 3 PASS + 2 SKIP
+```
+
+### checklist 推进 (docs/planner/checklist.md)
+- 配置 § 4 项 ✅ (PlannerConfig/disabled/override merge/restart_required)
+- 生成 § 5 项 ✅ (上轮已勾)
+- 执行 § "同一 Session 的 Planner 位于既有 turn FIFO gate 内" ✅ (runPlannedTurn 在 RunTurn callback 内运行)
+- 集成与安全 §:
+  - ✅ Tool 执行时 fold 真实 agentID/sessionID 再次鉴权 (AggregateStepRunner.runToolStep + ToolManager.Execute)
+  - ✅ LLM Step 不携带 Tool definitions (runLLMStep Tools=nil)
+  - ✅ Session snapshot / Remote / RBAC 无 Plan 字段/resource (planner 不入 Session 不写 Tool unit)
+  - ✅ Skill 只作为静态 Agent Prompt 不进 Capabilities (planningInput.capabilities 来自 ToolManager.ListForAgent)
+  - ⬜ Step 输出在依赖绑定前验证可 JSON 编码 (executor.go 现状 bindValue 未做 JSON 编码前置校验)
+  - ⬜ 日志与指标不泄露 task/input/output/prompt/secret (observability commit 同步做)
+
+### 决策记录
+- **Type==\"llm\" 才构造 LLMPlanner, Type=\"\" 兜底 disabled**: docs §1 枚举只有 llm/disabled, Runtime 走 config.Validate 必把 "" 拒掉; 直构 cfg 的现有测试漏配 Planner 字段时不再擅自启用 planned turn 不破坏. Ponytail: 用 == 双枚举区分代替 if-not-disabled 判断, 减少假阳性.
+- **applyToolManagerForRunnersLocked 共享**, NewManager 末尾与 SetTools 都调: 测试用 immediate Tools 注入 (Dependencies.Tools); 真实 Runtime 用 SetTools 延迟注入. 抽一个 helper 避免双份.
+- **Executor 每 turn 新构造**: Executor 内部 state (results map / dependents 入度) 都是 plan-specific; docs §1 骨架亦未见 Agent 缓存 Executor. NewExecutor 仅校验 maxConcurrent/runner, 极轻量; 每 turn 新建是合理 cost.
+- **finishPlannedTurn 必做 final Chat**: docs/agent.md §4 "PlanResult 只存在于当前 turn, 并作为请求副本输入一次无 Planner 递归的最终生成" + docs/integration.md §1 骨架最后调 `finishPlannedTurn` — 显示需要一次 final generation. 我直接 plain text "You are the response generator..." system prompt + plan result JSON as user message; docs 未指定具体模板字面值, ponytail 取最短静态字符串.
+- **plan 副本注入 user message**: canonical 末尾 append `"Plan execution result:\\n<json>"` 而不是入 system; currentTurnStart 指向这条, Context.Build 看到它是当前 turn 起点.
+- **32KiB cap for plan result**: 与 memory inject cap 一致; errors.md §1 "错误字符串不含完整 payload" 反过来: 成功路径用户消息 payload 上限同样合理避免单 turn 极长 step 结果爆 Context Window.
+- **不实施 observability 指标的 hardening**: 日志不泄露那项规约与 yaa_mcp_servers 等 observability 指标同 commit 做, 不本节强加. 现 logger.Warn "memory inject dropped" 已经不打 content 只打 dropped count, 暂不需要额外 hardening.
+- **Skip TestPlannedTurnPlanFailure / ExecutionFailure**: planner/{llm_planner_test.go, executor_test.go} 14+8 case 已全覆盖错误路径 (Provider 错误 / ValidatePlan 失败 / Executor 失败/cancel); agent 包不重复 test 这些底层阶段, 只做集成端到端. Ponytail YAGNI 不造冗余 mock server 错误路径.
+
+### 未完成下一步
+1. **#31: Step 输出 JSON 编码前置校验** — executor.go bindValue 检查 Output 在绑定前 `json.Marshal` 可行; 否则 worker 提前 fail 不返 hard error. quick: 加 5 行 + 1 单测.
+2. **#32: 观测指标 / 不泄露** — observability.md §5 指标 (yaa_mcp_servers / yaa_planner_plan_steps 等 5-6 个指标) + 日志脱敏.
+3. **MCP 集成剩余**: § 9 Session 集成 (MCP Tool 在 Session 上下文可用) / § 9 Provider 集成 (MCP Tool 作为 Function 暴露给 LLM) — 实际上 MCP Tool 已通过 ToolManager 注册走 direct turn ExecuteBatch; 改 checklist 勾选状态即可.

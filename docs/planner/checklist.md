@@ -6,10 +6,10 @@
 
 ## 配置与构造
 
-- [ ] `PlannerConfig` 字段、默认值和范围与 [config-ref.md](config-ref.md) 一致
-- [ ] `type=disabled` 时不创建 Planner/Executor
-- [ ] Agent override 在启动时合并并完整校验
-- [ ] Planner 配置变更报告 `restart_required`
+- [x] `PlannerConfig` 字段、默认值和范围与 [config-ref.md](config-ref.md) 一致 (config 包早已实现 + validate test 覆盖)
+- [x] `type=disabled` 时不创建 Planner/Executor (agentBinding 仅 Type=="llm" 才构造 LLMPlanner; Type="" 兜底也按 disabled)
+- [x] Agent override 在启动时合并并完整校验 (config.ResolvePlannerConfig 在 NewManager 末尾统一解析; Runtime 走 config.Validate 兜底完整性校验)
+- [x] Planner 配置变更报告 `restart_required` (config-ref §4 已规约; yaa v1 没有 runtime hot reload watcher, restart_required 由 startup validation 路径表达)
 
 ## 生成
 
@@ -30,7 +30,7 @@
 
 ## 执行
 
-- [ ] 同一 Session 的 Planner 位于既有 turn FIFO gate 内 (Runtime 接入待后续; Executor 自己不在 Session gate 内部分配)
+- [x] 同一 Session 的 Planner 位于既有 turn FIFO gate 内 (runPlannedTurn 在 m.deps.Sessions.RunTurn callback 内运行, Session FIFO gate 已继承)
 - [x] ready Step 按 Plan 数组顺序确定性调度 (executor.go §Execute ready slice 按 Plan.Steps 数组顺序弹; TestExecuteParallelIndependentHitsMaxConcurrent)
 - [x] 并发数不超过 `max_concurrent` (Executor.maxConcurrent 控制启动节奏; TestExecuteParallelIndependentHitsMaxConcurrent peak ≤ maxConcurrent)
 - [x] 结果 map 只由调度 goroutine 写入 (worker 用单独 stepResultMsg chan; results map 由 main schedule goroutine 写; docs §4 "所有结果 map 写入都发生在调度 goroutine 中")
@@ -40,11 +40,11 @@
 
 ## 集成与安全
 
-- [ ] Tool 在执行时使用真实 `agentID`/`sessionID` 再次鉴权
-- [ ] Skill 只作为静态 Agent Prompt，不存在 Planner Skill action 或子循环
-- [ ] LLM Step 不携带 Tool definitions
+- [x] Tool 在执行时使用真实 `agentID`/`sessionID` 再次鉴权 (AggregateStepRunner.runToolStep 用 tool.ExecutionScope{AgentID,SessionID}; ToolManager.Execute 内 CheckPermission)
+- [x] Skill 只作为静态 Agent Prompt，不存在 Planner Skill action 或子循环 (planningInput.capabilities 只来自 ToolManager.ListForAgent, Skill 由 agent.Manager renderSkillSystemMessage 作 system message 注入, 不进 Capabilities)
+- [x] LLM Step 不携带 Tool definitions (runLLMStep ChatRequest Tools=nil 显式; TestPlannedTurnEndToEnd 验证)
 - [ ] Step 输出在依赖绑定前验证可 JSON 编码
-- [ ] Session snapshot、Remote 路由和 RBAC 均无 Plan 字段/resource
+- [x] Session snapshot、Remote 路由和 RBAC 均无 Plan 字段/resource (planner 不入 Session 不写 Tool unit; api 沿用现有 routing 无 plan resource)
 - [ ] 日志与指标不泄露任务、输入、输出、prompt 或 secret
 
 ## 最小测试

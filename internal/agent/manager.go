@@ -12,6 +12,7 @@ import (
 	"github.com/imshuai/yaa/internal/config"
 	ctxwindow "github.com/imshuai/yaa/internal/context"
 	mm "github.com/imshuai/yaa/internal/memory"
+	"github.com/imshuai/yaa/internal/planner"
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/session"
 	"github.com/imshuai/yaa/internal/skill"
@@ -41,6 +42,11 @@ type agentBinding struct {
 	sysPrompt string
 	maxTokens int
 	status    Status
+	// Planner v1 接入 (docs/planner/integration.md §1).
+	// plannerType=disabled 时 planner / runner 都为 nil, HandleTurn 走 runDirectTurn.
+	planner     *planner.LLMPlanner
+	runner      *planner.AggregateStepRunner // 在 SetTools 完成后 lazy 构造, 供 runPlannedTurn 组装 Executor
+	plannerCfg  config.PlannerConfig           // resolved effective 配置, 用于 max_steps/max_concurrent/timeout
 }
 
 // Manager 是 Agent Manager。
@@ -100,16 +106,30 @@ func NewManager(deps Dependencies) (*Manager, error) {
 		if maxTokens <= 0 {
 			return nil, fmt.Errorf("agent %q: max_tokens must be > 0", a.ID)
 		}
+		// Resolve planner config (docs/planner/integration.md §1 + config-ref §3).
+		// disabled 时 planner/runner 都为 nil, HandleTurn 走 runDirectTurn (docs §1 "if a.planner == nil").
+		effectiveCfg := config.ResolvePlannerConfig(m.deps.Config.Planner, a.Planner)
+		var plan *planner.LLMPlanner
+		// 仅 Type=="llm" 才构造 LLMPlanner (docs/planner/config-ref.md §2 枚举 llm/disabled).
+		// 有效 cfg 走 config.Validate 时 Type="" 已被拒; 测试直构造 cfg 漏配 Planner 字段时
+		// 这里兜底按 disabled 处理不擅自构造 (避免缺 step runner 即走 planned turn).
+		if effectiveCfg.Type == "llm" {
+			plan = planner.NewLLMPlanner(p, effectiveCfg)
+		}
 		m.agents[a.ID] = &agentBinding{
-			id:        a.ID,
-			name:      a.Name,
-			provider:  a.Provider,
-			model:     a.Model,
-			sysPrompt: a.SystemPrompt,
-			maxTokens: maxTokens,
-			status:    StatusRunning,
+			id:         a.ID,
+			name:       a.Name,
+			provider:   a.Provider,
+			model:      a.Model,
+			sysPrompt:  a.SystemPrompt,
+			maxTokens:  maxTokens,
+			status:     StatusRunning,
+			planner:    plan,
+			plannerCfg: effectiveCfg,
 		}
 	}
+	// 工具已 immediate 注入 (Dependencies.Tools 非 nil) 时, 各 planner-enabled 绑定现在构造 runner.
+	m.applyToolManagerForRunnersLocked()
 	return m, nil
 }
 
@@ -146,7 +166,7 @@ func (m *Manager) Inspect(id string) (Detail, error) {
 		Tools:          []string{},
 		Skills:         []string{},
 		MemoryEnabled:  memEn,
-		PlannerEnabled: false,
+		PlannerEnabled: a.planner != nil,
 	}, nil
 }
 
@@ -258,10 +278,46 @@ func (m *Manager) SetSessions(sm *session.Manager) {
 }
 
 // SetTools 延迟注入 Tool Manager（Runtime 先构造 Agent，再创建 Tool Manager 并注册 builtin）。
+// 对每个 planner.enabled 且 Tools 已注入的 agentBinding 构造 AggregateStepRunner
+// (docs/planner/integration.md §3). LLM Step 复用该 Agent 自己的 provider.Provider 和 model/max_tokens.
 func (m *Manager) SetTools(tm *tool.Manager) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.deps.Tools = tm
-	m.mu.Unlock()
+	if tm == nil {
+		return
+	}
+	m.applyToolManagerForRunnersLocked()
+}
+
+// applyToolManagerForRunnersLocked 给每个 a.planner!=nil 且 a.runner==nil 的绑定构造 AggregateStepRunner.
+// 调用方持 m.mu. Provider 已在 NewManager 验证. 缺失 Tool/Provider 跳过该 Agent, runPlannedTurn 时再拒.
+func (m *Manager) applyToolManagerForRunnersLocked() {
+	if m.deps.Tools == nil {
+		return
+	}
+	for _, a := range m.agents {
+		if a.planner == nil || a.runner != nil {
+			continue
+		}
+		p, perr := m.deps.Providers.Get(a.provider)
+		if perr != nil {
+			if m.deps.Logger != nil {
+				m.deps.Logger.Warn("agent planner step runner provider missing",
+					"agent", a.id, "provider", a.provider)
+			}
+			continue
+		}
+		runner, rerr := planner.NewAggregateStepRunner(m.deps.Tools, p, a.model, a.maxTokens)
+		if rerr != nil {
+			if m.deps.Logger != nil {
+				m.deps.Logger.Warn("agent planner step runner build failed",
+					"agent", a.id, "err", rerr.Error())
+			}
+			continue
+		}
+		a.runner = runner
+	}
 }
 
 // SetSkills 延迟注入 Skill Manager（Runtime 在 Tool Manager 之后才创建 Skill Manager 并完成 Agent binding）。

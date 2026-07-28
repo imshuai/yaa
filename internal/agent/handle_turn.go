@@ -61,6 +61,18 @@ func (m *Manager) HandleTurn(ctx context.Context, agentID string, req TurnReques
 
 	err := m.deps.Sessions.RunTurn(ctx, req.SessionID, req.TurnID, onQueued,
 		func(turnCtx context.Context, turn *session.Turn) error {
+			// planner.enabled 时走 planned turn (docs/planner/integration.md §1). a.planner==nil 是
+			// planner.type=disabled 的唯一标识 — 静默回退直接 Agent Loop (docs §1 + §4 不允许中途降级).
+			// runner 缺失视为 Planner 配置错误, 直接拒绝 turn 以避免运行才发现 nil runner.
+			if a.planner != nil && a.runner == nil {
+				return fmt.Errorf("%w: planner enabled but step runner missing for agent %s",
+					ErrAgentInvalidState, agentID)
+			}
+			if a.planner != nil {
+				r, e := m.runPlannedTurn(turnCtx, turn, req, a, p)
+				result = r
+				return e
+			}
 			r, e := m.runDirectTurn(turnCtx, turn, req, a, p)
 			result = r
 			return e
