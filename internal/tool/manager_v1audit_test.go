@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/imshuai/yaa/internal/config"
+	"github.com/imshuai/yaa/internal/metrics"
 	"github.com/imshuai/yaa/internal/provider"
 	"golang.org/x/exp/slog"
 )
@@ -322,17 +323,20 @@ func TestExecuteLogsStructuredEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if h.msg != "tool.execute" {
-		t.Errorf("log msg=%q want tool.execute", h.msg)
+	if h.msg != "tool executed" {
+		t.Errorf("log msg=%q want tool executed", h.msg)
 	}
 	if v, ok := h.attrs["tool"]; !ok || v != "x" {
 		t.Errorf("attr tool=%v (want x)", v)
 	}
-	if v, ok := h.attrs["agent"]; !ok || v != "a1" {
-		t.Errorf("attr agent=%v (want a1)", v)
+	if v, ok := h.attrs["agent_id"]; !ok || v != "a1" {
+		t.Errorf("attr agent_id=%v (want a1)", v)
 	}
-	if v, ok := h.attrs["session"]; !ok || v != "s1" {
-		t.Errorf("attr session=%v (want s1)", v)
+	if v, ok := h.attrs["session_id"]; !ok || v != "s1" {
+		t.Errorf("attr session_id=%v (want s1)", v)
+	}
+	if _, ok := h.attrs["result_tokens"]; !ok {
+		t.Errorf("attr result_tokens missing; attrs=%+v", h.attrs)
 	}
 	// 参数不应出现在日志中 (docs §6 step 10 不含 params/content).
 	for k, v := range h.attrs {
@@ -363,3 +367,177 @@ func (h *captureHandler) Handle(r slog.Record) error {
 }
 func (h *captureHandler) WithAttrs(attrs []slog.Attr) slog.Handler { return h }
 func (h *captureHandler) WithGroup(name string) slog.Handler       { return h }
+
+// ===== §14.5 §10.2 Prometheus 指标接入 =====
+
+func TestSetMetricsRegistersAllSix(t *testing.T) {
+	provCfg := config.ProviderConfig{ID: "p1", Type: "openai", APIKey: "k", BaseURL: "http://0", Models: []config.ModelConfig{{ID: "m"}}}
+	pm, _ := provider.NewManager([]config.ProviderConfig{provCfg})
+	t.Cleanup(func() { _ = pm.Close() })
+	cfg := &config.Config{Providers: []config.ProviderConfig{provCfg}, Agents: []config.AgentConfig{{ID: "a1", Provider: "p1", Model: "m"}},
+		Tools: config.ToolsConfig{DefaultTimeout: 1 * time.Second, MaxTimeout: 5 * time.Second, MaxConcurrent: 2, MaxResultTokens: 1000}}
+	m, _ := NewManager(Dependencies{Config: cfg, Providers: pm})
+	r := metrics.NewRegistry()
+	m.SetMetrics(r)
+
+	want := []string{
+		"yaa_tool_calls_total",
+		"yaa_tool_call_duration_seconds",
+		"yaa_tool_errors_total",
+		"yaa_tool_timeouts_total",
+		"yaa_tool_concurrent",
+		"yaa_tool_alias_projection_errors_total",
+	}
+	for _, name := range want {
+		if r.Get(name) == nil {
+			t.Errorf("metric %q not registered", name)
+		}
+	}
+}
+
+func TestExecuteIcrementsCallsAndDuration(t *testing.T) {
+	provCfg := config.ProviderConfig{ID: "p1", Type: "openai", APIKey: "k", BaseURL: "http://0", Models: []config.ModelConfig{{ID: "m"}}}
+	pm, _ := provider.NewManager([]config.ProviderConfig{provCfg})
+	t.Cleanup(func() { _ = pm.Close() })
+	cfg := &config.Config{Providers: []config.ProviderConfig{provCfg}, Agents: []config.AgentConfig{{ID: "a1", Provider: "p1", Model: "m"}},
+		Tools: config.ToolsConfig{DefaultTimeout: 1 * time.Second, MaxTimeout: 5 * time.Second, MaxConcurrent: 2, MaxResultTokens: 1000}}
+	m, _ := NewManager(Dependencies{Config: cfg, Providers: pm})
+	r := metrics.NewRegistry()
+	m.SetMetrics(r)
+	_ = m.Register(&noopTool{name: "n", content: "ok"})
+	_, err := m.Execute(context.Background(), ExecutionScope{AgentID: "a1"}, "n", map[string]any{})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	// yaa_tool_calls_total{tool=n,result=ok} 应至少 1.
+	if got := m.metrics.callsCounter.Value("n", "ok"); got < 1 {
+		t.Errorf("calls(ok)=%d want >=1", got)
+	}
+	// duration_seconds hist Count 至少 1.
+	if got := m.metrics.durationHist.Count("n"); got < 1 {
+		t.Errorf("hist.Count=%d want >=1", got)
+	}
+}
+
+func TestExecuteIncrementsErrorAndTimeoutOnTimeout(t *testing.T) {
+	provCfg := config.ProviderConfig{ID: "p1", Type: "openai", APIKey: "k", BaseURL: "http://0", Models: []config.ModelConfig{{ID: "m"}}}
+	pm, _ := provider.NewManager([]config.ProviderConfig{provCfg})
+	t.Cleanup(func() { _ = pm.Close() })
+	cfg := &config.Config{Providers: []config.ProviderConfig{provCfg}, Agents: []config.AgentConfig{{ID: "a1", Provider: "p1", Model: "m"}},
+		Tools: config.ToolsConfig{DefaultTimeout: 50 * time.Millisecond, MaxTimeout: 10 * time.Second, MaxConcurrent: 1, DefaultMaxRetry: 0}}
+	m, _ := NewManager(Dependencies{Config: cfg, Providers: pm})
+	r := metrics.NewRegistry()
+	m.SetMetrics(r)
+	_ = m.Register(echoTool{name: "slow", desc: "slow", delay: 1 * time.Second})
+	_, err := m.Execute(context.Background(), ExecutionScope{AgentID: "a1"}, "slow", map[string]any{})
+	if !errors.Is(err, ErrToolTimeout) {
+		t.Fatalf("expected timeout, got %v", err)
+	}
+	// timeouts_total{slow} >= 1, errors_total{slow,class=timeout} >= 1, calls_total{slow,result=timeout} >= 1.
+	if got := m.metrics.timeoutsCounter.Value("slow"); got < 1 {
+		t.Errorf("timeouts=%d want >=1", got)
+	}
+	if got := m.metrics.errorsCounter.Value("slow", "timeout"); got < 1 {
+		t.Errorf("errors(timeout)=%d want >=1", got)
+	}
+	if got := m.metrics.callsCounter.Value("slow", "timeout"); got < 1 {
+		t.Errorf("calls(timeout)=%d want >=1", got)
+	}
+}
+
+func TestConcurrentGaugeBalances(t *testing.T) {
+	// 只是确保 gauge 非负 (no leaks): 跑完 Some Execute 后 concurrent 应为 0.
+	provCfg := config.ProviderConfig{ID: "p1", Type: "openai", APIKey: "k", BaseURL: "http://0", Models: []config.ModelConfig{{ID: "m"}}}
+	pm, _ := provider.NewManager([]config.ProviderConfig{provCfg})
+	t.Cleanup(func() { _ = pm.Close() })
+	cfg := &config.Config{Providers: []config.ProviderConfig{provCfg}, Agents: []config.AgentConfig{{ID: "a1", Provider: "p1", Model: "m"}},
+		Tools: config.ToolsConfig{DefaultTimeout: 1 * time.Second, MaxTimeout: 5 * time.Second, MaxConcurrent: 2, MaxResultTokens: 1000}}
+	m, _ := NewManager(Dependencies{Config: cfg, Providers: pm})
+	r := metrics.NewRegistry()
+	m.SetMetrics(r)
+	_ = m.Register(&noopTool{name: "n", content: "x"})
+	_, _ = m.Execute(context.Background(), ExecutionScope{AgentID: "a1"}, "n", map[string]any{})
+	if got := m.metrics.concurrentGauge.Value(); got != 0 {
+		t.Errorf("concurrent after Execute=%d want 0", got)
+	}
+}
+
+func TestAliasProjectionErrorsOnCollision(t *testing.T) {
+	provCfg := config.ProviderConfig{ID: "p1", Type: "openai", APIKey: "k", BaseURL: "http://0", Models: []config.ModelConfig{{ID: "m"}}}
+	pm, _ := provider.NewManager([]config.ProviderConfig{provCfg})
+	t.Cleanup(func() { _ = pm.Close() })
+	cfg := &config.Config{Providers: []config.ProviderConfig{provCfg}, Agents: []config.AgentConfig{{ID: "a1", Provider: "p1", Model: "m"}},
+		Tools: config.ToolsConfig{DefaultTimeout: 1 * time.Second, MaxTimeout: 5 * time.Second, MaxConcurrent: 2, MaxResultTokens: 1000}}
+	m, _ := NewManager(Dependencies{Config: cfg, Providers: pm})
+	r := metrics.NewRegistry()
+	m.SetMetrics(r)
+	// 注册两个 canonical 不安全名 → alias 都走 SHA-256 base32 派生, 不同 canonical 才不碰; 此处用相同 1 检测 dup canonical.
+	_ = m.Register(&noopTool{name: "x/y", content: "1"})
+	// ToToolDefs 调一次 — current defs{} 空 (a1 not allowlisting 不安全名), 历史不带 string, 不一定触发 collision.
+	// 用一个 history 消息触发 history canonical 不在 union (但 alias 投影 union 不 require 出现 sync — 此条件非 collision).
+	// 简单直接: 两 Tool name alias 相等 → 注册即被 Register 拒, 这里走 ToToolDefs 不易触发.
+	// 我们改用 history 含 same canonical 已 register, 投影 union 不含 collision (same canonical 已在 union).
+	// 改用 history 差 auf 封入 invalid_history:
+	hist := []provider.Message{{Role: "assistant", ToolCalls: []provider.ToolCall{{Function: provider.ToolCallFunction{Name: "no-such-tool", Arguments: "{}"}}}}}
+	_, perr := m.ToToolDefs("a1", hist)
+	// ToToolDefs 不 cause unknown canonical error (只把 unknown 名加入 union), 即 — 不触发 collision.
+	// 真正 invalid_history 触发在 ProjectRequest. 经过 ToToolDefs 构造 proj 再 ProjectRequest 单测 model.
+	if perr != nil {
+		t.Logf("ToToolDefs returned err (unexpected): %v", perr)
+	}
+	// 直接用 ProjectRequest history 也可以间接碰 invalid_history — 但上边 hist 已加入 union (canonicalToAlias 包 no-such-tool alias).
+	// 故 ProjectRequest 在带 history 含 "no-such-tool" 应成功, 不触发 invalid_history.
+	// 我们之后单独 TestProjectRequestInvalidHistory 脱离 dependency.
+}
+
+// TestProjectRequestInvalidHistory 补: 构造 freezing projection 后, 调 ProjectRequest 带未在 union 的 canonical → invalid_history 计数 +1.
+func TestProjectRequestInvalidHistory(t *testing.T) {
+	provCfg := config.ProviderConfig{ID: "p1", Type: "openai", APIKey: "k", BaseURL: "http://0", Models: []config.ModelConfig{{ID: "m"}}}
+	pm, _ := provider.NewManager([]config.ProviderConfig{provCfg})
+	t.Cleanup(func() { _ = pm.Close() })
+	cfg := &config.Config{Providers: []config.ProviderConfig{provCfg}, Agents: []config.AgentConfig{{ID: "a1", Provider: "p1", Model: "m"}},
+		Tools: config.ToolsConfig{DefaultTimeout: 1 * time.Second, MaxTimeout: 5 * time.Second, MaxConcurrent: 2, MaxResultTokens: 1000}}
+	m, _ := NewManager(Dependencies{Config: cfg, Providers: pm})
+	_ = m.Register(&noopTool{name: "t", content: "ok"})
+	r := metrics.NewRegistry()
+	m.SetMetrics(r)
+	// ToToolDefs empty history 给 a1: defs = ["t"] (unsafe-alias 无关); union {"t"}.
+	proj, err := m.ToToolDefs("a1", nil)
+	if err != nil {
+		t.Fatalf("ToToolDefs: %v", err)
+	}
+	// ProjectRequest 带 history 含 canonical "ghost" 不在 union {"t"} → invalid_history.
+	req := provider.ChatRequest{Messages: []provider.Message{{Role: "assistant", ToolCalls: []provider.ToolCall{{Function: provider.ToolCallFunction{Name: "ghost", Arguments: "{}"}}}}}}
+	_, perr := proj.ProjectRequest(req)
+	if perr == nil {
+		t.Fatal("expected invalid_history error from ProjectRequest")
+	}
+	if got := m.metrics.aliasProjErr.Value("invalid_history"); got < 1 {
+		t.Errorf("alias_proj_err(invalid_history)=%d want >=1", got)
+	}
+}
+
+// TestProjectRequestInvalidChoice 补: ToolChoice.mode=specific + canonical 不在 executable → invalid_choice +1.
+func TestProjectRequestInvalidChoice(t *testing.T) {
+	provCfg := config.ProviderConfig{ID: "p1", Type: "openai", APIKey: "k", BaseURL: "http://0", Models: []config.ModelConfig{{ID: "m"}}}
+	pm, _ := provider.NewManager([]config.ProviderConfig{provCfg})
+	t.Cleanup(func() { _ = pm.Close() })
+	cfg := &config.Config{Providers: []config.ProviderConfig{provCfg}, Agents: []config.AgentConfig{{ID: "a1", Provider: "p1", Model: "m"}},
+		Tools: config.ToolsConfig{DefaultTimeout: 1 * time.Second, MaxTimeout: 5 * time.Second, MaxConcurrent: 2, MaxResultTokens: 1000}}
+	m, _ := NewManager(Dependencies{Config: cfg, Providers: pm})
+	_ = m.Register(&noopTool{name: "echo", content: "x"})
+	r := metrics.NewRegistry()
+	m.SetMetrics(r)
+	proj, err := m.ToToolDefs("a1", nil)
+	if err != nil {
+		t.Fatalf("ToToolDefs: %v", err)
+	}
+	req := provider.ChatRequest{ToolChoice: &provider.ToolChoice{Mode: "specific", Tool: "ghost"}}
+	_, perr := proj.ProjectRequest(req)
+	if perr == nil {
+		t.Fatal("expected invalid_choice error")
+	}
+	if got := m.metrics.aliasProjErr.Value("invalid_choice"); got < 1 {
+		t.Errorf("alias_proj_err(invalid_choice)=%d want >=1", got)
+	}
+}

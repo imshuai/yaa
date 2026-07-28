@@ -51,7 +51,7 @@
 
 - [ ] Plugin RPC Tool capability 与 Proxy 注册
 - [ ] 配置文件声明注册
-- [ ] Runtime 内置 Tool 的静态 Go 注册
+- [x] Runtime 内置 Tool 的静态 Go 注册
 
 ### 14.4 Context 集成
 
@@ -62,10 +62,10 @@
 
 ### 14.5 可观测性
 
-- [ ] 执行日志（tool/agent/session/duration/result_tokens）
-- [ ] Prometheus 指标
-- [ ] Remote API 事件推送
-- [ ] alias 不作为日志/指标 label；协议错误不记录 Provider 返回的原始 name
+- [x] 执行日志（tool/agent/session/duration/result_tokens）
+- [x] Prometheus 指标
+- [x] Remote API 事件推送
+- [x] alias 不作为日志/指标 label；协议错误不记录 Provider 返回的原始 name
 
 ---
 

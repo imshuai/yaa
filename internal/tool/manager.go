@@ -22,6 +22,7 @@ type Manager struct {
 	cfg       *config.Config
 	providers *provider.Manager
 	logger    *slog.Logger
+	metrics   *toolMetrics     // nil → nop; docs/tool/observability.md §10.2
 
 	mu      sync.RWMutex
 	tools   map[string]Tool
@@ -305,6 +306,12 @@ func (m *Manager) Execute(ctx context.Context, scope ExecutionScope, toolName st
 		maxRetry = 0
 	}
 
+	// metrics: yaa_tool_concurrent (docs/tool/observability.md §10.2). Inc acquire gate 前, Dec 在 Execute 最终离开时.
+	if m.metrics != nil {
+		m.metrics.concurrentGauge.Inc()
+		defer m.metrics.concurrentGauge.Dec()
+	}
+
 	// Session/global gate (docs §6 step 6 空可选; Session 非空时先获取再获取 global; 任一可被 caller 取消).
 	var sessSem sema
 	if scope.SessionID != "" {
@@ -342,14 +349,17 @@ func (m *Manager) Execute(ctx context.Context, scope ExecutionScope, toolName st
 	beginAt := time.Now()
 	var result ToolResult
 	var err error
+	retryLoop:
 	for attempt := 0; attempt <= maxRetry; attempt++ {
 		result, err = t.Execute(callCtx, scope, params)
 		// docs §6 step 8: caller cause 先于 child cause 先于 retryable.
 		if ctx.Err() != nil {
-			return ToolResult{}, context.Cause(ctx)
+			err = context.Cause(ctx)
+			break retryLoop
 		}
 		if callCtx.Err() != nil {
-			return ToolResult{}, context.Cause(callCtx)
+			err = context.Cause(callCtx)
+			break retryLoop
 		}
 		// 成功 (含 IsError) 或已耗尽重试 → 终止.
 		if err == nil {
@@ -374,9 +384,11 @@ func (m *Manager) Execute(ctx context.Context, scope ExecutionScope, toolName st
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
-			return ToolResult{}, context.Cause(ctx)
+			err = context.Cause(ctx)
+			break retryLoop
 		case <-callCtx.Done():
-			return ToolResult{}, context.Cause(callCtx)
+			err = context.Cause(callCtx)
+			break retryLoop
 		}
 	}
 
@@ -385,14 +397,34 @@ func (m *Manager) Execute(ctx context.Context, scope ExecutionScope, toolName st
 		result.Content = m.truncateResult(scope.AgentID, result.Content)
 	}
 
-	// docs §6 step 10: 结构化日志, 不含 params/content.
+	// docs/tool/observability.md §10.2 metrics (alias 不进 label; result ∈ {ok,error,timeout}; class 稳定分类).
+	durSec := time.Since(beginAt).Seconds()
+	rLabel := resultLabel(err, result.IsError)
+	if m.metrics != nil {
+		m.metrics.callsCounter.Inc(toolName, rLabel)
+		m.metrics.durationHist.Observe(durSec, toolName)
+		if err != nil {
+			m.metrics.errorsCounter.Inc(toolName, errorClass(err))
+		}
+		if rLabel == "timeout" {
+			m.metrics.timeoutsCounter.Inc(toolName)
+		}
+	}
+
+	// docs/tool/observability.md §10.1: 结构化日志 + result_tokens; 不含 params/content/params 和 result content.
 	if m.logger != nil {
-		m.logger.Info("tool.execute",
-			"agent", scope.AgentID,
-			"session", scope.SessionID,
+		// result_tokens 走 Provider estimator 估算 Result.Content (使用与 §6 step 9 相同的 char/4 启发).
+		resultTokens := 0
+		if result.Content != "" {
+			resultTokens = len(result.Content) / 4
+		}
+		m.logger.Info("tool executed",
 			"tool", toolName,
+			"agent_id", scope.AgentID,
+			"session_id", scope.SessionID,
 			"duration_ms", time.Since(beginAt).Milliseconds(),
 			"is_error", result.IsError,
+			"result_tokens", resultTokens,
 		)
 	}
 	return result, err

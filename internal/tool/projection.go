@@ -45,6 +45,11 @@ type ProviderToolProjection struct {
 
 	// aliasToCanonical 仅含 current definitions（executable 反查表）。
 	aliasToCanonical map[string]string
+
+	// projectionErr 是可选的 alias projection 失败埋点 (docs/tool/observability.md §10.2
+	// yaa_tool_alias_projection_errors_total{reason=collision|invalid_history|invalid_choice}).
+	// nil → nop; 由 Manager.ToToolDefs 在构造时注入.
+	projectionErr func(reason string)
 }
 
 // Defs 返回不可变 definitions 的深拷贝，调用方可安全持有/修改。
@@ -94,6 +99,8 @@ func (p *ProviderToolProjection) ProjectRequest(req provider.ChatRequest) (provi
 			for j := range m.ToolCalls {
 				alias, ok := p.resolveAlias(m.ToolCalls[j].Function.Name)
 				if !ok {
+					p.recordAliasProjErr("invalid_history")
+					p.recordAliasProjErr("invalid_history")
 					return provider.ChatRequest{}, fmt.Errorf("tool: projection missing canonical %q in assistant tool call",
 						m.ToolCalls[j].Function.Name)
 				}
@@ -103,6 +110,8 @@ func (p *ProviderToolProjection) ProjectRequest(req provider.ChatRequest) (provi
 			if m.Name != "" {
 				alias, ok := p.resolveAlias(m.Name)
 				if !ok {
+					p.recordAliasProjErr("invalid_history")
+					p.recordAliasProjErr("invalid_history")
 					return provider.ChatRequest{}, fmt.Errorf("tool: projection missing canonical %q in tool result name",
 						m.Name)
 				}
@@ -118,10 +127,12 @@ func (p *ProviderToolProjection) ProjectRequest(req provider.ChatRequest) (provi
 		}
 		// specific 必须命中 executable definitions；无法解析则在 Provider 调用前失败。
 		if _, ok := p.aliasToCanonical[providerToolAlias(canonical)]; !ok {
+			p.recordAliasProjErr("invalid_choice")
 			return provider.ChatRequest{}, fmt.Errorf("tool: specific ToolChoice %q not executable", canonical)
 		}
 		alias, ok := p.resolveAlias(canonical)
 		if !ok {
+			p.recordAliasProjErr("invalid_choice")
 			return provider.ChatRequest{}, fmt.Errorf("tool: specific ToolChoice %q not in projection union", canonical)
 		}
 		out.ToolChoice.Tool = alias
@@ -152,9 +163,11 @@ func (m *Manager) ToToolDefs(agentID string, history []provider.Message) (*Provi
 		alias := providerToolAlias(ti.Name)
 		if _, dup := canonicalToAlias[ti.Name]; dup {
 			// 重复 canonical 名理论上 Register 已拒，防御性。
+			m.recordAliasProjErr("collision")
 			return nil, fmt.Errorf("%w: duplicate canonical %q", ErrToolAliasCollision, ti.Name)
 		}
 		if other, dup := aliasToCanonical[alias]; dup && other != ti.Name {
+			m.recordAliasProjErr("collision")
 			return nil, fmt.Errorf("%w: %q and %q alias to %q", ErrToolAliasCollision, other, ti.Name, alias)
 		}
 		canonicalToAlias[ti.Name] = alias
@@ -183,6 +196,7 @@ func (m *Manager) ToToolDefs(agentID string, history []provider.Message) (*Provi
 				}
 				alias := providerToolAlias(name)
 				if other, dup := aliasToCanonical[alias]; dup && other != name {
+				m.recordAliasProjErr("collision")
 					return nil, fmt.Errorf("%w: history %q and %q alias to %q", ErrToolAliasCollision, other, name, alias)
 				}
 				// history-only: 不写 aliasToCanonical (executable 反查表), 仅 union map.
@@ -198,17 +212,24 @@ func (m *Manager) ToToolDefs(agentID string, history []provider.Message) (*Provi
 			}
 			alias := providerToolAlias(name)
 			if other, dup := aliasToCanonical[alias]; dup && other != name {
+				m.recordAliasProjErr("collision")
 				return nil, fmt.Errorf("%w: history tool-name %q and %q alias to %q", ErrToolAliasCollision, other, name, alias)
 			}
 			canonicalToAlias[name] = alias
 		}
 	}
 
-	return &ProviderToolProjection{
+	proj := &ProviderToolProjection{
 		defs:             defs,
 		canonicalToAlias: canonicalToAlias,
 		aliasToCanonical: aliasToCanonical,
-	}, nil
+	}
+	// alias projection 失败埋点 (docs/tool/observability.md §10.2).
+	// Manager metrics nil (未注入 SetMetrics) → nop. 仅记 reason, 不含 alias/canonical/ToolCallID/Session.
+	if m.metrics != nil && m.metrics.aliasProjErr != nil {
+		proj.projectionErr = func(reason string) { m.metrics.aliasProjErr.Inc(reason) }
+	}
+	return proj, nil
 }
 
 // cloneToolDef 深拷贝 ToolDef（含 json.RawMessage）。

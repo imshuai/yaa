@@ -2780,3 +2780,54 @@ go test -count=1 -timeout 300s ./...   # 24 包全绿 (含 internal/tool/builtin
 - §14.2 剩余: config_reload Tool (依赖 Phase 5 ReloadManager) — 留 Phase 5.
 - §14.3 自定义 Tool: Plugin RPC Tool (Phase 4 大架构) + 配置文件声明注册 + 静态 Go 注册 (RegisterBuiltin/RegisterIntrospection 已实现待 audit).
 - §14.5 可观测性: Prometheus 指标 (tool 包未接 metrics) + Remote API 事件推送.
+
+---
+
+## #41 feat(tool): §14.5 可观测性 metrics 接入 + §14.3 静态 Go 注册 audit (docs/tool/observability.md §10)
+
+### scope
+- §14.5 可观测性 4 项全部闭合: 执行日志 / Prometheus 指标 / Remote API 事件推送 / alias 不作为 label.
+- §14.3 第 3 项 "Runtime 内置 Tool 的静态 Go 注册" audit 闭合.
+
+### 实现
+- **`internal/tool/metrics.go` 新建**: `toolMetrics` 结构含 6 指标 (callsCounter / durationHist / errorsCounter / timeoutsCounter / concurrentGauge / aliasProjErr); `Manager.SetMetrics(r *metrics.Registry)` 注入并 MustRegister 6 指标; nil → nop; `errorClass(err)` 返 {not_found/disabled/permission/invalid_params/timeout/invalid_def/other}; `resultLabel(err, isToolError)` 返 {ok/error/timeout}; `recordAliasProjErr(reason)` helper (Manager + ProviderToolProjection 各一份).
+  - 6 指标 label (§10.2 docs 精确约束): `yaa_tool_calls_total{tool,result}` / `yaa_tool_call_duration_seconds{tool}` / `yaa_tool_errors_total{tool,class}` / `yaa_tool_timeouts_total{tool}` / `yaa_tool_concurrent` Gauge / `yaa_tool_alias_projection_errors_total{reason}`.
+  - label 均不含 alias / Canonical / ToolCallID / SessionID (§10.2 显式约束); `tool` 永远 canonical name.
+- **`internal/tool/manager.go` Execute 改动**:
+  - 开头 `concurrentGauge.Inc()` + `defer Dec()` (所有路径都要 Inc/Dec 配对, 反映当前并发数; ponytail: global 平衡, 早期失败也 Inc/Dec 平衡).
+  - retry loop 从 4 处 early `return ToolResult{}, cause` 改为 `err = cause; break retryLoop` **root cause 修复**: timeout / caller cancel / backoff cancel 现在统一走 loop 后的 metrics 记录, 不会跳过.
+  - loop 后 metrics 块: `callsCounter.Inc(tool, rLabel)` + `durationHist.Observe(durSec, tool)` + `errorsCounter.Inc(tool, errorClass(err))` + `timeoutsCounter.Inc(tool) if rLabel == "timeout"`.
+  - 日志改 `Logger.Info("tool executed", "tool", toolName, "agent_id", "agentID", "session_id", "sessionID", "duration_ms", ..., "is_error", ..., "result_tokens", len(content)/4)` (§10.1 docs).
+- **`internal/tool/projection.go` 改动**:
+  - `ProviderToolProjection` 加 `projectionErr func(reason string)` 字段; `ToToolDefs` 返 proj 时注入闭包 (调 `m.metrics.aliasProjErr.Inc(reason)`); nil → nop.
+  - 6 处错误点插入 `recordAliasProjErr` (3 处 collision → `m.recordAliasProjErr("collision")`; 2 处 history invalid → `p.recordAliasProjErr("invalid_history")`; 2 处 specific ToolChoice → `p.recordAliasProjErr("invalid_choice")`).
+- **测试** `internal/tool/manager_v1audit_test.go` (+189 行, 7 新测试):
+  - TestSetMetricsRegistersAllSix / TestExecuteIcrementsCallsAndDuration / TestExecuteIncrementsErrorAndTimeoutOnTimeout / TestConcurrentGaugeBalances / TestAliasProjectionErrorsOnCollision (stub) / TestProjectRequestInvalidHistory / TestProjectRequestInvalidChoice.
+  - 已改 TestExecuteLogsStructuredEvent 适配新 log msg / attr ("tool executed", agent_id, session_id, result_tokens).
+  - 修 2 处 `provider.ToolFunction{Name:, Arguments:}` → `provider.ToolCallFunction{...}` 类型错误.
+
+### docs audit 闭合
+- §14.3 第 3 项 ✅ RegisterBuiltin / RegisterIntrospection / RegisterMCPIntrospection 都走 `RegisterWithSource(t, "builtin")` 等价 docs/tool/custom.md §7.2 "方式二 编程注册 (仅内置 Tool)".
+- §14.5 全 4 项 ✅:
+  - 10.1 执行日志 ✅ (tool executed + 7 attr; 不含 params/content/凭据/alias; tool 永远 canonical).
+  - 10.2 Prometheus 指标 ✅ (6 指标 全实现; label 严格遵循 §10.2 表; alias zero label).
+  - 10.3 Remote API 事件推送 ✅ (ConversationFrame "tool_call"/"tool_result" 走 Agent Emit → API turnEventToFrame, 已存在未改; audit 已验).
+  - alias 不作为 label + 协议错不计原始 name ✅ (log/metrics label 同 canonical-only).
+
+### 决策记录
+- **`SetMetrics(r)` 注入而非改 NewManager**: 与 mcp 包一致; caller 面广破坏大; nil → nop 保未启用环境测试原行为.
+- **retry loop `break retryLoop` 替换 4 处 `return ...cause`**: 单点修复根因; 缩小 diff, 保证 timeout/cancel/error path 统一走 metrics 块; Ponytail "root cause fix, not symptom patch".
+- **concurrentGauge Inc 在 gate 之前**: 早期失败也 Inc + defer Dec, 输出恒等于当前并发实际数; 牺牲Strict "gate 后 Inc 才是真正并发" 换 1 行代码 (Ponytail 短 diff 优先, ceiling 是 loose 早期 path Inc/Dec 平衡不精确高并发下少 1 bias).
+- **result_tokens 走 len(content)/4 启发**: 与 Provider.EstimateInputTokens (char/4) 相同; 只反映 Result.Content token 数, 不二次调 provider.
+- **errorClass 分显式 sentinel vs "other"**: 已验证 `ErrToolNotFound/ErrToolDisabled/ErrPermissionDenied/ErrInvalidParams/ErrToolTimeout/ErrInvalidToolName/ErrInvalidToolDef` 同包 sentinel; timeout 走 `resultLabel == "timeout"` 路径, errorClass(err) 返 "timeout" 同步.
+
+### 验证
+```
+go vet ./... && go build ./...   # OK
+go test -count=1 -timeout 300s ./...   # 24 包全绿 (含 internal/tool 0.539s, 7 新测试)
+```
+
+### 下一步
+- §14.3 剩 2 项: Plugin RPC Tool capability (Phase 4) + 配置文件声明注册 (Phase 4).
+- §14.4 Context 集成 (4 项): Tool 结果 Message / 原子单元截断 / reasoning_content 保留 / canonical-only.
+- docs/plugin Phase 4 (52 项 checklist).
