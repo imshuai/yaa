@@ -9,9 +9,9 @@
 
 - [ ] 文档阶段只以 [interface.md](interface.md) 内嵌 proto 为权威；实现时原样落到 `api/plugin/v1/plugin.proto` 并切换唯一 wire authority
 - [ ] 生成 `pkg/pluginrpc/gen`，生成文件不手工修改；CI 校验 proto、生成物和保留镜像一致
-- [ ] RPC major v1 只接受 `protocol_version: "1"`
-- [ ] Manifest 完整字段和严格未知字段校验
-- [ ] `provides[]` 只接受 `tool`，且 name/description/schema 必填
+- [x] RPC major v1 只接受 `protocol_version: "1"`
+- [x] Manifest 完整字段和严格未知字段校验
+- [x] `provides[]` 只接受 `tool`，且 name/description/schema 必填
 - [ ] Manifest capabilities 与 Ready capabilities 的 type/name/description/schema 集合一致
 - [ ] `entries[].config` 在启动进程前通过 `config_schema`
 - [ ] `requires_runtime`、dependency version 使用 SemVer parser
