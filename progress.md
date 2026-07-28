@@ -2622,3 +2622,60 @@ go test -count=1 -timeout 30s ./internal/tool/builtin/ -run 'TestConfigQuery' -v
 - §14.2 内置 Tool 剩余: file_write/file_list/file_delete (file_test.go 已有但 checklist 未勾, 需 audit) + config_reload (依赖 Phase 5 ReloadManager) + runtime_status + agent_list/inspect + session_list/inspect + tool_list + skill_list + provider_list (introspection 10 个).
 - §14.1 Tool Manager checklist (10 项): 多数已实现未勾, audit-only task 一次 commit 推进多项.
 - §14.5 可观测性: 执行日志 + Prometheus 指标 + Remote API 事件推送 — Phase 5 与已有 metrics 框架接 (本 commit 已建 internal/metrics 框架).
+
+---
+
+## #38 — 内置 introspection Tool §2-§9 (8 个) + §10 mcp_list audit (2026-07-29)
+
+### 概要
+按 docs/tool/introspection.md §2-§9 实现 8 个只读 introspection Tool (runtime_status / agent_list / agent_inspect / session_list / session_inspect / tool_list / skill_list / provider_list), 并 audit 勾选已实现的 §10 mcp_list. 所有 Tool 共享 tool.Manager 的 Agent allowlist/timeout/并发门, 不建立第二套 Registry 或权限层 (docs §1).
+
+### 改动文件
+- `internal/tool/builtin/introspection.go` (新建 ~340 行): 8 个 Tool struct + 构造 + Execute; `IntrospectionDeps` 结构集中依赖 (Agents/Sessions/Tools/Skills/Providers + RuntimeStatusFunc 闭包); `RegisterIntrospection(m, deps)` 批量注册 Source=builtin.
+  - RuntimeStatusTool: version=0.1.0 常量 + go_version=runtime.Version() + uptime/ready 走闭包 (nil 闭包 uptime=0 ready=false, 不 panic).
+  - AgentListTool: agent.Manager.List + scope.AgentID 过滤 (docs §1 唯一 caller) + status enum 过滤.
+  - AgentInspectTool: agent.Manager.Inspect + tool.Manager.ListForAgent + skill.Manager.ResolveForAgent 补全 Tool/Skill 名 (docs §4 明确要求来源); 按名升序.
+  - SessionListTool: session.Manager.List(ctx,scope.AgentID,ListQuery) + limit (1-100 default 20) + state 过滤; 固定字段 id/agent_id/state/message_count/created_at/updated_at.
+  - SessionInspectTool: session.Manager.Get + 验证 Session.AgentID==scope.AgentID (越权与不存在同 IsError).
+  - ToolListTool: tool.Manager.ListForAgent (天然只含 enabled+授权) + source 过滤 builtin/plugin/mcp.
+  - SkillListTool: skill.Manager.ResolveForAgent + Get 取 description/version/status; 安全字段 name/description/version/status 不含 prompt/path/options.
+  - ProviderListTool: provider.Manager.List() (已按 ID 升序) 只读不发网络; 不含 api_key/base_url/health.
+- `internal/runtime/runtime.go`: 在 RegisterMCPIntrospection 之后加 RegisterIntrospection 调用, 传入所有 Manager 依赖 + RuntimeStatusFunc 闭包 (走 Runtime.UptimeSeconds/Ready).
+- `internal/tool/builtin/introspection_test.go` (新建 ~280 行): newIntrospectionEnv 构造完整测试环境 (agent a1 + skill alpha + provider p1) + 18 个测试覆盖每个 Tool 的 schema/正常/nil 分支 + RegisterIntrospection 注册校验.
+- `docs/tool/checklist.md`: §14.2 勾选 8 个 introspection 项 + 1 项 mcp_list audit 项 (共 9 项).
+
+### Evidence (docs/tool/introspection.md §1-§10 规约对照)
+- §1 "以 scope.AgentID 为唯一 caller; 参数不能选择其他 Agent" ✅ (agent_list 只返 caller 自身; session_inspect 跨 Agent 与不存在相同).
+- §1 "不存在的资源返回 ToolResult{IsError:true}" ✅ (各 Tool 不存在均 IsError).
+- §1 "空 slice 编码为 []" ✅ (nil slice 显式初始化为 []).
+- §1 "列表按稳定主键升序" ✅ (tool/skill 按 name, agent 按 ID, provider List 已升序).
+- §1 "additionalProperties:false" ✅ (各 Parameters schema).
+- §2 runtime_status schema 空对象 ✅; 固定字段 version/go_version/uptime_seconds/ready ✅.
+- §3 agent_list status enum [running/paused/stopped] + 固定字段 id/name/provider/model/status ✅.
+- §4 agent_inspect 固定字段 + tools/skills/memory_enabled/planner_enabled ✅ (Tool/Skill 来源 tool.Manager.ListForAgent/skill.Manager.ResolveForAgent).
+- §5 session_list limit 1-100 + default 20 + state enum [created/active/paused/closed] + 固定字段不含 metadata/消息 ✅.
+- §6 session_inspect 必需 session_id + AgentID 验证 + 不含 messages/context/tool_results (v1) ✅.
+- §7 tool_list source enum [builtin/plugin/mcp] + 固定字段 name/description/parameters/enabled/source ✅.
+- §8 skill_list 安全字段 name/description/version/status (loaded) 不含 prompt/path/options ✅.
+- §9 provider_list 固定字段 id/type/models; 不发网络 ✅.
+- §10 mcp_list 已实现 (mcp_list.go) 本 commit audit 勾选; schema server_name minLength 1 + 按 Name 升序 ✅.
+
+### 决策记录
+- **RegisterIntrospection 单独函数而非扩展 RegisterBuiltin**: RegisterBuiltin 签名只接受 (m, cfg), introspection Tool 依赖跨包 Manager 集合 (agent/session/tool/skill/provider). 与 RegisterMCPIntrospection 同款 — 在 Runtime 所有 Manager 就绪后单独调用. 保持 RegisterBuiltin 不变 (caller 面广).
+- **runtime_status 走闭包 RuntimeStatusFunc 而非 Runtime 指针**: 避免把 root 容器 Runtime 传给 Tool, 解耦 + 易测 (测试直接传 func 返定值).
+- **agent_inspect Tool 自己调 ListForAgent/ResolveForAgent 而非依赖 agent.Manager.Inspect**: agent.Manager.Inspect 当前 Tools/Skills 返空 slice (历史实现), docs §4 明确要求 "Tool 名来自 tool.Manager.ListForAgent". Tool 自身补充这两个调用, 不改 agent.Manager 行为 (avoid scope creep). 是否升级 agent.Manager.Inspect 留后续 audit task.
+- **skill_list 当 ResolveForAgent 返 ErrSkillAgentNotFound 时返空列表**: 无 Skill binding 的 Agent 应返 `{"items":[]}` 而非硬错 (Tool 的语义是 "列出", 空是合法结果). 与 docs §1 "不存在与越权不可区分" 不冲突 (越权只限 Agent scope 选择).
+- **nil Manager 的 Tool 仍注册但 Execute 返 IsError**: 保证 Tool Manager 可 List 出 Tool 名 (即使底层 Manager 未配置), 调用时返可读错误而非硬错 panic. testNilManagersDontPanic 覆盖.
+
+### 验证
+```
+go vet ./... && go build ./...   # OK
+go test -count=1 -timeout 300s ./...   # 24 包全绿 (含 internal/tool/builtin 0.116s, internal/runtime 0.199s)
+```
+
+### 下一步
+- §14.1 Tool Manager checklist (10 项): 多数已实现未勾, audit-only task 一次 commit 推进多项 (canonical 校验 / 并发 / 重试 / ErrToolTimeout / ToToolDefs 投影 / canonical name / alias / definitions 过滤 / ToolChoice 深拷贝 / Batch worker + MCP 全局 gate).
+- §14.3 自定义 Tool: Plugin RPC Tool (Phase 4 大架构), 配置文件声明注册, Runtime 内置 Tool 静态 Go 注册 (已实现 + RegisterBuiltin/RegisterIntrospection audit).
+- §14.5 可观测性: 执行日志 + Prometheus 指标 (internal/metrics 框架已建, tool 包未接入) + Remote API 事件推送.
+- shell/http/file_* checklist (§14.2 前 6 项) 功能已实现, audit 勾选可与 §14.1 同 commit.
+- config_reload Tool (§14.2): 依赖 Phase 5 ReloadManager.

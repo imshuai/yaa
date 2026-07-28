@@ -279,6 +279,23 @@ func (rt *Runtime) Start(ctx context.Context) error {
 		return fmt.Errorf("runtime: register mcp introspection tools: %w", rerr)
 	}
 
+	// 注册 §2-§9 introspection Tool (docs/tool/introspection.md).
+	// 所有 Manager 此时已就绪 (agent/session/tool/skill/provider); runtime_status 走闭包取 uptime/ready.
+	// 与 RegisterBuiltin 及 RegisterMCPIntrospection 同源注册到 tool.Manager, Source=builtin.
+	if ierr := builtin.RegisterIntrospection(rt.tools, builtin.IntrospectionDeps{
+		Agents:    rt.agents,
+		Sessions:  rt.sessions,
+		Tools:     rt.tools,
+		Skills:    rt.skills,
+		Providers: rt.providers,
+		RuntimeStatusFunc: func() (int64, bool) {
+			return rt.UptimeSeconds(), rt.Ready()
+		},
+	}); ierr != nil {
+		rt.rollback()
+		return fmt.Errorf("runtime: register introspection tools: %w", ierr)
+	}
+
 	// 注入 Memory Remote API：仅当 Memory Manager 已构造（Memory.Enabled=true）。
 	// resolver 从当前 config snapshot 计算 effective policy；Memory 全局 disabled 时
 	// rt.memory == nil，handler 统一返 50301（子系统未启用），operator 不应调用 disabled 子系统。

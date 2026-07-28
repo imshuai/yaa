@@ -37,15 +37,15 @@
 - [ ] File Delete Tool（路径校验、安全确认）
 - [x] Config Query Tool（完整 `config.RedactedView` 后路径查询，脱敏不可关闭）— internal/tool/builtin/config_query.go: ConfigQueryTool{cfg} Name/Description/Parameters({path:string}) Execute; RedactedView 已脱敏 api_key/Header/env/options-scalar; path dot-segment + array decimal index; miss/through-scalar/non-string param → IsError=true; nil cfg 构造 panic; RegisterBuiltin 注册 + Source=builtin Enabled. Evidence: TestConfigQueryEmptyPath (api_key 原文 not in content) + PathLookupValid + PathMiss + PathThroughScalar + RejectsNonStringPath + NewConfigQueryToolRejectsNilCfg + Registered
 - [ ] Config Reload Tool（统一主配置路径、原子应用、restart_required 摘要）
-- [ ] Runtime Status Tool（版本/uptime/内存/goroutine/统计）
-- [ ] Agent List Tool（状态过滤、摘要信息）
-- [ ] Agent Inspect Tool（详细信息、Session/Context/Tool/Skill 绑定）
-- [ ] Session List Tool（Agent 过滤、状态过滤、Token 统计）
-- [ ] Session Inspect Tool（消息历史、上下文统计、Tool 结果可选）
-- [ ] Tool List Tool（source 过滤、enabled 过滤）
-- [ ] Skill List Tool（`loaded|disabled` 安全摘要）
-- [ ] Provider List Tool（canonical ID/type/model 列表）
-- [ ] MCP List Tool（canonical `ServerStatus` 安全摘要）
+- [x] Runtime Status Tool（版本/go_version/uptime_seconds/ready）— internal/tool/builtin/introspection.go: RuntimeStatusTool{Name/Description/Parameters(empty object additionalProperties:false) Execute}; version=0.1.0 常量 + go_version=runtime.Version() + uptime/ready 走闭包 (Runtime.UptimeSeconds/Ready); nil 闭包 uptime=0 ready=false. Evidence: TestRuntimeStatusShaderAndExecute (version=0.1.0 uptime=12345 ready=true go_version non-empty) + TestRuntimeStatusNilFunc
+- [x] Agent List Tool（状态过滤、只返 caller 自身）— internal/tool/builtin/introspection.go: AgentListTool{mgr *agent.Manager}; scope.AgentID 过滤 (docs §1 唯一 caller) + status enum 过滤; 无匹配返 {"items":[]}; nil mgr → IsError. Evidence: TestAgentListSelfOnly + TestAgentListStatusFilter + TestAgentListUnknownAgentReturnsEmpty
+- [x] Agent Inspect Tool（详细信息 + 授权 Tool/Skill 名）— internal/tool/builtin/introspection.go: AgentInspectTool{mgr/toolMgr/skillMgr}; 调 agent.Manager.Inspect + tool.Manager.ListForAgent + skill.Manager.ResolveForAgent; Tool/Skill 按名升序; 不存在 → IsError. Evidence: TestAgentInspectSelf (tools 包含 config_query, skills=[alpha]) + TestAgentInspectUnknownAgentIsError
+- [x] Session List Tool（Agent 过滤、state 过滤、limit）— internal/tool/builtin/introspection.go: SessionListTool{mgr}; session.Manager.List(ctx,scope.AgentID,ListQuery{State,Page:1,PageSize}); 固定字段 id/agent_id/state/message_count/created_at/updated_at 不含 metadata/消息. Evidence: TestSessionListEmpty + TestSessionListAfterCreate
+- [x] Session Inspect Tool（单 session 元数据, AgentID 验证）— internal/tool/builtin/introspection.go: SessionInspectTool{mgr}; session.Manager.Get + 验证 Session.AgentID==scope.AgentID (不匹配与不存在同 IsError); v1 不含 messages/context/tool_results. Evidence: TestSessionInspectFound + TestSessionInspectNotFoundIsError + TestSessionInspectCrossAgentSameAsNotFound
+- [x] Tool List Tool（source 过滤, 授权投影）— internal/tool/builtin/introspection.go: ToolListTool{mgr}; tool.Manager.ListForAgent(scope.AgentID) 天然只含 enabled+授权; source 过滤 builtin/plugin/mcp; 输出按 Name 升序. Evidence: TestToolListShowsRegistered (升序校验) + TestToolListFilterBySource
+- [x] Skill List Tool（loaded 安全摘要）— internal/tool/builtin/introspection.go: SkillListTool{mgr}; skill.Manager.ResolveForAgent + Get 取 description/version/status; 安全字段 name/description/version/status 不含 prompt/path/options. Evidence: TestSkillListShowsBound (alpha loaded, description="Alpha skill") + TestSkillListUnboundAgentReturnsEmpty
+- [x] Provider List Tool（canonical ID/type/model 只读列表）— internal/tool/builtin/introspection.go: ProviderListTool{mgr}; provider.Manager.List() (已按 ID 升序) 不发网络请求; 不含 api_key/base_url/health. Evidence: TestProviderListShowsOne (p1/openai, models=[test-model])
+- [x] MCP List Tool（canonical `ServerStatus` 安全摘要） — internal/tool/builtin/mcp_list.go: MCPListTool{mgr *mcp.Manager}; mcp.Manager.List() 按 Name 升序 + server_name 单条过滤; ServerStatus 只含 name/status/transport/protocol_version/tool_count/connected_at/last_error 不含 command/args/url/headers/env/Token. Evidence: TestMCPListToolSchema + TestMCPListToolEmptyServersReturnsArray + TestMCPListToolListAllAndFilterName + TestMCPListToolFilterUnknownServerNameIsError
 
 ### 14.3 自定义 Tool
 
