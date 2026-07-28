@@ -2419,3 +2419,30 @@ go test -count=1 -timeout 30s ./internal/tool/ -run "TestToToolDefsExposesMCPToo
 ### 下一步
 - MCP checklist §8 配置 7 项 (L108-114): 多数由 config.validateMCPConfig 已满足，需补验收勾选 + 可能加小测试。
 - MCP checklist §observability 两项 (L128-129) + planner checklist "日志与指标不泄露" — observability commit 同步做。
+
+## progress #33 — MCP §8 配置验收勾选 + docs/mcp/integration.md L152 与 v1 现实对齐
+
+### 改动
+- `docs/mcp/integration.md` §5 L152: 原文 "mcp.* 结构性变更由文件 watcher 检测为 restart_required" 与 yaa v1 现实冲突 (全项目无 ReloadManager/file watcher 实现). 改为 "v1 由启动期 config.Validate 表达为 restart_required (yaa v1 未实现 runtime watcher), 与 docs/config/hot-reload.md 契约预留路径一致". 与 planner checklist L12 同款 utory.
+- `docs/mcp/checklist.md` §8 L108-114 全部 7 项勾选, 每项 evidence 引用:
+  - L108 全局 MCP 配置 — `config.MCPConfig` 顶层 (types.go L10/L133-138)
+  - L109 `mcp.servers[]` 字段 — `MCPServerConfig` (types.go L140-151) + `TestDefaultMCPServerConfig`
+  - L110 本地 `mcp.server` 字段 — `MCPExposeConfig` (types.go L153-161) + defaults 测试
+  - L111 Agent 不增隐含 `agents[].mcp` 字段 — `AgentConfig` 仅 `Tools []string` (types.go L92), 无 MCP yaml 字段
+  - L112 `restart_required` — v1 由 startup validation 表达 (带 utory, 与 planner checklist L12 同款)
+  - L113 默认超时 (tool=0 caller deadline) — `DefaultMCPConfig.Timeout={10s,15s,0}` + `validateMCPConfig` 仅 `Tool<0` 报错 + `TestDefaultMCPServerConfig` 验 `Timeout==0`
+  - L114 auto_start/reconnect — `MCPServerConfig.AutoStart` + `MCPReconnectConfig` + `DefaultMCPConfig` 默认 + `validateMCPConfig` rangem, `validateMCPConfig` 仅报 `Tool<0` (validation.go L309-311), `==0` 合法; `DefaultMCPServerConfig` 测 `Timeout==0`
+
+### 决策记录
+- **不补 MCP §8 单测**: evidence 已经由现有测试覆盖 (defaults_test L42-49 + TestDefaultMCPServerConfig L103-107 + validation_test L42-55). L111 "AgentConfig 无 mcp 字段" 是源码事实 (types.go L86-99 无 MCP yaml tag), 反射测造作, Ponytail YAGNI. 新增测试不会让不变量更可信.
+- **docs 优先修复 docs 与现实冲突**: 目标要求 "发现文档有问题先修文档". L152 "文件 watcher 检测 restart_required" 是 v1 未来态描述, 与现状 (无 watcher 实现) 直接冲突. 改为对齐 v1 现实 (startup validation 表达) + 引 docs/config/hot-reload.md 说明契约预留路径, 不留虚假承诺.
+- **L112 utory 与 planner checklist L12 同款**: planner checklist L12 已勾 "restart_required 由 startup validation 路径表达" (utory 写在括号内). MCP §8 L112 同样处理, 保持一致性.
+
+### 验证
+```
+go build ./...   # OK (纯 docs 改动, 代码不受影响)
+```
+evidence 已在现有测试覆盖, 无需补测试.
+
+### 下一步
+- MCP + planner checklist 仅剩 observability 3 项 (mcp §observability L128-129 + planner "日志与指标不泄露"): 5 个 MCP 指标 + 2 个 span + 日志脱敏. 这是最后一块硬骨头.

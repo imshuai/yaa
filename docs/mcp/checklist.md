@@ -105,13 +105,13 @@ v1 副债：listTools 严格 DTO 的 DisallowUnknownFields（当前 request Unma
 
 ## 8. 配置
 
-- [ ] 全局 MCP 配置（`mcp.*` in yaa.yaml）
-- [ ] `mcp.servers[]` 配置字段（name, transport, command, args, env, headers, tls, url, timeout, auto_start）
-- [ ] 本地 `mcp.server` 配置字段（enabled, agent_id, transport, addr, path, messages_path, exposed_tools, origin_allowlist）
-- [ ] Agent 级别只通过 `agents[].tools` 引用 `mcp.<server>.<tool>`，不增加隐含 `agents[].mcp` 字段
-- [ ] `mcp.*` 变更返回 `restart_required`，重启后按 `auto_start` 连接
-- [ ] 默认超时配置（`mcp.timeout.connect/init/tool`，其中 `tool=0` 只使用 caller deadline）
-- [ ] 自动启动与重连配置（`auto_start`, `mcp.reconnect.*`）
+- [x] 全局 MCP 配置（`mcp.*` in yaa.yaml）— `config.MCPConfig` 顶层字段 (types.go L10/L133-138), yaml `mcp.*` 解析路径完整
+- [x] `mcp.servers[]` 配置字段（name, transport, command, args, env, headers, tls, url, timeout, auto_start）— `config.MCPServerConfig` 字段齐全 (types.go L140-151); `TestDefaultMCPServerConfig` 验默认值
+- [x] 本地 `mcp.server` 配置字段（enabled, agent_id, transport, addr, path, messages_path, exposed_tools, origin_allowlist）— `config.MCPExposeConfig` 字段齐全 (types.go L153-161); `DefaultMCPConfig` 测试验各字段默认值
+- [x] Agent 级别只通过 `agents[].tools` 引用 `mcp.<server>.<tool>`，不增加隐含 `agents[].mcp` 字段 — `AgentConfig` 仅 `Tools []string` (types.go L92), 无 MCP yaml 字段
+- [x] `mcp.*` 变更返回 `restart_required`，重启后按 `auto_start` 连接 — v1 无 runtime file watcher/ReloadManager; 与 planner checklist 同款, 由启动期 `config.Validate` 路径表达 (docs/mcp/integration.md §5 L152 已对齐 v1 现状)
+- [x] 默认超时配置（`mcp.timeout.connect/init/tool`，其中 `tool=0` 只使用 caller deadline）— `DefaultMCPConfig.Timeout` = {10s, 15s, 0} (defaults.go L99-103); `validateMCPConfig` 仅 `Tool<0` 报错, `==0` 合法; `TestDefaultMCPServerConfig` 验 `Timeout==0`
+- [x] 自动启动与重连配置（`auto_start`, `mcp.reconnect.*`）— `MCPServerConfig.AutoStart` + `MCPReconnectConfig{Enabled,MaxAttempts,InitialDelay,MaxDelay}` (types.go L146/L174-179); `DefaultMCPConfig` 默认 {true,3,1s,1min} + `DefaultMCPServerConfig.AutoStart=true`; `validateMCPConfig` 校验 reconnect 范围
 
 ## 9. 集成
 

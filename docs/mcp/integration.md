@@ -149,7 +149,7 @@ Config.Parse → Config.Validate
 - Manager 对连接失败按 1s、2s、4s 退避创建新 Client；Client 自身不重连。
 - 任何已经发送的 `tools/call` 都不自动重放；断线或 timeout 后向调用方返回结果不确定错误，重连只服务新请求。
 - 重连成功后重新 initialize 和完整分页 tools/list；只有名称、description 和 input schema 与既有 Proxy 快照精确一致时才原子替换 handle，差异需要重启 Runtime。
-- `mcp.*` 的结构性变更由文件 watcher 检测为 `restart_required`，重启后按 `auto_start` 重新连接；正在执行的请求不迁移到新连接。Remote API 不拥有 MCP 配置。
+- `mcp.*` 的结构性变更在 v1 由启动期 `config.Validate` 表达为 `restart_required`（yaa v1 未实现 runtime file watcher/ReloadManager，与 `docs/config/hot-reload.md` 契约预留路径一致）；重启后按 `auto_start` 重新连接，正在执行的请求不迁移到新连接。Remote API 只读不拥有 MCP 配置。
 
 ## 6. Yaa! 作为 MCP Server
 
