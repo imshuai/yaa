@@ -34,17 +34,17 @@
 
 ## Manager
 
-- [ ] 状态唯一为 `discovered|starting|ready|error|stopped`
-- [ ] 显式 `entries[].enabled` 优先于 Manifest `default_enabled`
+- [x] 状态唯一为 `discovered|starting|ready|error|stopped`
+- [x] 显式 `entries[].enabled` 优先于 Manifest `default_enabled`
 - [ ] `auto_start=false` 时只发现/校验，不启动
-- [ ] 缺失/循环/版本不匹配依赖在启动进程前检测
+- [x] 缺失/循环/版本不匹配依赖在启动进程前检测
 - [ ] 非 optional dependency 未 Ready 时下游不启动
 - [ ] Proxy 注册事务化，失败回滚；全部成功后才标记 Ready
 - [ ] 单 Plugin 失败进入 non-fatal StartupReport
 - [ ] 初始启动只尝试一次，`restart.*` 只处理 ready 后 unexpected exit
 - [ ] unexpected exit 使 Proxy 返回 unavailable，并有限退避重启
 - [ ] 重启成功原子替换 Proxy client；请求不自动 replay
-- [ ] Entry 只以冻结的 `Descriptor.Manifest` 为 Manifest 来源，不保存可漂移副本
+- [x] Entry 只以冻结的 `Descriptor.Manifest` 为 Manifest 来源，不保存可漂移副本
 - [ ] Stop 关闭 lifecycle gate 并取消退避/启动；发布新 client 前在锁内复查 stopping
 - [ ] `mu` 覆盖 Entry 的 Client/Handle/ProxyNames/State/Health/StartedAt/LastError；RPC/Wait/退避在锁外
 - [ ] Health 使用 `health_timeout`，在 `mu` 下更新 snapshot，失败只标 degraded
