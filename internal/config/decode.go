@@ -11,12 +11,50 @@ import (
 	"time"
 
 	"github.com/mitchellh/mapstructure"
+	"golang.org/x/exp/slog"
 )
 
 var (
 	durationType   = reflect.TypeOf(time.Duration(0))
 	jsonNumberType = reflect.TypeOf(json.Number(""))
 )
+
+// deprecatedFields 记录已废弃但仍可读的字段名 → 替代方案提示.
+// docs/config checklist 行90: 废弃字段警告 (warn 日志提示替代方案).
+// 空表 = 当前无废弃字段; 旧版本字段废弃时在此注册, 不阻断加载.
+var deprecatedFields = map[string]string{}
+
+// removedFields 记录已移除字段名 → 迁移提示.
+// docs/config checklist 行91: 移除字段报错 (fatal 并提示迁移).
+// 空表 = 当前无移除字段; 字段彻底移除时在此注册, 阻断加载.
+var removedFields = map[string]string{}
+
+// warnDeprecatedFields 递归扫描 raw, 对存在的 deprecated 字段输出 warn 日志.
+// docs/config checklist 行90: 废弃字段警告 (warn 日志提示替代方案).
+// ponytail: 当前无 deprecated 字段, 表空; 旧版本字段废弃时注册到 deprecatedFields.
+func warnDeprecatedFields(raw map[string]any, logger *slog.Logger) {
+	if len(deprecatedFields) == 0 || logger == nil {
+		return
+	}
+	walkDeprecatedKeys(raw, "", logger)
+}
+
+func walkDeprecatedKeys(v any, path string, logger *slog.Logger) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return
+	}
+	for k, val := range m {
+		child := k
+		if path != "" {
+			child = path + "." + k
+		}
+		if hint, ok := deprecatedFields[k]; ok {
+			logger.Warn("config field is deprecated; "+hint, "field", child)
+		}
+		walkDeprecatedKeys(val, child, logger)
+	}
+}
 
 type decodeIssue struct {
 	path    string
@@ -157,6 +195,11 @@ func inspectDecodeStruct(raw any, dst reflect.Value, path string, resets *[]refl
 		field, found := fields[entry.key]
 		child := joinDecodePath(path, entry.key)
 		if !found {
+			// docs/config checklist 行91: 移除字段 fatal 并提示迁移
+			if hint, ok := removedFields[entry.key]; ok {
+				addDecodeIssue(issues, child, "removed field; "+hint)
+				continue
+			}
 			addDecodeIssue(issues, child, "unknown field")
 			continue
 		}

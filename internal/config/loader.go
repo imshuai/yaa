@@ -56,6 +56,8 @@ func (l *Loader) Load() (*Config, error) {
 		if err := DecodeInto(raw, cfg); err != nil {
 			return nil, fmt.Errorf("decode config: %w", err)
 		}
+		// Step 7.1: 废弃字段警告 (docs/config checklist 行90)
+		warnDeprecatedFields(raw, l.logger)
 	} else {
 		l.logger.Warn("no config file found; starting with built-in defaults")
 	}
@@ -65,8 +67,11 @@ func (l *Loader) Load() (*Config, error) {
 		return nil, fmt.Errorf("apply flags: %w", err)
 	}
 
-	// Step 9: 校验
+	// Step 9: 校验 (错误含文件路径上下文; docs/config checklist 行117)
 	if err := new(Validator).Validate(cfg); err != nil {
+		if path != "" {
+			return nil, fmt.Errorf("validate config %s: %w", path, err)
+		}
 		return nil, fmt.Errorf("validate config: %w", err)
 	}
 

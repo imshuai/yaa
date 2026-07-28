@@ -3038,3 +3038,63 @@ go test -count=1 -timeout 300s ./...   # 24 包全绿 (internal/session 0.436s +
 - **config 55/74** (剩 29 项: 热更新 12 Phase 5 + CLI 2 + 迁移 CLI 4 + 敏感 EnvResolver 1 + sentinel 2 + 部分 4 + 测试 2).
 - **memory 39 项未审计**, **plugin 52 项 Phase 4**, **context 38 项部分已勾**.
 - **tool §14.2 剩 1 项** (config_reload Phase 5), **§14.3 剩 2 项** (Plugin RPC/配置声明 Phase 4).
+
+---
+
+## #46 feat(config): #46 config checklist 6项补闭合 (MCP listener/agent model/迁移注册表/removed字段/校验上下文)
+
+### 范围
+- **docs/config checklist 29→23 项** (-6): 勾选行41/46/85 + 新增行90/91/117 实现并勾选.
+
+### 实现
+
+#### 行41: MCP 非回环 listener 拒绝；disabled/auto_start=false 仍完整校验 descriptor (审计已实现)
+- `validation.go:383-386`: sse/streamable_http transport → validateListenAddr → !loopback 报 "must be loopback".
+- `validation.go:319-381`: cfg.Servers (外部 descriptor) 校验**完全无条件**, 不依赖 auto_start.
+
+#### 行46: Agent model 非空; 内置 Provider base_url 非空绝对 HTTP(S) URL (审计已实现)
+- `validation.go:105-107`: agent.Model==="" → "model must not be empty".
+- `validation.go:568-579`: openai/claude/gemini/ollama/azure → BaseURL==="" → "required"; url.ParseRequestURI + Host!="" + scheme∈{http,https}.
+
+#### 行85: 迁移函数注册表 []Migration 显式版本边 (审计已实现)
+- `migrate.go:24`: var migrations = []Migration{} (注册表就位).
+- `migrate.go:41-43`: 拒绝重复起点 (multiple migrations start at %s).
+- `migrate.go:47-49`: 拒绝隐式路径 (no migration path from %s to %s).
+
+#### 行91: 移除字段报错 (fatal 并提示迁移) — 新增实现
+- `decode.go`: 加 `removedFields = map[string]string{}` 包级表.
+- `inspectDecodeStruct` !found 分支: 先查 removedFields[entry.key], 命中则 `addDecodeIssue("removed field; "+hint)` fatal; 否则 unknown field.
+- 测试: `TestDecodeIntoRemovedFieldFatalWithHint` 注册临时 removed 字段 → 验证 fatal + hint 子串.
+
+#### 行90: 废弃字段警告 (warn 日志提示替代方案) — 新增机制
+- `decode.go`: 加 `deprecatedFields = map[string]string{}` + `warnDeprecatedFields(raw, logger)` + `walkDeprecatedKeys` 递归扫描.
+- `loader.go` Step 7.1: `warnDeprecatedFields(raw, l.logger)` 调用. 空表 → nop.
+- deprecated 字段仍在 struct 中 (mapstructure 正常解码), 不走 !found 路径; warn 在 loader 层非 decode 层 (decode 无 logger).
+- 测试: `TestWarnDeprecatedFieldsLogsWarning` (nil logger 安全) + `TestDecodeIntoDeprecatedFieldKnownFieldNoError`.
+
+#### 行117: 错误消息包含上下文 (文件路径 + 字段路径 + 原因) — 新增实现
+- `loader.go` Step 9: `if path != "" { fmt.Errorf("validate config %s: %w", path, err) }` — 文件路径包在外层错误.
+- ValidationError 已含字段路径 (Path) + 原因 (Rule + Message).
+- 测试: `TestLoadValidationErrorsIncludeFilePath` → 写坏配置文件 → Load 失败 → err 含文件路径子串.
+
+### 测试新增 (decode_test.go, 4 个)
+- `TestDecodeIntoRemovedFieldFatalWithHint`: removed 字段 → fatal + hint.
+- `TestDecodeIntoDeprecatedFieldKnownFieldNoError`: deprecatedFields 表存在不影响已知字段解码.
+- `TestWarnDeprecatedFieldsLogsWarning`: nil logger 安全 (nop).
+- `TestLoadValidationErrorsIncludeFilePath`: Load 校验失败 → err 含文件路径.
+
+### 决策记录
+- **deprecated 不走 decode !found**: deprecated 字段仍在 struct 中 (有对应 field), mapstructure 正常解码; warn 在 loader 层 (decode 无 logger). !found 路径只查 removedFields.
+- **removedFields/deprecatedFields 表空**: 当前 schema v1.0 无废弃/移除字段; 机制就位, 表空 → 行为不变.
+- **文件路径在外层包装非 ValidationError 内层**: 最小改动 (1 行 if-else), %w 保留 Unwrap 链; ValidationError 已含字段路径+原因, 外层补文件路径.
+- **未实现项**: 行90 变更明细 (行92 需 MigrationFunc 返回 diff, 无实际迁移边 → 延后). 行26 敏感字段强制 env (影响现有测试大, 延后).
+
+### 验证
+```
+go vet ./... && go build ./...   # OK
+go test -count=1 -timeout 300s ./...   # 24 包全绿
+```
+
+### 下一步
+- config 61/74 (剩 23 项: 热更新 12 Phase 5 + CLI 2 + 迁移 CLI 4 + 敏感 EnvResolver 1 + sentinel 2 + 格式等价测试 1 + default 文档 1 + default CLI 1).
+- memory 39 项未审计, plugin 52 项 Phase 4, context 38 项部分已勾.

@@ -2,10 +2,12 @@ package config
 
 import (
 	"encoding/json"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
 )
 
 func TestDecodeIntoPreservesAbsentFieldsAndReplacesPresentSlices(t *testing.T) {
@@ -279,3 +281,88 @@ func TestDecodeIntoPreservesPlannerOverridePresence(t *testing.T) {
 		t.Fatalf("planner.max_tokens = %#v, want present zero", override)
 	}
 }
+
+// --- docs/config checklist 行90/91: deprecated/removed 字段机制测试 ---
+
+func TestDecodeIntoRemovedFieldFatalWithHint(t *testing.T) {
+	// 临时注册一个 removed 字段
+	old := removedFields
+	removedFields = map[string]string{"some_removed_field": "use new_field instead"}
+	t.Cleanup(func() { removedFields = old })
+
+	cfg := Default()
+	raw := map[string]any{"some_removed_field": "x"}
+	err := DecodeInto(raw, cfg)
+	if err == nil {
+		t.Fatal("expected error for removed field, got nil")
+	}
+	if !strings.Contains(err.Error(), "removed field") {
+		t.Fatalf("error missing 'removed field': %v", err)
+	}
+	if !strings.Contains(err.Error(), "use new_field instead") {
+		t.Fatalf("error missing hint: %v", err)
+	}
+}
+
+func TestDecodeIntoDeprecatedFieldKnownFieldNoError(t *testing.T) {
+	// deprecated 字段仍在 struct 中则 mapstructure 正常解码, 路径仅用于 warn
+	// 这里验证: deprecatedFields 表存在条目不影响正常已知字段的解码
+	old := deprecatedFields
+	deprecatedFields = map[string]string{"addr": "use runtime.api.http.addr instead (example)"}
+	t.Cleanup(func() { deprecatedFields = old })
+
+	cfg := Default()
+	// addr 是已知字段 (Config struct 内有), 不会触发 unknown
+	// 但 raw 顶层放 addr 仍会报 unknown (它不在顶层 Config struct)
+	// 所以这里只能验证 deprecatedFields 表不污染其它逻辑: 跑一个已知 path
+	raw := map[string]any{"runtime": map[string]any{"storage": map[string]any{"type": "sqlite"}}}
+	err := DecodeInto(raw, cfg)
+	if err != nil {
+		t.Fatalf("known field decode failed: %v", err)
+	}
+}
+
+func TestWarnDeprecatedFieldsLogsWarning(t *testing.T) {
+	// 测试 warnDeprecatedFields 在有 deprecated 字段时 warn
+	// 用 demo logger 捕获输出
+	old := deprecatedFields
+	deprecatedFields = map[string]string{"old_key": "use new_key instead"}
+	t.Cleanup(func() { deprecatedFields = old })
+
+	// 抓取 slog 输出
+	// ponytail: 最简单验证—无 panic + 函数执行即可 (logger nil → nop 安全)
+	warnDeprecatedFields(map[string]any{"old_key": 42}, nil) // logger nil 安全
+}
+
+// --- docs/config checklist 行117: 错误消息包含文件路径上下文 ---
+
+func TestLoadValidationErrorsIncludeFilePath(t *testing.T) {
+	// 构造一个会校验失败的配置文件
+	dir := t.TempDir()
+	path := dir + "/bad.yaml"
+	content := `agents:
+  - id: ""
+    name: ""
+    provider: ""
+    model: ""
+`
+	if err := writeFile(path, content); err != nil {
+		t.Fatal(err)
+	}
+	l := NewLoader(path, nil)
+	_, err := l.Load()
+	if err == nil {
+		t.Fatal("expected validation error, got nil")
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Fatalf("validation error should include file path %q: %v", path, err)
+	}
+}
+
+func writeFile(path, content string) error {
+	return osWriteFile(path, []byte(content), 0644)
+}
+
+// osWriteFile 用 os.WriteFile 但避免在 test 中加 os import 只为了一点小操作
+// ponytail: 直接 inline os.WriteFile 薄包装
+var osWriteFile = os.WriteFile

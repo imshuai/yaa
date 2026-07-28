@@ -38,12 +38,12 @@
 - [x] 依赖关系校验（如非回环监听必须启用认证）
 - [x] 语义校验（如 `tools.max_concurrent` > 0、`timeout` > 0）
 - [x] Runtime SQLite path、HTTP timeout/header、Agent/Model、Planner、Plugin、Log 基础规则
-- [ ] MCP 非回环 listener 拒绝；disabled/`auto_start=false` 仍完整校验 descriptor
+- [x] MCP 非回环 listener 拒绝；disabled/`auto_start=false` 仍完整校验 descriptor
 - [x] Memory vector/embedding 条件按 effective policy 判定，关闭 Memory 不强制未使用连接字段
 - [x] Model Thinking effort 枚举、唯一性和 `supports_thinking` 依赖
 - [x] 校验错误聚合返回（收集所有错误，一次性报告）
 - [x] 校验错误消息包含字段路径（如 `runtime.api.http.addr: invalid value`）
-- [ ] Agent `model` 非空；内置 Provider 的 `base_url` 解码后是非空绝对 HTTP(S) URL
+- [x] Agent `model` 非空；内置 Provider 的 `base_url` 解码后是非空绝对 HTTP(S) URL
 
 ## 热更新
 
@@ -82,13 +82,13 @@
 
 - [x] 配置版本字段（`config_version: "1.0"`）
 - [x] 版本检测与迁移触发（加载时比较文件版本与当前版本）
-- [ ] 迁移函数注册表（`[]Migration` 显式版本边，拒绝重复起点与隐式路径）
+- [x] 迁移函数注册表（`[]Migration` 显式版本边，拒绝重复起点与隐式路径）
 - [x] 按显式迁移边逐步执行，不推测 `nextVersion` 或跳过缺失路径
 - [ ] 仅显式迁移 CLI 在写回前备份原配置文件（`.bak` 后缀）；启动加载不写盘
 - [ ] 显式迁移 CLI 写回成功后更新版本号；启动加载只更新内存中的 raw Map
 - [ ] CLI 写回失败时保留原文件；启动加载迁移失败不启动 Runtime
-- [ ] 废弃字段警告（字段已废弃但仍可读，warn 日志提示替代方案）
-- [ ] 移除字段报错（字段已移除，fatal 并提示迁移）
+- [x] 废弃字段警告（字段已废弃但仍可读，warn 日志提示替代方案）
+- [x] 移除字段报错（字段已移除，fatal 并提示迁移）
 - [ ] 迁移日志记录（from version → to version，变更明细）
 
 ## 默认值
@@ -114,7 +114,7 @@
 - [ ] `ErrConfigHotReloadFailed`
 - [ ] `ErrConfigNotActive`
 - [x] `ErrConfigFormatUnsupported`
-- [ ] 错误消息包含上下文（文件路径 + 字段路径 + 原因）
+- [x] 错误消息包含上下文（文件路径 + 字段路径 + 原因）
 
 ---
 
