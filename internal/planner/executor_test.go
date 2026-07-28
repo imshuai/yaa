@@ -417,3 +417,92 @@ func TestExecuteInputBindingMissingKeyInObjectFails(t *testing.T) {
 		t.Errorf("b.Error=%q should contain 'missing_key'", pr.Steps["b"].Error)
 	}
 }
+
+// TestExecuteFailsOnUnmarshalableOutput 单 step a 返不可 JSON 编码 Output (chan) → a 转 failed
+// (docs/planner/integration.md §3 "无法编码时 Step 失败"), 无 Output 字段写 results map,
+// 依赖 a 的 b 转 skipped, 整体 plan err 是 *ExecutionError stepID=a Cause 含 marshalling 错误.
+func TestExecuteFailsOnUnmarshalableOutput(t *testing.T) {
+	runner := StepRunner(func(ctx context.Context, agentID, sessionID string, step Step, input map[string]any) (StepRunResult, error) {
+		if step.ID == "a" {
+			// chan 不是 JSON 可编码值; json.Marshal 返 json.UnsupportedTypeError.
+			return StepRunResult{Output: make(chan int)}, nil
+		}
+		return StepRunResult{Output: map[string]any{"content": "b_ok"}}, nil
+	})
+	plan := Plan{
+		ID:   "t:plan",
+		Task: "t",
+		Steps: []Step{
+			{ID: "a", Action: ActionLLM},
+			{ID: "b", Action: ActionLLM, Depends: []string{"a"}},
+		},
+	}
+	e, _ := NewExecutor(4, runner)
+	pr, err := e.Execute(context.Background(), "a1", "s1", plan)
+	if err == nil {
+		t.Fatal("Execute should fail (a Output unmarshalable); got nil")
+	}
+	var ee *ExecutionError
+	if !errors.As(err, &ee) || ee.StepID != "a" {
+		t.Fatalf("err type=%T want *ExecutionError step=a; err=%v", err, err)
+	}
+	if !errors.Is(err, ErrPlanExecution) {
+		t.Errorf("errors.Is(ErrPlanExecution) false")
+	}
+	// marshalling 失败应保留 cause json.UnsupportedTypeError (encoding/json 包) — 但 ee.Cause 只 string 形式记.
+	if !strings.Contains(ee.Cause.Error(), "unsupported type") && !strings.Contains(pr.Steps["a"].Error, "unsupported type") {
+		t.Errorf("a.Error=%q / ee.Cause=%v should mention 'unsupported type'", pr.Steps["a"].Error, ee.Cause)
+	}
+	if pr.Status != PlanFailed {
+		t.Errorf("status=%q want %q", pr.Status, PlanFailed)
+	}
+	if pr.Steps["a"].Status != StepFailed {
+		t.Errorf("a status=%q want failed (Output unmarshalable)", pr.Steps["a"].Status)
+	}
+	// failed step 的 Output 不入 results map (这里 = nil / 零值).
+	if pr.Steps["a"].Output != nil {
+		t.Errorf("a.Output = %v, want nil (failed step 不保存 Output)", pr.Steps["a"].Output)
+	}
+	// b 是依赖 a 的步骤, a 失败后不动 b 的入度, b 一直留在 ready/未启动 → skipped.
+	if pr.Steps["b"].Status != StepSkipped {
+		t.Errorf("b status=%q want %q", pr.Steps["b"].Status, StepSkipped)
+	}
+}
+
+// TestExecuteMarshalCheckIsolated 以独立 step 验证 marshalling 校验只影响返回 Output 不可编码的 step;
+// 相邻独立 step 不被波及.
+func TestExecuteMarshalCheckIsolated(t *testing.T) {
+	var calls int32 = 0
+	runner := StepRunner(func(ctx context.Context, agentID, sessionID string, step Step, input map[string]any) (StepRunResult, error) {
+		_ = atomic.AddInt32(&calls, 1)
+		if step.ID == "unmarshalable" {
+			return StepRunResult{Output: func() {}}, nil // func 也是不可 JSON 编码
+		}
+		return StepRunResult{Output: map[string]any{"content": "ok"}}, nil
+	})
+	plan := Plan{
+		ID:   "t:plan",
+		Task: "t",
+		Steps: []Step{
+			{ID: "unmarshalable", Action: ActionLLM},
+			{ID: "good", Action: ActionLLM},
+		},
+	}
+	e, _ := NewExecutor(4, runner)
+	pr, err := e.Execute(context.Background(), "a1", "s1", plan)
+	if err == nil {
+		t.Fatal("Execute should fail (one step unmarshalable); got nil")
+	}
+	if pr.Status != PlanFailed {
+		t.Errorf("status=%q want failed", pr.Status)
+	}
+	// unmarshalable step failed; good step 独立可同时跑, 但被同次 cancel 触发或不影响 status 判断.
+	// 关键断言: unmarshalable 必为 failed, good 至少不是 failed because unmarshalable 出错之外字节影响.
+	if pr.Steps["unmarshalable"].Status != StepFailed {
+		t.Errorf("unmarshalable status=%q want failed", pr.Steps["unmarshalable"].Status)
+	}
+	if pr.Steps["good"].Status == StepFailed {
+		t.Errorf("good status=%q should not be failed from a's unmarshalable output; plan-wide cancel 也只能 canceled/skipped",
+			pr.Steps["good"].Status)
+	}
+}

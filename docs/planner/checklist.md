@@ -43,7 +43,7 @@
 - [x] Tool 在执行时使用真实 `agentID`/`sessionID` 再次鉴权 (AggregateStepRunner.runToolStep 用 tool.ExecutionScope{AgentID,SessionID}; ToolManager.Execute 内 CheckPermission)
 - [x] Skill 只作为静态 Agent Prompt，不存在 Planner Skill action 或子循环 (planningInput.capabilities 只来自 ToolManager.ListForAgent, Skill 由 agent.Manager renderSkillSystemMessage 作 system message 注入, 不进 Capabilities)
 - [x] LLM Step 不携带 Tool definitions (runLLMStep ChatRequest Tools=nil 显式; TestPlannedTurnEndToEnd 验证)
-- [ ] Step 输出在依赖绑定前验证可 JSON 编码
+- [x] Step 输出在依赖绑定前验证可 JSON 编码 (executor.go scheduler 成功 path 之前 json.Marshal(Output) 不可编码 → step failed + ExecutionError carry marshalling err; TestExecuteFailsOnUnmarshalableOutput + TestExecuteMarshalCheckIsolated)
 - [x] Session snapshot、Remote 路由和 RBAC 均无 Plan 字段/resource (planner 不入 Session 不写 Tool unit; api 沿用现有 routing 无 plan resource)
 - [ ] 日志与指标不泄露任务、输入、输出、prompt 或 secret
 

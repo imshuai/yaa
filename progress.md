@@ -2360,3 +2360,27 @@ go test -count=1 -timeout 60s ./internal/agent/ -run "PlannedTurn|PlannerDisable
 1. **#31: Step 输出 JSON 编码前置校验** — executor.go bindValue 检查 Output 在绑定前 `json.Marshal` 可行; 否则 worker 提前 fail 不返 hard error. quick: 加 5 行 + 1 单测.
 2. **#32: 观测指标 / 不泄露** — observability.md §5 指标 (yaa_mcp_servers / yaa_planner_plan_steps 等 5-6 个指标) + 日志脱敏.
 3. **MCP 集成剩余**: § 9 Session 集成 (MCP Tool 在 Session 上下文可用) / § 9 Provider 集成 (MCP Tool 作为 Function 暴露给 LLM) — 实际上 MCP Tool 已通过 ToolManager 注册走 direct turn ExecuteBatch; 改 checklist 勾选状态即可.
+
+## progress #31 — Step 输出绑定前 JSON 可编码性校验 (docs/planner/integration.md §3)
+
+### 改动
+- `internal/planner/executor.go` (+~20 行): scheduler 成功 path 之前加 `json.Marshal(res.runResult.Output)` 校验. 不可编码 → step 转 failed, Output 不入 results map, ExecutionError carry marshalling err; Usage 已提前累计 (docs §4 "先累计 usage, 再判断 error/status").
+- `internal/planner/executor_test.go` (+~70 行): TestExecuteFailsOnUnmarshalableOutput (chan Output); TestExecuteMarshalCheckIsolated (func Output + 邻居可编码 step).
+- `docs/planner/checklist.md`: 勾选 "Step 输出在依赖绑定前验证可 JSON 编码".
+
+### 决策记录
+- 单点校验放 scheduler 成功 path 之前而不是 worker 内 (executor.go): docs/integration.md L70 "Tool result 和 LLM response 都应转成 JSON 可编码值; 无法编码时 Step 失败" — "失败" 是 plan-level semantics, 由 scheduler 统一处理不分散到 runner, 与"绑定"时机 (下游 worker 读 results.Output) 之前保证一致.
+- marshal 失败 step Error 字符串保留原始 json.UnsupportedTypeError 文本 (via errShort 截 200 字), 不脱敏额外处理 (marshalling 错误本无敏感载荷).
+- Usage 在 marshal 失败前已累计 (与 ctx/Provider 错误 path 一致, docs §4 "Provider 已返但后续编码失败也保留 usage").
+- 失败 step 的 Output 字段不写 results map (Status=Failed, Output=nil); 保护下游 bindValue 看到 Output 字段空时查 StepStatus!=Succeeded 仍拒.
+
+### 验证
+```
+go vet ./... && go build ./...   # OK
+go test -count=1 -timeout 300s ./...   # 21 包全绿
+go test -count=1 -timeout 60s ./internal/planner/ -run "TestExecute(FailsOnUnmarshalableOutput|MarshalCheckIsolated)" -v   # 2 PASS
+```
+
+### 下一步
+仅剩 checklist 1 项未勾 (§ 集成与安全 "日志与指标不泄露任务/输入/输出/prompt/secret" — 等 observability commit 同步做). planner 包端到端至此完整.
+下一步候选: #32 observability 指标 (yaa_mcp_servers / yaa_planner_plan_steps 5-6 个 + 日志脱敏); 或 MCP 集成 checklist 剩余 § 9 项 (MCP Tool 已在 Session/Provider 上下文真实可用 — 直接补文档勾选 = minimum quick).

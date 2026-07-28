@@ -2,6 +2,7 @@ package planner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -214,6 +215,24 @@ func (e *Executor) Execute(ctx context.Context, agentID, sessionID string, plan 
 					cancelCause = res.runErr
 					// 主动取消未启动节点: cancel + 不再启动新节点 → skipped 自动.
 					cancel(res.runErr)
+				}
+				continue
+			}
+
+			// docs/planner/integration.md §3: "Tool result 和 LLM response 都应转成 JSON 可编码值;
+			// 无法编码时 Step 失败." 在 Output 写入 results map (供下游 $step 引用) 之前先验证可 JSON 编码.
+			// Usage 已在上面累计 (docs §4 "先累计 usage, 再判断 error/status"; marshalling 失败仍保留 usage).
+			if _, merr := json.Marshal(res.runResult.Output); merr != nil {
+				results[res.stepID] = StepResult{
+					StepID:   res.stepID,
+					Status:   StepFailed,
+					Error:    errShort(merr),
+					Duration: res.duration,
+				}
+				if firstErr == nil {
+					firstErr = &ExecutionError{PlanID: plan.ID, StepID: res.stepID, Cause: merr}
+					cancelCause = merr
+					cancel(merr)
 				}
 				continue
 			}
