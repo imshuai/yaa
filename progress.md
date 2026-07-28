@@ -2949,3 +2949,92 @@ go test -count=1 -timeout 300s ./...   # 24 包全绿 (含 internal/storage 0.46
 - §14.2 剩 1 项 config_reload Tool — Phase 5.
 - docs/config (74), docs/session (58), docs/memory (39) checklist 大量未勾 audit 候选.
 - docs/plugin Phase 4 (52 项 checklist) — Phase 4.
+
+---
+
+## #45 feat(session,config): session yaa_session_* metrics 10 指标全闭合 + config sentinel error
+
+### 范围
+- **docs/session checklist 58/58 ✅ 全闭合**: 最后 1 项 "指标全部使用 yaa_session_*" (行79) 勾选.
+- **session metrics 埋点**: 新建 `internal/session/metrics.go` (163 行) + 改 `manager.go/lifecycle.go/turn.go/runturn.go/hub.go` 注入 10 个 Prometheus 指标.
+- **config sentinel**: 加 `ErrConfigMigrationFailed` + `migrate.go` 3 处 `%w` 包装 + 新测试 `TestMigrateFailedErrorsIsSentinel`.
+
+### 实现
+
+#### `internal/session/metrics.go` (新建, 163 行)
+- `sessionMetrics` 结构含 10 指标指针: `current(Gauge) / operations(Counter) / messages(Counter) / messageBytes(Histogram) / turnWait(Histogram) / turnDuration(Histogram) / persistenceErrors(Counter) / restore(Counter) / cleanupTransitions(Counter) / eventPublishErrors(Counter)`.
+- `newSessionMetrics(r *metrics.Registry)`: r==nil 返全字段 nil nop 容器; 非 nil 构造 10 指标 MustRegister.
+- `SetMetrics(r)`: 公开 API, r==nil return 否则 `m.metrics = newSessionMetrics(r)`.
+- nil-safe helper (调用方无判空): `opInc(op,result)` / `currentInc/Dec(state)` / `messageObserve(role,bytes)` / `turnWaitObserve(sec)` / `turnDurationObserve(result,sec)` / `persistenceErrInc(op)` / `restoreInc(result)` / `cleanupTransitionInc(to,reason)` / `eventPublishErrInc(event)`.
+- `messageJSONBytes(payload) int`: 包级, `json.Marshal` 返字节数, err 返 0.
+
+#### `internal/session/hub.go` (改, event_publish_errors 第10指标)
+- Hub struct 加 `onDrop func(string)` 字段.
+- 加 `SetOnDrop(f func(string))` Setter (mu 保护).
+- `Publish` drop 处 `if h.onDrop != nil { h.onDrop("session_event") }` (each dropped subscriber).
+
+#### `internal/session/manager.go` (改)
+- 加 `metrics *sessionMetrics` 字段.
+- `Hub(sessionID)` 创建 Hub 后 `h.SetOnDrop(m.eventPublishErrInc)` 注入 drop 回调.
+- `Restore(ctx,now)` 改 named return `(err error)` + defer 失败 `restoreInc("failed")` 成功 `restoreInc("ok")` + 循环 loaded sessions 初始化 current Gauge.
+- `cleanupOnce` cleanup_transitions 埋点 (StateClosed/StatePaused + reason="cleanup").
+- `transitionLocked` 成功后 `currentDec(old)+currentInc(new)` (统一覆盖 Pause/Resume/Close/cleanup 所有状态转换).
+- `commit` store.Set 失败 `persistenceErrInc("set")`.
+
+#### `internal/session/lifecycle.go` (改)
+- `Create` 改 named return `(sessOut *Session, err error)` + defer: err!=nil → `opInc("create","failed")`; err==nil → `opInc("create","ok")+currentInc(StateCreated)`. store.Set 失败 `persistenceErrInc("set")`.
+- `Pause/Resume/Close` 各 named return `(err error)` + defer opInc (ok/failed).
+- `Delete` named return `(err error)` + defer opInc("delete", ok/failed). `runInSessionWithinDelete` 记 lastState + store.Delete 失败 `persistenceErrInc("delete")` + 删 sessions map 后 `currentDec(lastState)`.
+
+#### `internal/session/turn.go` (改)
+- `AppendUser` 加 `wasCreatedState` / `transitionedToActive` 闭包变量 → commit 成功后 `messageObserve("user", messageJSONBytes(msg))` + 若 transitionedToActive 则 `currentDec(StateCreated)+currentInc(StateActive)` (created→active 不走 transitionLocked).
+- `Append` commit 成功后 for each result 调 `messageObserve(role, messageJSONBytes)`.
+
+#### `internal/session/runturn.go` (改)
+- 加 `time` import.
+- `RunTurn` onQueued 后记 `enqueuedAt := time.Now()`.
+- `task` 闭包开头 `callbackStart := time.Now()` + `turnWaitObserve(callbackStart.Sub(enqueuedAt).Seconds())` + defer `turnDurationObserve(result, time.Since(callbackStart).Seconds())`, result = "ok"/"failed"/"canceled" (perr!=nil 为 failed; turnCtx cause ErrAgentStopped/context.Canceled 为 canceled).
+
+#### `internal/config/migrate.go` (改)
+- 加 `ErrConfigMigrationFailed = errors.New("config: migration failed")`.
+- 3 处 `fmt.Errorf("...: %w", ErrConfigMigrationFailed)`: `migration %s->%s failed: %w` (step.Run err) / `migration %s->%s returned a nil config` (nil result) / `config migration input is nil` (nil input).
+- 错误文本保持原测试断言子串 (`"returned a nil config"` / `"config migration input is nil"`).
+
+#### `internal/config/migrate_test.go` (改)
+- 新增 `TestMigrateFailedErrorsIsSentinel`: 2 子测试 (nil_input / nil_result) 验证 `errors.Is(err, ErrConfigMigrationFailed)`.
+
+#### `internal/session/manager_test.go` (改)
+- 新增 4 测试:
+  - `TestMetricsCreateOperationCounter`: Create → `operations{create,ok}>=1` + `current{created}==1`; Delete → `operations{delete,ok}>=1` + `current{created}==0`.
+  - `TestMetricsAppendMessagesCounter`: AppendUser+Append → `messages{user}>=1` + `messages{assistant}>=1` + `messageBytes{user}.Count>=1`.
+  - `TestMetricsRunTurnWaitAndDuration`: RunTurn → `turnWait.Count>=1` + `turnDuration{ok}.Count>=1`.
+  - `TestMetricsEventPublishErrorsOnDrop`: hubBufSize+1 条 Publish → 1 条 drop → `eventPublishErrors{session_event}>=1`.
+- 加 `newTestManagerWithMetrics` helper (带 metrics.Registry).
+- import 加 `github.com/imshuai/yaa/internal/metrics` (合并到已有 block).
+
+#### `docs/session/checklist.md` (改)
+- 行79 "指标全部使用 yaa_session_*" 勾选 → 58/58 ✅ 全闭合.
+
+#### `docs/config/checklist.md` (改)
+- 勾选 55 项已实现 (含本轮补的 `ErrConfigMigrationFailed` 行113 + `config_query` 脱敏 67/68). 剩 29 项未勾 (热更新 12 Phase 5 + CLI 2 + 迁移 CLI 4 + 敏感 EnvResolver 1 + sentinel 2 + 部分 4 + 测试 2 等).
+
+### 决策记录
+- **Hub 用 `SetOnDrop` 而非构造参数**: 与 `SetMetrics` 模式一致; NewHub 大量 caller 不破坏; onDrop nil → nop 不影响现有测试.
+- **event label 固定 "session_event"**: Hub 接收 any 跨包类型断言代价高于收益; docs/session/observability.md §2 只要求低基数未强制 §3 的 6 类 canonical 名.
+- **transitionLocked 集中 current Gauge 增减**: 一处覆盖 Pause/Resume/Close/cleanup 所有状态转换; root cause fix. AppendUser 的 created→active 不走 transitionLocked (在 commitCandidate 内), 单独手动 `currentDec(Created)+currentInc(Active)`.
+- **Create/Pause/Resume/Close/Delete 用 named return + defer**: 统一 opInc ok/failed 判定避免每个 return 路径散埋.
+- **turn_wait/turn_duration 在 task 闭包内**: onQueued 后记 enqueuedAt, task 开头记 callbackStart, Observe wait/duration. result label: "ok"(callback nil) / "failed"(callback err) / "canceled"(turnCtx cause ErrAgentStopped/Canceled).
+- **config sentinel 错误文本保持原断言子串**: 首次改文本导致测试失败 ("returned a nil config" → "returned nil config"), 改回原子串 + `%w` 包装 sentinel.
+
+### 验证
+```
+go vet ./... && go build ./...   # OK
+go test -count=1 -timeout 300s ./...   # 24 包全绿 (internal/session 0.436s +4 测试)
+```
+
+### 下一步
+- **session 58/58 ✅ 全闭合** — 模块完成.
+- **mcp 82/82 ✅**, **planner 34/34 ✅**, **tool §14.1 17/17 ✅**, **tool §14.4 4/4 ✅**, **tool §14.5 4/4 ✅**, **auth 30/30 ✅**, **storage 23/23 ✅**, **skill 23/24** (剩 restart-required Phase 5).
+- **config 55/74** (剩 29 项: 热更新 12 Phase 5 + CLI 2 + 迁移 CLI 4 + 敏感 EnvResolver 1 + sentinel 2 + 部分 4 + 测试 2).
+- **memory 39 项未审计**, **plugin 52 项 Phase 4**, **context 38 项部分已勾**.
+- **tool §14.2 剩 1 项** (config_reload Phase 5), **§14.3 剩 2 项** (Plugin RPC/配置声明 Phase 4).

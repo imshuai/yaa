@@ -1,10 +1,15 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 
 	"golang.org/x/exp/slog"
 )
+
+// ErrConfigMigrationFailed 是 Migrate 失败 (迁移函数返回错误/返回 nil 输入) 的 sentinel.
+// 配合 docs/config/checklist.md 错误处理章节, 启动加载迁移失败通过 %w 包此 sentinel.
+var ErrConfigMigrationFailed = errors.New("config: migration failed")
 
 // MigrationFunc upgrades a presence-aware raw configuration map.
 type MigrationFunc func(map[string]any) (map[string]any, error)
@@ -46,16 +51,16 @@ func Migrate(raw map[string]any, from, to ConfigSchema) (map[string]any, error) 
 		var err error
 		result, err = step.Run(result)
 		if err != nil {
-			return nil, fmt.Errorf("migration %s->%s failed: %w", step.From, step.To, err)
+			return nil, fmt.Errorf("%w: migration %s->%s failed: %w", ErrConfigMigrationFailed, step.From, step.To, err)
 		}
 		if result == nil {
-			return nil, fmt.Errorf("migration %s->%s returned a nil config", step.From, step.To)
+			return nil, fmt.Errorf("%w: migration %s->%s returned a nil config", ErrConfigMigrationFailed, step.From, step.To)
 		}
 		current = step.To
 	}
 
 	if result == nil {
-		return nil, fmt.Errorf("config migration input is nil")
+		return nil, fmt.Errorf("%w: config migration input is nil", ErrConfigMigrationFailed)
 	}
 	result["config_version"] = to.String()
 	return result, nil

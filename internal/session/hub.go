@@ -18,6 +18,8 @@ type Hub struct {
 	subs   map[*Subscriber]struct{}
 	logger *slog.Logger
 	closed bool
+	// onDrop 在订阅者因队列满被丢弃时回调; nil → nop. 用于 event_publish_errors_total 埋点.
+	onDrop func(string)
 }
 
 // Subscriber 是 Hub 的一个订阅者。Events 在 Hub 关闭或队列已满被注销后 close。
@@ -33,6 +35,14 @@ func NewHub(logger *slog.Logger) *Hub {
 		subs:   make(map[*Subscriber]struct{}),
 		logger: logger,
 	}
+}
+
+// SetOnDrop 设置订阅者被丢弃时的回调函数 f. 用于 event_publish_errors_total 埋点.
+// nil → nop. 必须在 Publish 首次可能调用前设置 (通常构造后立即调用).
+func (h *Hub) SetOnDrop(f func(string)) {
+	h.mu.Lock()
+	h.onDrop = f
+	h.mu.Unlock()
 }
 
 // Subscribe 创建一个新订阅者。返回值持有容量 hubBufSize 的缓冲队列和 done 信号。
@@ -74,6 +84,9 @@ func (h *Hub) Publish(ev any) {
 	}
 	h.mu.Unlock()
 	for _, s := range drop {
+		if h.onDrop != nil {
+			h.onDrop("session_event")
+		}
 		close(s.events)
 		close(s.done)
 	}

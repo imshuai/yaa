@@ -35,6 +35,9 @@ type Manager struct {
 	hubs        map[string]*Hub
 	activeTurns map[string]map[string]*turnControl // sessionID -> turnID -> control
 
+	// metrics 持有 10 个 session 指标; nil -> nop (docs/session/observability.md §2).
+	metrics *sessionMetrics
+
 	closing chan struct{}
 	closed  bool
 
@@ -103,10 +106,19 @@ func newManagerWith(cfg config.SessionConfig, store storage.Storage, logger *slo
 }
 
 // Restore 在启动时加载所有持久 snapshot 并重建索引。
-func (m *Manager) Restore(ctx context.Context, now time.Time) error {
-	keys, err := m.store.Keys("session:")
+//
+// 成功埋 yaa_session_restore_total{result="ok"} 并一次性初始化 yaa_session_current{state};
+// 失败埋 yaa_session_restore_total{result="failed"} (docs/session/observability.md §2).
+func (m *Manager) Restore(ctx context.Context, now time.Time) (err error) {
+	defer func() {
+		if err != nil {
+			m.restoreInc("failed")
+		}
+	}()
+	keys, kerr := m.store.Keys("session:")
+	err = kerr
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrRestoreFailed, err)
+		return fmt.Errorf("%w: %v", ErrRestoreFailed, kerr)
 	}
 	sort.Strings(keys)
 	loaded := make(map[string]*Session, len(keys))
@@ -161,6 +173,11 @@ func (m *Manager) Restore(ctx context.Context, now time.Time) error {
 		m.activeTurns[sid] = map[string]*turnControl{}
 	}
 	m.logger.Info("session restore complete", "sessions", len(loaded))
+	// 恢复完成一次性初始化 yaa_session_current{state}: 按 loaded session 状态计数.
+	for _, sess := range loaded {
+		m.currentInc(string(sess.State))
+	}
+	m.restoreInc("ok")
 	return nil
 }
 
@@ -294,10 +311,16 @@ func (m *Manager) cleanupOnce() {
 			}
 			if desired == StateClosed {
 				_, err := m.transitionLocked(id, StateClosed, "cleanup")
+				if err == nil {
+					m.cleanupTransitionInc(string(StateClosed), "cleanup")
+				}
 				return err
 			}
 			if desired == StatePaused {
 				_, err := m.transitionLocked(id, StatePaused, "cleanup")
+				if err == nil {
+					m.cleanupTransitionInc(string(StatePaused), "cleanup")
+				}
 				return err
 			}
 			return nil
@@ -419,6 +442,10 @@ func (m *Manager) transitionLocked(sessionID string, to State, reason string) (*
 	if err := m.commit(cand); err != nil {
 		return nil, err
 	}
+	// 状态转换成功后更新 yaa_session_current{state}: Dec 旧状态 + Inc 新状态.
+	// 对幂等 (closed->closed) transitionLocked 上方已提前 return, 此处必是真实变化.
+	m.currentDec(string(s.State))
+	m.currentInc(string(to))
 	return cand, nil
 }
 
@@ -431,6 +458,7 @@ func (m *Manager) commit(cand *Session) error {
 			return err
 		}
 		if cerr := m.store.Set(snapshotKey(cand.ID), data); cerr != nil {
+			m.persistenceErrInc("set")
 			if errors.Is(cerr, storage.ErrValueTooLarge) {
 				return fmt.Errorf("persist session %s: %w: %w", cand.ID, ErrPersistenceFailed, ErrSessionSnapshotTooLarge)
 			}
@@ -458,6 +486,7 @@ func (m *Manager) Hub(sessionID string) (*Hub, error) {
 		return h, nil
 	}
 	h := NewHub(m.logger)
+	h.SetOnDrop(m.eventPublishErrInc)
 	m.hubs[sessionID] = h
 	return h, nil
 }

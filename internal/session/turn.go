@@ -43,6 +43,8 @@ func (t *Turn) AppendUser(content string, metadata map[string]any) (SessionMessa
 	}
 	var result SessionMessage
 	var committedTurnID bool
+	wasCreatedState := false
+	transitionedToActive := false
 	err := t.manager.commitCandidate(t.sessionID, func(snap *Session) (*Session, error) {
 		// must be first user for this turn
 		for _, m := range snap.Messages {
@@ -53,6 +55,7 @@ func (t *Turn) AppendUser(content string, metadata map[string]any) (SessionMessa
 		}
 		// user 消息必须在候选序列头部（空历史或已有历史）
 		cand := snap.clone()
+		wasCreatedState = cand.State == StateCreated
 		now := t.manager.clock.Now().UTC()
 		sm := SessionMessage{
 			ID:        t.manager.ids.NewMessageID(),
@@ -74,6 +77,7 @@ func (t *Turn) AppendUser(content string, metadata map[string]any) (SessionMessa
 		// state: created -> active
 		if cand.State == StateCreated {
 			cand.State = StateActive
+			transitionedToActive = true
 		}
 		cand.UpdatedAt = now
 		cand.LastActivityAt = now
@@ -85,6 +89,13 @@ func (t *Turn) AppendUser(content string, metadata map[string]any) (SessionMessa
 		return SessionMessage{}, err
 	}
 	_ = committedTurnID
+	// docs/session/observability.md §2: yaa_session_messages_total{role="user"} + message_bytes.
+	// 若 commit 内 created -> active 发生, 同步 current Gauge (transitionLocked 不覆盖此路径).
+	t.manager.messageObserve("user", messageJSONBytes(msg))
+	if transitionedToActive || wasCreatedState {
+		t.manager.currentDec(string(StateCreated))
+		t.manager.currentInc(string(StateActive))
+	}
 	return result, nil
 }
 
@@ -141,6 +152,10 @@ func (t *Turn) Append(inputs []AppendInput) ([]SessionMessage, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+	// docs/session/observability.md §2: yaa_session_messages_total{role} + message_bytes{role} (per msg).
+	for _, sm := range result {
+		t.manager.messageObserve(sm.Payload.Role, messageJSONBytes(sm.Payload))
 	}
 	return result, nil
 }

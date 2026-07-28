@@ -2,8 +2,10 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // ErrAgentStopped 是业务层在关停时使用的 cause。
@@ -80,6 +82,9 @@ func (m *Manager) RunTurn(
 	if onQueued != nil {
 		onQueued(position)
 	}
+	// docs/session/observability.md §2: turn_wait_seconds = 入 runner 到 callback 开始.
+	// 这里 enqueuedAt 在登记 + onQueued 之后取, 最接近"已 enqueue".
+	enqueuedAt := time.Now()
 
 	// 唯一 defer：无论 enqueue 失败、queued cancel、Delete、panic 或 callback 完成，
 	// 都从 activeTurns 移除并 close(done)。
@@ -98,7 +103,24 @@ func (m *Manager) RunTurn(
 	}()
 
 	task := func() (perr error) {
+		callbackStart := time.Now()
+		// 入 runner FIFO 后到开始 callback 的等待时间; onQueued 时 enqueuedAt 之后到此.
+		m.turnWaitObserve(callbackStart.Sub(enqueuedAt).Seconds())
 		defer func() {
+			// docs/session/observability.md §2: turn_duration_seconds{result}.
+			// result: "ok" (callback nil perr) / "failed" (callback err) / "canceled" (turnCtx 已 cancel).
+			dur := time.Since(callbackStart).Seconds()
+			result := "ok"
+			if perr != nil {
+				result = "failed"
+			}
+			if cerr := context.Cause(turnCtx); cerr != nil && perr != nil {
+				// 被取消 (manager shutdown/session deleted) → canceled 标签.
+				if errors.Is(cerr, ErrAgentStopped) || errors.Is(cerr, context.Canceled) {
+					result = "canceled"
+				}
+			}
+			m.turnDurationObserve(result, dur)
 			if rec := recover(); rec != nil {
 				perr = fmt.Errorf("panic in turn: %v", rec)
 			}

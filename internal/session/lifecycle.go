@@ -19,8 +19,18 @@ import (
 //
 // 容量与 ID 预留在 Manager 写锁内完成，避免两个并发 Create 同时越界。
 // 失败时内存索引回退；持久化失败不留下可查询的半成品。
-func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Session, error) {
-	if err := ctx.Err(); err != nil {
+func (m *Manager) Create(ctx context.Context, req CreateRequest) (sessOut *Session, err error) {
+	// docs/session/observability.md §2: yaa_session_operations_total{operation="create",result}.
+	// outcome 判定: 返回 err==nil -> ok + currentInc(created); 否则 failed.
+	defer func() {
+		if err != nil {
+			m.opInc("create", "failed")
+			return
+		}
+		m.opInc("create", "ok")
+		m.currentInc(string(StateCreated))
+	}()
+	if err = ctx.Err(); err != nil {
 		return nil, err
 	}
 	if req.AgentID == "" {
@@ -89,11 +99,13 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (*Session, erro
 			return nil, err
 		}
 		if cerr := m.store.Set(snapshotKey(id), data); cerr != nil {
+			m.persistenceErrInc("set")
 			m.rollbackCreate(id, req.AgentID, runnerCreated)
 			return nil, fmt.Errorf("%w: %v", ErrPersistenceFailed, cerr)
 		}
 	}
 
+	// 成功返深拷贝 (defer 处理 opInc + currentInc).
 	return sess.clone(), nil
 }
 
@@ -190,8 +202,16 @@ func (m *Manager) List(ctx context.Context, agentID string, q ListQuery) ([]*Ses
 }
 
 // Pause 将 active -> paused。
-func (m *Manager) Pause(ctx context.Context, sessionID string) error {
-	if err := ctx.Err(); err != nil {
+func (m *Manager) Pause(ctx context.Context, sessionID string) (err error) {
+	// docs/session/observability.md §2: yaa_session_operations_total{operation="pause",result}.
+	defer func() {
+		if err != nil {
+			m.opInc("pause", "failed")
+			return
+		}
+		m.opInc("pause", "ok")
+	}()
+	if err = ctx.Err(); err != nil {
 		return err
 	}
 	return m.runInSession(sessionID, func() error {
@@ -208,8 +228,15 @@ func (m *Manager) Pause(ctx context.Context, sessionID string) error {
 }
 
 // Resume 将 paused -> active，先检查 max_lifetime。
-func (m *Manager) Resume(ctx context.Context, sessionID string) error {
-	if err := ctx.Err(); err != nil {
+func (m *Manager) Resume(ctx context.Context, sessionID string) (err error) {
+	defer func() {
+		if err != nil {
+			m.opInc("resume", "failed")
+			return
+		}
+		m.opInc("resume", "ok")
+	}()
+	if err = ctx.Err(); err != nil {
 		return err
 	}
 	return m.runInSession(sessionID, func() error {
@@ -230,8 +257,15 @@ func (m *Manager) Resume(ctx context.Context, sessionID string) error {
 }
 
 // Close 将任意非 Closed -> Closed；对 Closed 幂等 nil。
-func (m *Manager) Close(ctx context.Context, sessionID string) error {
-	if err := ctx.Err(); err != nil {
+func (m *Manager) Close(ctx context.Context, sessionID string) (err error) {
+	defer func() {
+		if err != nil {
+			m.opInc("close", "failed")
+			return
+		}
+		m.opInc("close", "ok")
+	}()
+	if err = ctx.Err(); err != nil {
 		return err
 	}
 	return m.runInSession(sessionID, func() error {
@@ -254,8 +288,16 @@ func (m *Manager) Close(ctx context.Context, sessionID string) error {
 }
 
 // Delete 物理删除 Session、snapshot、索引、runner。
-func (m *Manager) Delete(ctx context.Context, sessionID string) error {
-	if err := ctx.Err(); err != nil {
+func (m *Manager) Delete(ctx context.Context, sessionID string) (err error) {
+	// docs/session/observability.md §2: yaa_session_operations_total{operation="delete",result}.
+	defer func() {
+		if err != nil {
+			m.opInc("delete", "failed")
+			return
+		}
+		m.opInc("delete", "ok")
+	}()
+	if err = ctx.Err(); err != nil {
 		return err
 	}
 	return m.runInSessionWithinDelete(ctx, sessionID)
@@ -278,18 +320,21 @@ func (m *Manager) runInSessionWithinDelete(ctx context.Context, sessionID string
 	}
 	agentID := s.AgentID
 	persist := s.Policy.Persist
+	lastState := string(s.State) // 删除前状态, 成功后 Dec 一次.
 
 	// 交一个 sentinel task 给 runner：在 runner FIFO 内做 Storage 删除 + 索引摘除。
 	err := m.runInSession(sessionID, func() error {
 		if persist {
 			if derr := m.store.Delete(snapshotKey(sessionID)); derr != nil {
 				if !isStorageNotFound(derr) {
+					m.persistenceErrInc("delete")
 					return fmt.Errorf("%w: %v", ErrPersistenceFailed, derr)
 				}
 			}
 		}
 		m.mu.Lock()
 		delete(m.sessions, sessionID)
+		m.currentDec(lastState) // 同步 current Gauge: 删除 session 从计费移除.
 		if set := m.agentIdx[agentID]; set != nil {
 			delete(set, sessionID)
 		}

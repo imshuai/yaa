@@ -76,7 +76,7 @@
 - [x] 稳定错误集合与 `errors.Is` 包装见 [errors.md](errors.md)。
 - [x] Persistence/restore 失败不降级；Runtime readiness 反映 Restore 结果。
 - [x] 事件名称只使用 canonical 六类，提交后最多一次。
-- [ ] 指标全部使用 `yaa_session_*`，不含 session/message/tool ID 作为 label。
+- [x] 指标全部使用 `yaa_session_*`，不含 session/message/tool ID 作为 label。
 - [x] 日志不记录内容、ReasoningContent、Tool arguments/result 或 secret。
 - [x] SSE 订阅者慢不会阻塞 Session 提交。
 

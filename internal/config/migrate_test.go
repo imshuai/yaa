@@ -137,3 +137,26 @@ func assertErrorContains(t *testing.T, err error, want string) {
 		t.Fatalf("error = %v, want text %q", err, want)
 	}
 }
+
+func TestMigrateFailedErrorsIsSentinel(t *testing.T) {
+	// Migrate 失败 (迁移函数返错 或 nil 输入) 必须 errors.Is(ErrConfigMigrationFailed).
+	// 文本断言只覆盖已存在用例, 此测试显式锁定 sentinel 包装.
+	t.Run("nil_input wraps sentinel", func(t *testing.T) {
+		setMigrationsForTest(t, nil)
+		_, err := Migrate(nil, CurrentSchemaVersion, CurrentSchemaVersion)
+		if !errors.Is(err, ErrConfigMigrationFailed) {
+			t.Fatalf("errors.Is(ErrConfigMigrationFailed) = false; err = %v", err)
+		}
+	})
+	t.Run("nil_result wraps sentinel", func(t *testing.T) {
+		setMigrationsForTest(t, []Migration{
+			{From: ConfigSchema{1, 0}, To: ConfigSchema{1, 1}, Run: func(map[string]any) (map[string]any, error) {
+				return nil, nil
+			}},
+		})
+		_, err := Migrate(map[string]any{"config_version": "1.0"}, ConfigSchema{1, 0}, ConfigSchema{1, 1})
+		if !errors.Is(err, ErrConfigMigrationFailed) {
+			t.Fatalf("errors.Is(ErrConfigMigrationFailed) = false; err = %v", err)
+		}
+	})
+}

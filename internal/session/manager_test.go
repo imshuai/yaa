@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/imshuai/yaa/internal/config"
+	"github.com/imshuai/yaa/internal/metrics"
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/storage"
 )
@@ -386,4 +387,136 @@ func TestManagerConcurrentRunTurn(t *testing.T) {
 	if len(got.Messages) != 100 {
 		t.Fatalf("expected 100 messages, got %d", len(got.Messages))
 	}
+}
+
+// --- metrics 测试 ---
+
+// newTestManagerWithMetrics 构造带 metrics.Registry 的 Manager, 返回 registry 供断言.
+func newTestManagerWithMetrics(t *testing.T, persist bool) (*Manager, *metrics.Registry) {
+	t.Helper()
+	store, err := storage.NewMemory(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.SessionConfig{
+		MaxMessages:         100,
+		MaxMessageBytes:     1024 * 1024,
+		TTL:                 24 * time.Hour,
+		MaxLifetime:         720 * time.Hour,
+		Persist:             persist,
+		MaxSessionsPerAgent: 5,
+		CleanupInterval:     time.Minute,
+	}
+	clock := newFakeClock()
+	ids := newULIDGen()
+	m := newManagerWith(cfg, store, nil, clock, ids, ManagerOptions{})
+	r := metrics.NewRegistry()
+	m.SetMetrics(r)
+	if err := m.Restore(context.Background(), clock.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Shutdown(context.Background()) })
+	return m, r
+}
+
+func TestMetricsCreateOperationCounter(t *testing.T) {
+	m, _ := newTestManagerWithMetrics(t, true)
+	ctx := context.Background()
+
+	s, err := m.Create(ctx, CreateRequest{AgentID: "agent-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// operations_total{operation="create",result="ok"} >= 1
+	if got := m.metrics.operations.Value("create", "ok"); got < 1 {
+		t.Fatalf("operations{create,ok} = %d, want >= 1", got)
+	}
+	// current{state="created"} == 1
+	if got := m.metrics.current.Value("created"); got != 1 {
+		t.Fatalf("current{created} = %d, want 1", got)
+	}
+	// Delete → operations{delete,ok} + current 减少
+	if err := m.Delete(ctx, s.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.metrics.operations.Value("delete", "ok"); got < 1 {
+		t.Fatalf("operations{delete,ok} = %d, want >= 1", got)
+	}
+	if got := m.metrics.current.Value("created"); got != 0 {
+		t.Fatalf("current{created} after delete = %d, want 0", got)
+	}
+}
+
+func TestMetricsAppendMessagesCounter(t *testing.T) {
+	m, _ := newTestManagerWithMetrics(t, true)
+	ctx := context.Background()
+	s, _ := m.Create(ctx, CreateRequest{AgentID: "agent-a"})
+
+	err := m.RunTurn(ctx, s.ID, "turn_mc", nil, func(ctx context.Context, turn *Turn) error {
+		if _, err := turn.AppendUser("hello", nil); err != nil {
+			return err
+		}
+		_, err := turn.Append([]AppendInput{{Message: providerMsg("assistant", "world")}})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	// messages_total{role="user"} >= 1
+	if got := m.metrics.messages.Value("user"); got < 1 {
+		t.Fatalf("messages{user} = %d, want >= 1", got)
+	}
+	// messages_total{role="assistant"} >= 1
+	if got := m.metrics.messages.Value("assistant"); got < 1 {
+		t.Fatalf("messages{assistant} = %d, want >= 1", got)
+	}
+	// message_bytes histogram {role="user"} Count >= 1
+	if got := m.metrics.messageBytes.Count("user"); got < 1 {
+		t.Fatalf("messageBytes{user}.Count = %d, want >= 1", got)
+	}
+}
+
+func TestMetricsRunTurnWaitAndDuration(t *testing.T) {
+	m, _ := newTestManagerWithMetrics(t, true)
+	ctx := context.Background()
+	s, _ := m.Create(ctx, CreateRequest{AgentID: "agent-a"})
+
+	err := m.RunTurn(ctx, s.ID, "turn_wd", nil, func(ctx context.Context, turn *Turn) error {
+		_, err := turn.AppendUser("test", nil)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	// turn_wait_seconds histogram Count >= 1 (无 label)
+	if got := m.metrics.turnWait.Count(); got < 1 {
+		t.Fatalf("turnWait.Count = %d, want >= 1", got)
+	}
+	// turn_duration_seconds{result="ok"} Count >= 1
+	if got := m.metrics.turnDuration.Count("ok"); got < 1 {
+		t.Fatalf("turnDuration{ok}.Count = %d, want >= 1", got)
+	}
+}
+
+func TestMetricsEventPublishErrorsOnDrop(t *testing.T) {
+	m, _ := newTestManagerWithMetrics(t, true)
+	ctx := context.Background()
+	s, _ := m.Create(ctx, CreateRequest{AgentID: "agent-a"})
+
+	h, err := m.Hub(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 填满 hubBufSize 队列再多发一条 → 触发 drop → event_publish_errors_total{event="session_event"} >= 1
+	sub := h.Subscribe()
+	for i := 0; i < hubBufSize+1; i++ {
+		h.Publish("ev")
+	}
+	if got := m.metrics.eventPublishErrors.Value("session_event"); got < 1 {
+		t.Fatalf("eventPublishErrors{session_event} = %d, want >= 1 (dropped %d msgs after buf full)", got, hubBufSize+1)
+	}
+	_ = sub
 }
