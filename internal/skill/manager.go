@@ -8,7 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/exp/slog"
+
 	"github.com/imshuai/yaa/internal/config"
+	"github.com/imshuai/yaa/internal/metrics"
 	"github.com/imshuai/yaa/internal/tool"
 )
 
@@ -17,12 +20,55 @@ import (
 //
 // baseDir 用于解析相对 skills.dir；Runtime 在已知主配置文件目录时传该目录，
 // 否则传当前工作目录（与 storage path 解析基准一致）。
+// Load 保持原签名, 转调 LoadWith 空 hooks (nil → nop, 不破坏既有 caller).
 func Load(
 	skillsCfg config.SkillsConfig,
 	agents []config.AgentConfig,
 	tm *tool.Manager,
 	baseDir string,
 ) (*Manager, error) {
+	return LoadWith(skillsCfg, agents, tm, baseDir, LoadHooks{})
+}
+
+// LoadHooks 在构造期注入 Registry/logger 到 Load 工厂函数; 字段 nil → nop.
+// docs/skill/observability.md §1/§2: Load 是包级函数无 *Manager, 经 hooks 传入.
+// Registry 同时被 LoadWith 用于构造 load 指标并赋给 *Manager.metrics (供 ResolveForAgent 复用).
+type LoadHooks struct {
+	Registry *metrics.Registry // nil → metric nop
+	Logger   *slog.Logger       // nil → log nop (默认未注入不落日志)
+}
+
+// LoadWith 与 Load 等价, 额外接收 LoadHooks 在构造期埋点 (docs/skill/observability.md).
+// 用 named return + defer 保证一次 Load 最多一条 completed/failed (§1).
+// 成功: loadCounter.Inc("ok") + loadDuration + current{status} + skill.load.completed info.
+// 失败: loadCounter.Inc("failed") + loadDuration + skill.load.failed error (package_name?, error_class, duration_ms).
+// 不外泄 prompt/options value/绝对路径.
+func LoadWith(
+	skillsCfg config.SkillsConfig,
+	agents []config.AgentConfig,
+	tm *tool.Manager,
+	baseDir string,
+	hooks LoadHooks,
+) (mgr *Manager, lerr error) {
+	start := time.Now()
+	sm := newSkillMetrics(hooks.Registry) // nil-safe; hooks.Registry 为 nil 时 sm 各字段 nil, 埋点均 nop
+	hooks.Logger = defaultLogger(hooks.Logger)
+	defer func() {
+		if lerr != nil {
+			sm.loadFail(hooks.Logger, start, "", lerr)
+			return
+		}
+		loaded, disabled := 0, 0
+		for _, e := range mgr.entries {
+			if e.Status == StatusLoaded {
+				loaded++
+			} else {
+				disabled++
+			}
+		}
+		sm.loadSucceed(hooks.Logger, start, loaded, disabled)
+	}()
+
 	dir, err := resolveSkillDir(skillsCfg.Dir, baseDir)
 	if err != nil {
 		return nil, err
@@ -118,11 +164,14 @@ func Load(
 		byAgent[ag.ID] = resolved
 	}
 
-	return &Manager{
+	mgr = &Manager{
 		entries:   entries,
 		byAgent:   byAgent,
 		skillsDir: dir,
-	}, nil
+		metrics: sm,
+		logger:  hooks.Logger,
+	}
+	return mgr, nil
 }
 
 // resolveSkillDir 把 dir 相对 baseDir 解析为绝对路径并 filepath.Clean；
@@ -268,6 +317,10 @@ func resolveForAgent(ag config.AgentConfig, entries map[string]Entry, skillsCfg 
 		if err := validateOptionsJSON(merged); err != nil {
 			return nil, fmt.Errorf("%w: skill %q: %v", ErrSkillOptionsInvalid, name, err)
 		}
+		// docs/skill/config.md §3: 合并后递归规范化 key 并拒绝凭据黑名单 (api_key/password/secret/...).
+		if keys := validateSensitiveKeys(merged); len(keys) > 0 {
+			return nil, fmt.Errorf("%w: skill %q: sensitive key(s): %v", ErrSkillOptionsInvalid, name, keys)
+		}
 		out = append(out, ResolvedSkill{
 			Name:    name,
 			Options: merged,
@@ -343,9 +396,22 @@ func (m *Manager) List() []Entry {
 // ResolveForAgent 返回启动时为该 Agent 冻结的拓扑序 ResolvedSkill 列表，深拷贝。
 // 未知 Agent 返回 ErrSkillAgentNotFound。
 func (m *Manager) ResolveForAgent(agentID string) ([]ResolvedSkill, error) {
+	out, ok := m.resolveForAgent(agentID)
+	if !ok {
+		// 失败: metric + 日志 (agent_id, error_class).
+		m.metrics.resolveFail(m.logger, agentID, fmt.Errorf("%w: %q", ErrSkillAgentNotFound, agentID))
+		return nil, fmt.Errorf("%w: %q", ErrSkillAgentNotFound, agentID)
+	}
+	// 成功: metric + 日志 (agent_id, count).
+	m.metrics.resolveSucceed(m.logger, agentID, len(out))
+	return out, nil
+}
+
+// resolveForAgent 是已有解析逻辑 (深拷贝 ok=false 表未知 Agent), 保留作 metric 旁路以避免埋点污染.
+func (m *Manager) resolveForAgent(agentID string) ([]ResolvedSkill, bool) {
 	list, ok := m.byAgent[agentID]
 	if !ok {
-		return nil, fmt.Errorf("%w: %q", ErrSkillAgentNotFound, agentID)
+		return nil, false
 	}
 	out := make([]ResolvedSkill, len(list))
 	for i, r := range list {
@@ -355,7 +421,7 @@ func (m *Manager) ResolveForAgent(agentID string) ([]ResolvedSkill, error) {
 			Prompt:  r.Prompt,
 		}
 	}
-	return out, nil
+	return out, true
 }
 
 func cloneEntry(e Entry) Entry {

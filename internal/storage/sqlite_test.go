@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -186,8 +187,51 @@ func TestSQLiteCloseIdempotentAndAfterClosed(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatalf("second close should be idempotent: %v", err)
 	}
-	if err := s.Set("k", []byte("v")); err == nil {
-		t.Fatal("Set after close should error")
+	if err := s.Set("k", []byte("v")); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Set after close = %v, want ErrClosed", err)
+	}
+	if _, err := s.Get("k"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Get after close = %v, want ErrClosed", err)
+	}
+	if err := s.Delete("k"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Delete after close = %v, want ErrClosed", err)
+	}
+	if _, err := s.Has("k"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Has after close = %v, want ErrClosed", err)
+	}
+	if _, err := s.Keys(""); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Keys after close = %v, want ErrClosed", err)
+	}
+}
+
+// TestSQLiteIntegrityCheckOnCleanDB 验证 PRAGMA integrity_check 在干净数据库上返 "ok"。
+func TestSQLiteIntegrityCheckOnCleanDB(t *testing.T) {
+	s := newSQLiteForTest(t, filepath.Join(t.TempDir(), "yaa.db"))
+	if err := s.IntegrityCheck(context.Background()); err != nil {
+		t.Fatalf("IntegrityCheck clean db: %v", err)
+	}
+}
+
+// TestSQLiteBackupThenOpen 验证 checkpoint+WAL+file copy 后的副本可被新 NewSQLite 正常打开并读出原数据。
+// docs/storage/sqlite.md §7: 备份可走 "先停止写入、checkpoint WAL 后复制"。
+func TestSQLiteBackupThenOpen(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "yaa.db")
+	s := newSQLiteForTest(t, src)
+	if err := s.Set("k1", []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "backup.db")
+	if err := s.Backup(dst); err != nil {
+		t.Fatalf("Backup: %v", err)
+	}
+	s2 := newSQLiteForTest(t, dst)
+	got, err := s2.Get("k1")
+	if err != nil {
+		t.Fatalf("Get from backup: %v", err)
+	}
+	if string(got) != "v1" {
+		t.Fatalf("backup data = %q, want v1", got)
 	}
 }
 

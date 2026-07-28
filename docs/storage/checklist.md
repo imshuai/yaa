@@ -18,7 +18,7 @@
 - [x] schema version、migration、WAL、busy timeout 和单连接初始化失败均阻止 Ready。
 - [x] Set 使用原子 upsert；Get/Has/Keys 在 SQL 中过滤 expiry。
 - [x] cleanup 按 expiry/key 排序，每批最多 1000，支持关闭等待。
-- [ ] Close 后所有方法返回 ErrClosed；online backup/integrity check 有集成测试。
+- [x] Close 后所有方法返回 ErrClosed；online backup/integrity check 有集成测试。
 
 ## Memory 后端
 
@@ -32,16 +32,16 @@
 
 - [x] `runtime.storage.type` 只接受 `sqlite|memory`，Config 只有 Type/Path。
 - [x] Root Storage 所有者是 Runtime；Session Manager 不 Close。
-- [ ] Session 只写 `session:<id>` 完整 snapshot且不传 Storage TTL。
-- [ ] Memory 使用专用 ContentStore，不生成 root KV key。
-- [ ] Restore 遇坏 snapshot 不发布部分状态。
+- [x] Session 只写 `session:<id>` 完整 snapshot且不传 Storage TTL。
+- [x] Memory 使用专用 ContentStore，不生成 root KV key。
+- [x] Restore 遇坏 snapshot 不发布部分状态。
 
 ## 门禁
 
-- [ ] Storage 文档不存在未定义配置、后端、Session 子 key 或 Memory KV key。
-- [ ] fenced SQL/YAML/Go 结构完整，相对链接存在。
-- [ ] `git diff --check` 通过。
+- [x] Storage 文档不存在未定义配置、后端、Session 子 key 或 Memory KV key。
+- [x] fenced SQL/YAML/Go 结构完整，相对链接存在。
+- [x] `git diff --check` 通过。
 
 ---
 
-*最后更新: 2026-07-22*
+*最后更新: 2026-07-29*

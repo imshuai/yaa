@@ -3,6 +3,8 @@ package skill
 import (
 	"regexp"
 	"time"
+
+	"golang.org/x/exp/slog"
 )
 
 // Status 是 Skill 包加载后的稳定状态字符串（docs/skill/manager.md §1）。
@@ -49,6 +51,8 @@ type Manager struct {
 	entries   map[string]Entry
 	byAgent   map[string][]ResolvedSkill
 	skillsDir string
+	metrics   *skillMetrics // nil → nop; docs/skill/observability.md §2
+	logger    *slog.Logger   // nil → log nop; docs/skill/observability.md §1
 }
 
 // 固定字节上限（docs/skill/README.md §2），不可配置。

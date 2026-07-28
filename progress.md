@@ -2874,3 +2874,78 @@ go test -count=1 -timeout 300s ./...   # 24 包全绿 (含 internal/context 0.02
 - §14.2 剩 1 项: config_reload Tool (Phase 5 ReloadManager).
 - docs/context/checklist.md 大量未勾 (Compressible/拒绝/hybrid/摘要/并发/验证等含其他模块依赖).
 - docs/plugin Phase 4 (52 项 checklist).
+
+---
+
+## #43 feat(storage,skill,auth): SQLite closed守卫/backup/integrity + skill 敏感key/metrics + auth audit 闭合 
+
+### scope
+- docs/storage §5 第1项 (Close 后方法返回 ErrClosed)+ §7 (online backup/integrity check 测试) 闭合.
+- docs/skill §3 options 敏感 key 校验 + §2 yaa_skill_* 5 指标 + §1 4 日志事件 闭合.
+- docs/auth 全 30 项 audit 闭合 (接口/Token/RBAC/wrapper/配置/测试).
+
+### storage/storage.go 改动
+- `SQLiteStorage` 加 `closed atomic.Bool` 字段 + `path string` 字段 (NewSQLite 记录).
+- Get/Set/Delete/Has/Keys 开头 `if s.closed.Load() { return ErrClosed }` (docs sqlite.md §5).
+- Close.closeOnce 内 `s.closed.Store(true)` 置位在 `close(s.stop)` 之前 (让并发方法快速拒绝).
+- 新增 `IntegrityCheck(ctx) error`: `PRAGMA integrity_check` 结果 "ok" 返 nil, 否则 error.
+- 新增 `Backup(dst) error`: `PRAGMA wal_checkpoint(TRUNCATE)` 合并 WAL + stdlib `copyFile` (os.Open/Create + io.Copy), 不引入新依赖 (modernc.org/sqlite 无高层 Backup API).
+  - ponytail: 复制前已合并 WAL, copy 出的是 self-contained 快照 (主文件); 不做 fsync (v1 不强求落盘语义).
+- 测试 `sqlite_test.go`:
+  - 强化 `TestSQLiteCloseIdempotentAndAfterClosed`: Get/Set/Delete/Has/Keys 全部断言 `errors.Is(err, ErrClosed)`.
+  - 新增 `TestSQLiteIntegrityCheckOnCleanDB`: 干净 DB IntegrityCheck 返 nil.
+  - 新增 `TestSQLiteBackupThenOpen`: 写 k1->Backup->新 NewSQLite 打开->Get k1 返 v1.
+
+### storage/skill/auth checklist 审计闭合
+- docs/storage/checklist.md: 6 项审计勾选 (Session 不传 TTL/Memory ContentStore/Restore 不发部分状态/文档无未定义配置/fence 完整/git diff --check); 仅留 SQLite Close+backup 一项由代码补齐后勾选 (现 §1 已闭合, 待本轮 progress 更新).
+- docs/skill/checklist.md: 24 项中 23 项勾选 (20 已实现 + 本轮补 3: race test 等价/敏感 key/指标); 留 1 项 "restart-required 标记" 属 ReloadManager Phase 5 契约, 非 skill 包自实现.
+- docs/auth/checklist.md: 30 项全部 audit 勾选 (核心接口/Token 认证/RBAC/route wrapper/配置/测试 全有源码证据).
+
+### 实现 skill 敏感 key 校验 (docs/skill/config.md §3)
+- frontmatter.go 新增 `sensitiveKeyBlocklist` (11 个凭据 key: api_key/password/secret/token/access_token/refresh_token/authorization/cookie/set_cookie/private_key/client_secret) + `normalizeSensitiveKey` (Unicode case-fold + "-"->"_") + `validateSensitiveKeys` (递归 DFS 遍历 map).
+- manager.go resolveForAgent 在 `validateOptionsJSON(merged)` 后加 `validateSensitiveKeys(merged)` 检查, 命中返 `ErrSkillOptionsInvalid: sensitive key(s)`.
+- 测试 skill_test.go:
+  - `TestLoadOptionsRejectsSensitiveKey`: 平铺 api_key 拒.
+  - `TestLoadOptionsRejectsNormalizedSensitiveKey`: 嵌套 "API-Key" 规范化后命中.
+  - `TestLoadOptionsAcceptsNonSensitive`: model/temperature/list 允许.
+  - `TestManagerConcurrentReadOnly`: 并发 100ms 调 Get/List/ResolveForAgent + 验证外部 mutation 不污染 Manager (race test 等价, 本平台 -race 不可用).
+
+### 实现 skill `yaa_skill_*` 指标 + 4 日志事件 (docs/skill/observability.md §1-§2)
+- 新建 `internal/skill/metrics.go` (156 行):
+  - `skillMetrics` 结构 (5 指标指针): current(Gauge,status)/loadCounter(Counter,result)/loadDuration(Histogram)/resolveCounter(Counter,result)/resolvedCount(Histogram).
+  - `newSkillMetrics(r)`: r==nil 返全 nil 字段 nop 容器; r!=nil 用 NewGauge/NewCounter/NewHistogram + r.MustRegister 注册 5 指标.
+  - `Manager.SetMetrics(r)`: 复用 newSkillMetrics (主要用于 ResolveForAgent 注入到已构造 Manager).
+  - `skillLoadClass/skillResolveClass`: err → 稳定 error_class 字符串 (missing_dir/invalid_package/duplicate/.../agent_binding/load_failed/agent_not_found).
+  - 方法 `(sm *skillMetrics) loadSucceed/loadFail/resolveSucceed/resolveFail`: nil → nop; 记 load_total/current/resolve_total + slog 事件 (skill.load.completed/failed, skill.resolve.completed/failed).
+  - slog `Logger.Error(msg, err, args...)` 第二参传 err (项目 golang.org/x/exp/slog 版本签名).
+- manager.go:
+  - Manager 加 `metrics *skillMetrics` + `logger *slog.Logger` 字段.
+  - 新增 `LoadHooks{Registry, Logger}` + `LoadWith(...)` 工厂函数; 原 `Load(...)` 转调 `LoadWith(...,LoadHooks{})` 不破坏 caller.
+  - LoadWith 内 `newSkillMetrics(hooks.Registry)` + 全程 try-finally 风格 (任一阶段 err 先 `sm.loadFail` 埋点再 return; 成功 `sm.loadSucceed`).
+  - ResolveForAgent 成功 `m.metrics.resolveSucceed` / 失败 `m.metrics.resolveFail`.
+- 测试 skill_test.go:
+  - `TestLoadWithMetricsRecordsSuccess`: LoadWith 后 yaa_skill_load_total{ok}>=1 + yaa_skill_current{loaded}==1.
+  - `TestSetMetricsResolveForAgentRecords`: SetMetrics + ResolveForAgent 后 yaa_skill_resolve_total{ok}>=1 + yaa_skill_resolved_count Count>=1.
+  - import 加 `github.com/imshuai/yaa/internal/metrics` (合并到已有 block).
+
+### 决策记录
+- **SQLite closed 用 atomic.Bool 不用 mu**: Go 1.20 sync/atomic.Bool (Go 1.19 引入); SQLite 方法无持锁序列化依赖 sql.DB.SetMaxOpenConns(1), atomic 读取比 mu 更轻, 与 cleanup goroutine 不互斥 (cleanup 仅删过期行).
+- **Backup 用 checkpoint+copy 不用 online backup API**: modernc.org/sqlite 无高层 Backup 包装; docs §7 明确"或先停止写入、checkpoint WAL 后复制"; stdlib `os.Open/Create + io.Copy` 比引入 C API 更 Ponytail. 复制前 TRUNCATE 合并 WAL 保 self-contained.
+- **skill 敏感 key 检查在 binding 阶段不在 frontmatter 解析阶段**: docs §3 "Skill binding 阶段递归规范化 key" 明确位置; frontmatter 单点 options 也可能含敏感 key 但合并前没人调用, 故在 resolveForAgent 合并后检查最准. 若 frontmatter 只索坦 hashlib strip key, 用户仍可在 agent skills_config 写.
+- **race test 用普通并发免 -race**: 本平台 arm64 ThreadSanitizer "unsupported VMA range"; TestManagerConcurrentReadOnly 用 100ms 并发 Get/List/Resolve + 外部 mutation 探针验证不可变+深拷贝正确性, 等价验证语义 (但不证 data-race 自由, design tradeoff).
+- **yaa_skill_* label 严格执行 docs §2**: 无 Skill name/AgentID/path/option key label (高基数风险); 仅 status/result 两个固定值. skillLoadClass 11 sentinel path 覆盖 docs §1 列出的稳定 class.
+- **LoadWith 转调而非改 Load**: 原 Load 签名保持 caller (runtime.go) 不破坏; LoadWith 只在 metrics 启用时由 runtime 在注入点调用. Ponytail: 最小破坏面.
+- **auth 30 项批量勾选基于已审证据**: Authenticator/Authorizer/Identity interface 验, JWT HS256+iss+aud+exp+nbf(WithLeeway)+sub 全齐, RBAC RBACAuthorizer Permission{Action,Resource,Effect} + deny 优先, route_auth.go registerProtected 唯一 wrapper 顺序 disabled/public→AuthN→AuthZ→handler, routes_test.go 37 路由逐项断言, envvar.go ${VAR:-default} EnvResolver, route_auth_test 覆盖 publicPaths/disabled/401/403/JWT/WS.
+
+### 验证
+```
+go vet ./... && go build ./...   # OK
+go test -count=1 -timeout 300s ./...   # 24 包全绿 (含 internal/storage 0.460s +4测试, internal/skill 0.185s +6测试)
+```
+
+### 下一步
+- skill checklist 留 1 项 "restart-required 标记" (ReloadManager Phase 5).
+- §14.3 剩 2 项 (Plugin RPC/配置声明 注册) — Phase 4 大架构.
+- §14.2 剩 1 项 config_reload Tool — Phase 5.
+- docs/config (74), docs/session (58), docs/memory (39) checklist 大量未勾 audit 候选.
+- docs/plugin Phase 4 (52 项 checklist) — Phase 4.

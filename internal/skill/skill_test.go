@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/imshuai/yaa/internal/config"
+	"github.com/imshuai/yaa/internal/metrics"
 	"github.com/imshuai/yaa/internal/provider"
 	"github.com/imshuai/yaa/internal/tool"
 )
@@ -407,4 +408,177 @@ func toInt(v any) (int, bool) {
 		return int(x), true
 	}
 	return 0, false
+}
+
+func TestLoadOptionsRejectsSensitiveKey(t *testing.T) {
+	dir := t.TempDir()
+	// 平铺 api_key: 明确黑名单
+	writeSkill(t, dir, "alpha", `---
+name: alpha
+description: A
+options:
+  api_key: "xxx"
+---
+body
+`)
+	agents := []config.AgentConfig{{ID: "agent-a", Skills: []string{"alpha"}}}
+	_, err := Load(config.SkillsConfig{Dir: dir}, agents, nil, dir)
+	if !errors.Is(err, ErrSkillOptionsInvalid) {
+		t.Fatalf("expected ErrSkillOptionsInvalid, got %v", err)
+	}
+}
+
+func TestLoadOptionsRejectsNormalizedSensitiveKey(t *testing.T) {
+	dir := t.TempDir()
+	// "API-Key" 规范化 (lower + dash->underscore) -> "api_key" 命中黑名单。
+	writeSkill(t, dir, "gamma", `---
+name: gamma
+description: A
+options:
+  nested:
+    "API-Key": "xxx"
+---
+body
+`)
+	agents := []config.AgentConfig{{ID: "agent-a", Skills: []string{"gamma"}}}
+	_, err := Load(config.SkillsConfig{Dir: dir}, agents, nil, dir)
+	if !errors.Is(err, ErrSkillOptionsInvalid) {
+		t.Fatalf("expected ErrSkillOptionsInvalid for normalized API-Key, got %v", err)
+	}
+}
+
+func TestLoadOptionsAcceptsNonSensitive(t *testing.T) {
+	dir := t.TempDir()
+	writeSkill(t, dir, "beta", `---
+name: beta
+description: A
+options:
+  model: "gpt-4o"
+  temperature: 0.5
+  list:
+    - one
+    - two
+---
+body
+`)
+	agents := []config.AgentConfig{{ID: "agent-a", Skills: []string{"beta"}}}
+	_, err := Load(config.SkillsConfig{Dir: dir}, agents, nil, dir)
+	if err != nil {
+		t.Fatalf("expected OK for non-sensitive options, got %v", err)
+	}
+}
+
+// TestManagerConcurrentReadOnly 验证 Manager 不可变且深拷贝在并发读下安全 (race test 等价, 此平台 -race 不可用).
+// ponytail: 用几个并发 goroutine 持续调用 Get/List/ResolveForAgent, 任一返回外部 mutation 不影响其他 goroutine 即过.
+func TestManagerConcurrentReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	writeSkill(t, dir, "alpha", `---
+name: alpha
+description: A
+options:
+  k: v
+---
+body
+`)
+	agents := []config.AgentConfig{{ID: "agent-a", Skills: []string{"alpha"}}}
+	m, err := Load(config.SkillsConfig{Dir: dir}, agents, nil, dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// 取一次 resolved, 注入 mutation 探针, 验证 Manager 内部拷贝不受影响.
+	r0, _ := m.ResolveForAgent("agent-a")
+	if len(r0) != 1 {
+		t.Fatalf("resolved len = %d", len(r0))
+	}
+	r0[0].Options["injected"] = "mutant" // 改外部拷贝, 不应影响 Manager.
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				if e, eerr := m.Get("alpha"); eerr != nil || len(e.Skill.Prompt) == 0 {
+					t.Errorf("Get alpha: err=%v, prompt_len=%d", eerr, len(e.Skill.Prompt))
+					return
+				}
+				if list := m.List(); len(list) == 0 {
+					t.Errorf("List empty")
+					return
+				}
+				if r, rerr := m.ResolveForAgent("agent-a"); rerr != nil || len(r) != 1 {
+					t.Errorf("Resolve: err=%v, len=%d", rerr, len(r))
+					return
+				}
+				// 每轮重新 Resolve 拿到的 options 不应含有 mutant.
+				if r, _ := m.ResolveForAgent("agent-a"); r[0].Options["injected"] != nil {
+					t.Errorf("Manager state polluted by external mutation: %v", r[0].Options)
+					return
+				}
+			}
+		}
+	}()
+	// 跑 ~100ms 并发只读.
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+	<-done
+	_ = r0
+}
+
+func TestLoadWithMetricsRecordsSuccess(t *testing.T) {
+	dir := t.TempDir()
+	writeSkill(t, dir, "alpha", `---
+name: alpha
+description: A
+---
+body
+`)
+	agents := []config.AgentConfig{{ID: "agent-a", Skills: []string{"alpha"}}}
+	r := metrics.NewRegistry()
+	m, err := LoadWith(config.SkillsConfig{Dir: dir}, agents, nil, dir, LoadHooks{Registry: r})
+	if err != nil {
+		t.Fatalf("LoadWith: %v", err)
+	}
+	// yaa_skill_load_total{result=ok} >= 1
+	if got := r.Get("yaa_skill_load_total").(*metrics.Counter).Value("ok"); got < 1 {
+		t.Errorf("yaa_skill_load_total{ok}=%d want >=1", got)
+	}
+	// yaa_skill_current{status=loaded} == 1
+	if got := r.Get("yaa_skill_current").(*metrics.Gauge).Value("loaded"); got != 1 {
+		t.Errorf("yaa_skill_current{loaded}=%d want 1", got)
+	}
+	_ = m
+}
+
+func TestSetMetricsResolveForAgentRecords(t *testing.T) {
+	dir := t.TempDir()
+	writeSkill(t, dir, "alpha", `---
+name: alpha
+description: A
+---
+body
+`)
+	agents := []config.AgentConfig{{ID: "agent-a", Skills: []string{"alpha"}}}
+	m, err := Load(config.SkillsConfig{Dir: dir}, agents, nil, dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	r := metrics.NewRegistry()
+	m.SetMetrics(r)
+	resolved, err := m.ResolveForAgent("agent-a")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got := r.Get("yaa_skill_resolve_total").(*metrics.Counter).Value("ok"); got < 1 {
+		t.Errorf("yaa_skill_resolve_total{ok}=%d want >=1", got)
+	}
+	if cnt := r.Get("yaa_skill_resolved_count").(*metrics.Histogram).Count(); cnt < 1 {
+		t.Errorf("yaa_skill_resolved_count Count=%d want >=1", cnt)
+	}
+	if len(resolved) != 1 {
+		t.Errorf("resolved len=%d want 1", len(resolved))
+	}
 }

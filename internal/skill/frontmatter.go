@@ -161,3 +161,46 @@ func validateOptionsJSON(m map[string]any) error {
 
 // avoid unused io import（在测试与未来降级场景准备）
 var _ io.Reader = (*strings.Reader)(nil)
+
+// sensitiveKeyBlocklist 是 docs/skill/config.md §3 明确的凭据 key 黑名单。
+// 校验前对 key 做 Unicode case-fold + "-"->"_" 规范化, 再 exact match。
+var sensitiveKeyBlocklist = map[string]struct{}{
+	"api_key":        {},
+	"password":       {},
+	"secret":         {},
+	"token":          {},
+	"access_token":   {},
+	"refresh_token":  {},
+	"authorization":  {},
+	"cookie":         {},
+	"set_cookie":     {},
+	"private_key":    {},
+	"client_secret":  {},
+}
+
+// normalizeSensitiveKey 把 option key 规范化为黑名单匹配形式: Unicode case-fold + "-"->"_".
+// docs/skill/config.md §3: "Skill binding 阶段递归规范化 key（Unicode case-fold，`-` 转 `_`）".
+func normalizeSensitiveKey(k string) string {
+	return strings.ReplaceAll(strings.ToLower(k), "-", "_")
+}
+
+// validateSensitiveKeys 递归遍历 options, 任一 key 规范化后命中黑名单则返 ErrSkillOptionsInvalid.
+// ponytail: O(n) DFS; 不修改输入 map, 只读遍历.
+func validateSensitiveKeys(m map[string]any) []string {
+	var found []string
+	var walk func(node any)
+	walk = func(node any) {
+		mm, ok := node.(map[string]any)
+		if !ok {
+			return
+		}
+		for k, v := range mm {
+			if _, hit := sensitiveKeyBlocklist[normalizeSensitiveKey(k)]; hit {
+				found = append(found, k)
+			}
+			walk(v)
+		}
+	}
+	walk(m)
+	return found
+}

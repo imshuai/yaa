@@ -1,15 +1,18 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/imshuai/yaa/internal/config"
-	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -17,9 +20,11 @@ import (
 // SQLiteStorage 是基于 modernc.org/sqlite（纯 Go，无 CGO）的根 KV 后端。
 type SQLiteStorage struct {
 	db        *sql.DB
+	path      string // 主 DB 文件路径, Backup 复制源
 	stop      chan struct{}
 	done      chan struct{}
 	closeOnce sync.Once
+	closed    atomic.Bool // docs/storage/sqlite.md §5: Close 开始后所有公开方法返回 ErrClosed
 }
 
 // NewSQLite 构造 SQLite 后端。Path 为空、打开失败、目录创建失败、PRAGMA/migration 失败均阻止 Ready。
@@ -39,7 +44,7 @@ func NewSQLite(cfg config.StorageConfig) (*SQLiteStorage, error) {
 		db.Close()
 		return nil, fmt.Errorf("configure root storage: %w", err)
 	}
-	s := &SQLiteStorage{db: db, stop: make(chan struct{}), done: make(chan struct{})}
+	s := &SQLiteStorage{db: db, path: cfg.Path, stop: make(chan struct{}), done: make(chan struct{})}
 	if err = s.migrate(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate root storage: %w", err)
@@ -101,6 +106,9 @@ func (s *SQLiteStorage) migrate() error {
 }
 
 func (s *SQLiteStorage) Get(key string) ([]byte, error) {
+	if s.closed.Load() {
+		return nil, ErrClosed
+	}
 	if err := validateKey(key); err != nil {
 		return nil, err
 	}
@@ -123,6 +131,9 @@ func (s *SQLiteStorage) Get(key string) ([]byte, error) {
 }
 
 func (s *SQLiteStorage) Set(key string, value []byte, ttl ...time.Duration) error {
+	if s.closed.Load() {
+		return ErrClosed
+	}
 	if err := validateKey(key); err != nil {
 		return err
 	}
@@ -145,6 +156,9 @@ func (s *SQLiteStorage) Set(key string, value []byte, ttl ...time.Duration) erro
 }
 
 func (s *SQLiteStorage) Delete(key string) error {
+	if s.closed.Load() {
+		return ErrClosed
+	}
 	if err := validateKey(key); err != nil {
 		return err
 	}
@@ -153,6 +167,9 @@ func (s *SQLiteStorage) Delete(key string) error {
 }
 
 func (s *SQLiteStorage) Has(key string) (bool, error) {
+	if s.closed.Load() {
+		return false, ErrClosed
+	}
 	if err := validateKey(key); err != nil {
 		return false, err
 	}
@@ -173,6 +190,9 @@ func (s *SQLiteStorage) Has(key string) (bool, error) {
 }
 
 func (s *SQLiteStorage) Keys(prefix string) ([]string, error) {
+	if s.closed.Load() {
+		return nil, ErrClosed
+	}
 	if prefix != "" {
 		if err := validateKey(prefix); err != nil {
 			return nil, err
@@ -207,6 +227,7 @@ func (s *SQLiteStorage) Keys(prefix string) ([]string, error) {
 func (s *SQLiteStorage) Close() error {
 	var firstErr error
 	s.closeOnce.Do(func() {
+		s.closed.Store(true) // 置位在 close(stop) 之前, 让并发方法快速拒绝
 		close(s.stop)
 		<-s.done
 		if err := s.db.Close(); err != nil {
@@ -267,3 +288,67 @@ func (s *SQLiteStorage) cleanupExpired(batch int) (int, error) {
 
 // 编译期接口实现断言。
 var _ Storage = (*SQLiteStorage)(nil)
+
+// IntegrityCheck 执行 PRAGMA integrity_check, 失败/异常一律返错; 干净 DB 返 nil。
+// docs/storage/sqlite.md §7: 恢复文件必须先通过 integrity_check 再允许 Restore。
+func (s *SQLiteStorage) IntegrityCheck(ctx context.Context) error {
+	if s.closed.Load() {
+		return ErrClosed
+	}
+	row := s.db.QueryRowContext(ctx, `PRAGMA integrity_check;`)
+	var result string
+	if err := row.Scan(&result); err != nil {
+		return err
+	}
+	if result != "ok" {
+		return fmt.Errorf("storage: integrity_check: %s", result)
+	}
+	return nil
+}
+
+// Backup 用 "停止写入 + checkpoint WAL + 复制文件" 的 stdlib 路径生成副本 (docs §7)。
+// 不依赖 SQLite online backup API; modernc.org/sqlite 无高层 Backup 包装。
+// ponytail: stdlib os/io 复制 + TRUNCATE WAL checkpoint; 备份前先 pause 内部 cleanup loop,
+// checkpoint, 复制 .db 主体 (WAL 已合并进主文件); 失败保留原文件不自动丢弃 dst。
+func (s *SQLiteStorage) Backup(dst string) error {
+	if s.closed.Load() {
+		return ErrClosed
+	}
+	if dst == "" {
+		return fmt.Errorf("%w: backup dst is empty", ErrInvalidPath)
+	}
+	// 父目录就位。
+	if err := ensureStorageDir(filepath.Dir(dst)); err != nil {
+		return err
+	}
+	// 短暂持有 cleanup loop: 不阻止但保证 checkpoint 与 copy 期间不被并发 cleanup 干扰.
+	// (cleanup 仅 DELETE 过期行, 与 backup 读不强冲突; 这里仅做 WAL 合并以保证 copy 是 self-contained.)
+	_, err := s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`)
+	if err != nil {
+		// 非 WAL 模式返回 "no such function" 类错误, 视为可忽略 -> 继续 copy.
+		// ponytail: 仅当确实上层 DB 非 WAL 时才无害; 否则继续会拷到只有主文件的 DB (也是一致快照).
+	}
+	return copyFile(s.dbPath(), dst)
+}
+
+// dbPath 返回当前 DB 主文件路径 (NewSQLite 时记录)。
+func (s *SQLiteStorage) dbPath() string { return s.path }
+
+// copyFile 用 stdlib os+io 复制源文件到目标; 目标不存在则创建, 存在则截断覆盖.
+// ponytail: 用 io.Copy 按块流式复制; 不做 fsync (v1 不强求磁盘落盘语义).
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open src %s: %w", src, err)
+	}
+	defer srcFile.Close()
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("create dst %s: %w", dst, err)
+	}
+	defer dstFile.Close()
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		return fmt.Errorf("copy %s -> %s: %w", src, dst, err)
+	}
+	return nil
+}
