@@ -57,7 +57,7 @@ Plugin SDK 可把该进程内接口适配到生成的 gRPC Server，但 Runtime 
 
 ## 3. IDL 服务
 
-当前仓库处于文档阶段，下面代码块是完整、唯一权威的 v1 IDL。开始实现时必须先原样落到 `api/plugin/v1/plugin.proto`，再生成 `pkg/pluginrpc/gen`；proto 落地后由该文件接管唯一 wire contract，本代码块应删除或明确降为非权威镜像。生成代码不得手工修改，CI 必须校验 proto、生成物和任何保留镜像的一致性。仓库模块路径以当前 Git remote 对应的 `github.com/imshuai/yaa` 为准。
+**当前状态：已落地 `api/plugin/v1/plugin.proto`，该文件是唯一 wire contract。下面代码块降为非权威镜像，仅用于阅读上下文；不一致时以 proto 文件为准。CI 必须校验 proto、生成物和保留镜像的一致性。仓库模块路径 `github.com/imshuai/yaa`。**
 
 ```proto
 syntax = "proto3";

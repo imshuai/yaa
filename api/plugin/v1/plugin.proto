@@ -1,0 +1,108 @@
+syntax = "proto3";
+
+package yaa.plugin.v1;
+
+option go_package = "github.com/imshuai/yaa/pkg/pluginrpc/gen;pluginv1";
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+service PluginService {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc Init(InitRequest) returns (Ack);
+  rpc Ready(ReadyRequest) returns (ReadyResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Stop(StopRequest) returns (Ack);
+
+  rpc InvokeTool(ToolRequest) returns (ToolResponse);
+}
+
+message Ack {}
+
+message HandshakeRequest {
+  string runtime_protocol = 1;
+  string expected_plugin_id = 2;
+}
+
+message HandshakeResponse {
+  string protocol_version = 1;
+  string plugin_id = 2;
+  string plugin_version = 3;
+  string startup_nonce = 4;
+}
+
+message InitRequest {
+  google.protobuf.Struct config = 1;
+}
+
+message ReadyRequest {}
+
+enum CapabilityType {
+  CAPABILITY_TYPE_UNSPECIFIED = 0;
+  CAPABILITY_TYPE_TOOL = 1;
+}
+
+message CapabilityDescriptor {
+  CapabilityType type = 1;
+  string name = 2;
+  google.protobuf.Struct schema = 3;
+  string description = 4;
+}
+
+message ReadyResponse {
+  repeated CapabilityDescriptor capabilities = 1;
+}
+
+message HealthRequest {}
+
+enum HealthLevel {
+  HEALTH_LEVEL_UNSPECIFIED = 0;
+  HEALTH_LEVEL_HEALTHY = 1;
+  HEALTH_LEVEL_DEGRADED = 2;
+  HEALTH_LEVEL_UNHEALTHY = 3;
+}
+
+message HealthResponse {
+  HealthLevel level = 1;
+  string message = 2;
+  google.protobuf.Timestamp observed_at = 3;
+}
+
+message StopRequest {}
+
+message ToolRequest {
+  string plugin_id = 1;
+  string request_id = 2;
+  string agent_id = 3;
+  string session_id = 4;
+  string name = 5;
+  google.protobuf.Struct arguments = 6;
+}
+
+message ToolResult {
+  string content = 1;
+  bool is_error = 2;
+  google.protobuf.Struct meta = 3;
+}
+
+enum ToolErrorCode {
+  TOOL_ERROR_CODE_UNSPECIFIED = 0;
+  TOOL_ERROR_CODE_INVALID_ARGUMENT = 1;
+  TOOL_ERROR_CODE_TIMEOUT = 2;
+  TOOL_ERROR_CODE_UNAVAILABLE = 3;
+  TOOL_ERROR_CODE_INTERNAL = 4;
+}
+
+message ToolError {
+  ToolErrorCode code = 1;
+  string message = 2;
+  bool retryable = 3;
+}
+
+message ToolResponse {
+  string request_id = 1;
+  oneof outcome {
+    ToolResult result = 2;
+    ToolError error = 3;
+  }
+}
