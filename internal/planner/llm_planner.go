@@ -16,9 +16,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/imshuai/yaa/internal/config"
 	"github.com/imshuai/yaa/internal/provider"
+
+	"golang.org/x/exp/slog"
 )
 
 // Role 常量复用 provider.Message.Role 字段取值 (provider.go Message 注释).
@@ -32,6 +35,9 @@ const (
 type LLMPlanner struct {
 	provider provider.Provider
 	cfg      config.PlannerConfig
+	// logger 用于 docs/planner/observability.md §1 事件日志 (planner.plan.*).
+	// nil → slog.Default(); 不打 prompt/task/input/output/secret 等敏感字段 (§1 末段).
+	logger *slog.Logger
 }
 
 // NewLLMPlanner 构造 LLMPlanner. Provider 必须已就绪, cfg 必须是 ResolvePlannerConfig 后的完整值.
@@ -40,13 +46,37 @@ func NewLLMPlanner(p provider.Provider, cfg config.PlannerConfig) *LLMPlanner {
 	return &LLMPlanner{provider: p, cfg: cfg}
 }
 
+// SetLogger 注入 logger 用于 docs/planner/observability.md §1 事件日志.
+// nil → slog.Default(). 不打 task/prompt/input/output/secret 等敏感字段.
+func (p *LLMPlanner) SetLogger(l *slog.Logger) {
+	if l == nil {
+		l = slog.Default()
+	}
+	p.logger = l
+}
+
 // Plan 调一次 Provider.Chat 生成候选 Plan, 不做 ValidatePlan (AGBT/Executor 后续做 trust boundary).
 // 返回的 Usage 取自 Provider 响应, 无论后续 JSON 校验是否成功都原样回 (docs §3 第 4 步).
 func (p *LLMPlanner) Plan(ctx context.Context, in PlanningInput) (Plan, provider.Usage, error) {
+	// docs/planner/observability.md §1: planner.plan.started (debug) — turn_id, agent_id, model
+	logger := p.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Debug("planner.plan.started",
+		"turn_id", in.TurnID,
+		"agent_id", in.AgentID,
+		"model", in.Model)
+	planStarted := time.Now()
 	// 1. 必填校验. MaxSteps > 0 是 docs §1 "MaxSteps 必须等于已解析的当前 Agent Planner 配置且大于 0"
 	//    的下界, 上界由 cfg.MaxSteps 在 Runtime 构造 in 时规约; 此处只校验可判定条件.
 	zero := Plan{}
 	if err := validatePlanningInput(in); err != nil {
+		logger.Warn("planner.plan.failed",
+			"turn_id", in.TurnID,
+			"agent_id", in.AgentID,
+			"error_class", "validate_input",
+			"duration_ms", time.Since(planStarted).Milliseconds())
 		return zero, provider.Usage{}, err
 	}
 
@@ -82,6 +112,12 @@ func (p *LLMPlanner) Plan(ctx context.Context, in PlanningInput) (Plan, provider
 	// 5. 调 Chat. 无论后续 JSON 校验是否成功, Usage 都原样回 (§3 第 4 步).
 	resp, err := p.provider.Chat(planCtx, req)
 	if err != nil {
+		// docs §1: planner.plan.failed (warn) — error_class 区分 provider vs parse.
+		logger.Warn("planner.plan.failed",
+			"turn_id", in.TurnID,
+			"agent_id", in.AgentID,
+			"error_class", "provider",
+			"duration_ms", time.Since(planStarted).Milliseconds())
 		// 映射: Provider 调用失败 / 规划 ctx 超时取消 → ErrPlanGenerate (errors.md §2).
 		// ctx 超时 / 取消已 wrap context.DeadlineExceeded / context.Canceled, 单层 wrap 即可 errors.Is 判.
 		return zero, provider.Usage{}, fmt.Errorf("%w: %w", ErrPlanGenerate, err)
@@ -91,6 +127,12 @@ func (p *LLMPlanner) Plan(ctx context.Context, in PlanningInput) (Plan, provider
 	// 6. 严格 decode: DisallowUnknownFields + 拒绝 trailing token (§3 第 5 步).
 	raw, err := decodePlanResponse(resp.Content)
 	if err != nil {
+		// docs §1: planner.plan.failed (warn) — error_class 区分 provider vs parse.
+		logger.Warn("planner.plan.failed",
+			"turn_id", in.TurnID,
+			"agent_id", in.AgentID,
+			"error_class", "parse",
+			"duration_ms", time.Since(planStarted).Milliseconds())
 		// 映射: JSON 解码失败 → ErrPlanParse (errors.md §2).
 		// 错误字符串不含 prompt / body / output (errors.md §1).
 		return zero, usage, fmt.Errorf("%w: %v", ErrPlanParse, err)
@@ -102,6 +144,13 @@ func (p *LLMPlanner) Plan(ctx context.Context, in PlanningInput) (Plan, provider
 		Task:  in.Task,
 		Steps: raw.Steps,
 	}
+	// docs §1: planner.plan.completed (info) — plan_id, step_count, duration_ms.
+	logger.Info("planner.plan.completed",
+		"turn_id", in.TurnID,
+		"agent_id", in.AgentID,
+		"plan_id", plan.ID,
+		"step_count", len(plan.Steps),
+		"duration_ms", time.Since(planStarted).Milliseconds())
 	// 8. 返回候选 Plan + planning Usage; Agent 后续调 ValidatePlan (§3 第 7 步).
 	return plan, usage, nil
 }

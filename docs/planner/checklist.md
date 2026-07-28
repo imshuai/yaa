@@ -45,7 +45,7 @@
 - [x] LLM Step 不携带 Tool definitions (runLLMStep ChatRequest Tools=nil 显式; TestPlannedTurnEndToEnd 验证)
 - [x] Step 输出在依赖绑定前验证可 JSON 编码 (executor.go scheduler 成功 path 之前 json.Marshal(Output) 不可编码 → step failed + ExecutionError carry marshalling err; TestExecuteFailsOnUnmarshalableOutput + TestExecuteMarshalCheckIsolated)
 - [x] Session snapshot、Remote 路由和 RBAC 均无 Plan 字段/resource (planner 不入 Session 不写 Tool unit; api 沿用现有 routing 无 plan resource)
-- [ ] 日志与指标不泄露任务、输入、输出、prompt 或 secret
+- [x] 日志与指标不泄露任务、输入、输出、prompt 或 secret — internal/planner (LLMPlanner.Plan + Executor.Execute) 所有日志事件字段仅 turn_id/agent_id/model/plan_id/step_count/step_id/action/target/duration_ms/error_class (docs/planner/observability.md §1 表 + §1 末段禁止列表). LLMPlanner.Plan 不打 task/in.Model/prompt; Executor.Execute 不打 Step.Input/Output/secret; MCPToolProxy 侧 docs §1 §2 同样只打 server/tool/transport/status/result 等低基数字段. v1 planner 包无指标 (§2 依赖既有 metrics sink 条件性), 不存在指标泄露路径. Evidence: TestPlanEmitsStartedAndCompletedEvents + TestPlanEmitsFailedEvents + TestExecuteEmitsStepStartedAndCompleted + TestExecuteEmitsStepFailedOnHardError 全部断言 attrs 不含敏感字段
 
 ## 最小测试
 

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/imshuai/yaa/internal/provider"
+
+	"golang.org/x/exp/slog"
 )
 
 // StepStatus 是 Executor 记录的单 Step 状态 (docs/execution.md §3).
@@ -74,6 +76,13 @@ type StepRunner func(
 type Executor struct {
 	maxConcurrent int
 	run           StepRunner
+
+	// logger + agentID + planID + turnID 用于 docs/planner/observability.md §1 step.* 事件;
+	// nil logger → slog.Default(); turnID 缺失时空字符串作为事件字段 (调用方传入更佳).
+	logger  *slog.Logger
+	agentID string
+	planID  string
+	turnID  string
 }
 
 // NewExecutor 拒绝 maxConcurrent <= 0 或 nil runner (docs §3).
@@ -88,6 +97,16 @@ func NewExecutor(maxConcurrent int, run StepRunner) (*Executor, error) {
 	return &Executor{maxConcurrent: maxConcurrent, run: run}, nil
 }
 
+// SetObs 注入 logger + turnID 用于 docs/planner/observability.md §1 step.* 事件.
+// 不打 step.Input/Output/prompt/secret (§1 末段). logger nil → slog.Default().
+func (e *Executor) SetObs(logger *slog.Logger, turnID string) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	e.logger = logger
+	e.turnID = turnID
+}
+
 // Execute 调度执行 plan (docs §4):
 // 1. 建 planCtx + cancel (turn ctx 派生; 失败即停 / 取消时调 cancel 不启动新节点).
 // 2. 入度 == 0 的节点按 Steps 数组顺序放入 ready slice.
@@ -98,6 +117,12 @@ func NewExecutor(maxConcurrent int, run StepRunner) (*Executor, error) {
 // 6. 全成功 → completed/err=nil; caller cancel → canceled/ctx.Cause; Step hard fail → failed/*ExecutionError.
 // 结果 channel 容量 ≥ len(plan.Steps), 确保取消后 worker 不会因无人接收泄漏.
 func (e *Executor) Execute(ctx context.Context, agentID, sessionID string, plan Plan) (PlanResult, error) {
+	logger := e.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	e.agentID = agentID
+	e.planID = plan.ID
 	if agentID == "" {
 		return PlanResult{PlanID: plan.ID, Status: PlanFailed, Steps: map[string]StepResult{}, Duration: 0},
 			fmt.Errorf("%w: empty agent id", ErrPlanExecution)
@@ -155,6 +180,14 @@ func (e *Executor) Execute(ctx context.Context, agentID, sessionID string, plan 
 
 	startWorker := func(id string) {
 		s := stepByID[id]
+		// docs §1: planner.step.started (debug) — turn_id, plan_id, step_id, action, target.
+		// docs §1 末段: target 经 Agent 授权的注册名, 仍不附 step.Input/output.
+		logger.Debug("planner.step.started",
+			"turn_id", e.turnID,
+			"plan_id", plan.ID,
+			"step_id", s.ID,
+			"action", s.Action,
+			"target", s.Target)
 		// 抓依赖 Step 当前已 succeeded 的 Output 副本 (避免 worker 与调度竞争读 results map, docs §4 "结果 map 只由调度 goroutine 写入"; worker 也只读快照).
 		out := make(map[string]StepResult, len(s.Depends))
 		for _, d := range s.Depends {
@@ -200,6 +233,7 @@ func (e *Executor) Execute(ctx context.Context, agentID, sessionID string, plan 
 					Error:    "canceled",
 					Duration: res.duration,
 				}
+				stepEmitFailed(logger, e.turnID, plan.ID, res.stepID, res.duration, "canceled")
 				continue
 			}
 			if res.runErr != nil {
@@ -210,6 +244,7 @@ func (e *Executor) Execute(ctx context.Context, agentID, sessionID string, plan 
 					Error:    errShort(res.runErr),
 					Duration: res.duration,
 				}
+				stepEmitFailed(logger, e.turnID, plan.ID, res.stepID, res.duration, "hard_error")
 				if firstErr == nil {
 					firstErr = &ExecutionError{PlanID: plan.ID, StepID: res.stepID, Cause: res.runErr}
 					cancelCause = res.runErr
@@ -229,6 +264,7 @@ func (e *Executor) Execute(ctx context.Context, agentID, sessionID string, plan 
 					Error:    errShort(merr),
 					Duration: res.duration,
 				}
+				stepEmitFailed(logger, e.turnID, plan.ID, res.stepID, res.duration, "marshalling")
 				if firstErr == nil {
 					firstErr = &ExecutionError{PlanID: plan.ID, StepID: res.stepID, Cause: merr}
 					cancelCause = merr
@@ -244,6 +280,12 @@ func (e *Executor) Execute(ctx context.Context, agentID, sessionID string, plan 
 				Output:   res.runResult.Output,
 				Duration: res.duration,
 			}
+			// docs §1: planner.step.completed (debug) — 不附 Output/prompt/secret.
+			logger.Debug("planner.step.completed",
+				"turn_id", e.turnID,
+				"plan_id", plan.ID,
+				"step_id", res.stepID,
+				"duration_ms", res.duration.Milliseconds())
 			for _, dep := range dependents[res.stepID] {
 				inDeg[dep]--
 				if inDeg[dep] == 0 {
@@ -405,4 +447,15 @@ func errShort(err error) string {
 		msg = msg[:200]
 	}
 	return msg
+}
+
+// stepEmitFailed 是 docs/planner/observability.md §1 planner.step.failed (warn) 单点 helper.
+// 不附 Step.Input/Output/prompt/secret (§1 末段); error_class 仅日志分类 (canceled/hard_error/marshalling 等), 不入原始错误体.
+func stepEmitFailed(logger *slog.Logger, turnID, planID, stepID string, duration time.Duration, errorClass string) {
+	logger.Warn("planner.step.failed",
+		"turn_id", turnID,
+		"plan_id", planID,
+		"step_id", stepID,
+		"duration_ms", duration.Milliseconds(),
+		"error_class", errorClass)
 }

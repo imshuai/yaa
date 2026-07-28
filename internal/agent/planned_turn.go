@@ -76,6 +76,8 @@ func (m *Manager) runPlannedTurn(
 	if eerr != nil {
 		return TurnResult{Usage: usage}, fmt.Errorf("plan turn: %w", eerr)
 	}
+	// docs/planner/observability.md §1 step.* 事件: 注入 logger + turn_id (executor 内部各 step 状态转换 emit).
+	exec.SetObs(m.deps.Logger, req.TurnID)
 	result, eerr := exec.Execute(ctx, a.id, req.SessionID, plan)
 	addUsage(&usage, result.Usage)
 	if eerr != nil {

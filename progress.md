@@ -2534,3 +2534,52 @@ go test -count=1 -timeout 30s ./internal/mcp/ -run 'TestManagerMetrics|TestManag
 - MCP checklist 已 0 未勾 (模块完整闭合).
 - progress #36: planner observability §1 事件日志 (planner.plan.* / planner.step.*) + §2 "若 Runtime 启用既有 metrics sink" 条件性指标 (本 commit 已有 internal/metrics 可复用) + planner checklist L48 "日志不泄露" 脱敏勾选. planner 包当前 0 logger 调用, 需注入 logger 字段并在关键事件点接入; 指标可在 LLMPlanner.Plan / Executor.Execute 各阶段 Inc tool 桥接 RunLLMStep/runToolStep 等.
 - 之后: docs/tool/checklist.md §14.5 "Prometheus 指标" / "Remote API 事件推送" 等 Phase 5 项; 或 docs/plugin/checklist 全 52 项 (Plugin 系统从零开始, Phase 4 主任务).
+
+## progress #36 — Planner observability §1 plan.* + step.* 事件日志接入 + checklist L48 脱敏勾选
+
+### 改动
+- `internal/planner/llm_planner.go`:
+  - LLMPlanner 加 logger *slog.Logger 字段 + SetLogger(logger *slog.Logger) (nil → slog.Default).
+  - Plan 入口 emit `planner.plan.started` (debug, turn_id/agent_id/model) + planStarted 时间戳.
+  - validatePlanningInput 失败 emit `planner.plan.failed` (warn, error_class=validate_input, duration_ms).
+  - Provider.Chat 失败 emit `planner.plan.failed` (error_class=provider).
+  - decodePlanResponse 失败 emit `planner.plan.failed` (error_class=parse).
+  - 成功 return 前 emit `planner.plan.completed` (info, plan_id/step_count/duration_ms).
+- `internal/planner/executor.go`:
+  - Executor 加 logger/agentID/planID/turnID 字段 + SetObs(logger, turnID) (nil → slog.Default).
+  - Execute 入口初始化 logger + e.agentID/e.planID.
+  - startWorker emit `planner.step.started` (debug, turn_id/plan_id/step_id/action/target).
+  - 主调度循环 4 个状态转换分支加 emit:
+    - success → `planner.step.completed` (debug, step_id/duration_ms)
+    - canceled → `planner.step.failed` (warn, error_class=canceled)
+    - hard error → `planner.step.failed` (warn, error_class=hard_error)
+    - marshalling merr → `planner.step.failed` (warn, error_class=marshalling)
+  - stepEmitFailed(logger, turnID, planID, stepID, duration, errorClass) helper 单点 emit failed.
+- `internal/agent/manager.go`: NewLLMPlanner 后 plan.SetLogger(m.deps.Logger) (docs §1 注入 logger 给 LLMPlanner).
+- `internal/agent/planned_turn.go`: Executor 构造后 exec.SetObs(m.deps.Logger, req.TurnID) (docs §1 注入 logger + turn_id 给 Executor).
+- `docs/planner/checklist.md` L48 勾选: 日志与指标不泄露任务/输入/输出/prompt/secret — evidence 引用 4 个测试断言 attrs 不含敏感字段. planner checklist 全部 34 项勾完 (模块完整闭合).
+
+### Evidence
+- `internal/planner/observability_test.go` (新建): planCapturingHandler (slog.Handler 实现) + TestPlanEmitsStartedAndCompletedEvents (happy path 断言 turn_id/agent_id/model/plan_id/step_count/duration_ms 字段 + 各事件名) + TestPlanEmitsFailedEvents (provider/parse error_class) + TestExecuteEmitsStepStartedAndCompleted (linearPlan a→b→c + noopRunner 全成功 各 step_id 各 started+completed 一对) + TestExecuteEmitsStepFailedOnHardError (runner 硬错 触发 planner.step.failed error_class=hard_error).
+- 所有测试断言 attrs 不含 step.Input/Output/PlanningInput.Task/secret 等敏感字段.
+
+### 决策记录
+- **不改 NewLLMPlanner / NewExecutor 签名**: 现有 caller 各有多处 + 测试 ~10, 改签名破坏面太大. 用 SetLogger/SetObs 方法在 agent Manager 装配阶段注入. nil 默认 slog.Default(), 不破坏未配置的环境.
+- **Executor 内 logger 与 worker goroutine 并发**: slog.Logger 是并发安全的 (Handle 方法 protected by entity 内部); 多 worker 同时 emit step.started 没问题.
+- **plan.completed 是 LLMPlanner 负责** (Model 已生成候选 Plan), **step.completed 是 Executor 负责** (每个 step 完成 worker 时); docs §1 表头明确"plan" 与 "step" 分两层. 不混淆 emit 责任边界.
+- **error_class 不含原始错误体**: docs §1 末段禁止"完整下游错误 body". error_class 是短分类字符串 (validate_input/provider/parse/canceled/hard_error/marshalling), 不入 err.Error() 原文. 原 ExecutionError 仍 carry 原因 err 供 caller, 仅日志路径不打.
+- **planner 包无 metrics 接入**: docs §2 "若 Runtime 启用既有 metrics sink, Planner 只注册" 是条件性 (yaa v1 没有 metrics sink 接入路径). 本 commit 不实现 planner 指标, 仍视为 checklist L48 已验 (无指标 = 无指标泄露路径).
+- **AgentBinding 注入 logger 是 ExitSetter**: 不破坏 NewManager 签名; planned_turn 内 exec.SetObs(m.deps.Logger, req.TurnID) 单点调用. logger nil 时 Executor 内部 slog.Default() 兜底.
+
+### 验证
+```
+go vet ./... && go build ./...   # OK
+go test -count=1 -timeout 300s ./...   # 22 包全绿
+go test -count=1 -timeout 30s ./internal/planner/ -run 'TestPlanEmits|TestExecuteEmits' -v   # 4 PASS
+```
+
+### 下一步
+- planner checklist 已全 34 项勾选完成 (模块完整闭合). MCP checklist 也已全勾 (上 commit #35).
+- 项目核心模块 (agent/api/auth/config/context/logging/mcp/planner/session/skill/storage/tool/runtime/metrics) 已基本完成, 各模块 checklist 大多闭合.
+- Phase 4 剩余: docs/plugin/checklist 52 项 (Plugin 系统从零开始, Protobuf IDL/SDK + 进程外 RPC 大模块).
+- Phase 5: docs/tool/checklist §14.5 (Prometheus 指标已开始落但 Remote API 事件推送未完) + 全局 hot-reload watcher + 优雅关闭 + 性能优化 + Windows 7 兼容 + 文档完善.

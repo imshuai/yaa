@@ -115,6 +115,10 @@ func NewManager(deps Dependencies) (*Manager, error) {
 		// 这里兜底按 disabled 处理不擅自构造 (避免缺 step runner 即走 planned turn).
 		if effectiveCfg.Type == "llm" {
 			plan = planner.NewLLMPlanner(p, effectiveCfg)
+			// docs/planner/observability.md §1 注入 logger 给 LLMPlanner (plan.* 事件).
+			if m.deps.Logger != nil {
+				plan.SetLogger(m.deps.Logger)
+			}
 		}
 		m.agents[a.ID] = &agentBinding{
 			id:         a.ID,
