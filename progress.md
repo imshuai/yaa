@@ -3098,3 +3098,39 @@ go test -count=1 -timeout 300s ./...   # 24 包全绿
 ### 下一步
 - config 61/74 (剩 23 项: 热更新 12 Phase 5 + CLI 2 + 迁移 CLI 4 + 敏感 EnvResolver 1 + sentinel 2 + 格式等价测试 1 + default 文档 1 + default CLI 1).
 - memory 39 项未审计, plugin 52 项 Phase 4, context 38 项部分已勾.
+
+---
+
+## #48 feat(memory): yaa_memory_* metrics 8指标埋点
+
+### 范围
+- **docs/memory checklist 32/39** (+1, 行55): yaa_memory_* 指标定义 + 8 canonical 事件名.
+
+### 实现
+
+#### `internal/memory/metrics.go` (新建, 120行)
+- `memoryMetrics` 结构含 8 指标: `operations(Counter) / operationDuration(Histogram) / items(Gauge) / errors(Counter) / degraded(Gauge) / expired(Counter) / evicted(Counter) / reindex(Counter)`.
+- `newMemoryMetrics(r)`: r==nil 返全 nil nop; 否则 NewCounter/Gauge/Histogram + MustRegister.
+- `SetMetrics(r)`: 公开注入 API, nil → nop.
+- nil-safe helpers: `opInc / durationObserve / errorInc / degradedSet / expiredInc / evictedInc / reindexInc / itemsSet`.
+- `errorClassFromErr`: error → 稳定低基数 error_class (10 sentinel sentinel + "other"), 不用 err.Error().
+
+#### `internal/memory/manager.go` (改)
+- Manager struct 加 `metrics *memoryMetrics` 字段.
+- putLocked emit EventPromoted/Added/Updated → `opInc("put","ok")`.
+- commit.Evicted 循环 → `evictedInc(policy.EvictionPolicy)`.
+- DeleteExpired emit EventExpired → `expiredInc("ttl")`.
+- Reindex 成功 → `reindexInc("ok")`; 3处markDegraded → `reindexInc("failed")+degradedSet("index",1)`.
+- putIndex embedder degraded (3处) → `degradedSet("embedder",1)`.
+- index_upsert degraded → `degradedSet("index",1)`.
+
+### 验证
+```
+go vet ./... && go build ./...   # OK
+go test -count=1 -timeout 300s ./...   # 24 包全绿
+```
+
+### 下一步
+- **memory 32/39** (剩7: 行15/16/27 并发测试, 行28 vector状态序列, 行52/53 Phase 5 ReloadManager, 行56 Health结构).
+- **session 58/58 ✅**, **config 51/74**, **mcp 82/82 ✅**, **planner 34/34 ✅**.
+- 下一模块: context 38项审计 OR plugin Phase 4 52项.
