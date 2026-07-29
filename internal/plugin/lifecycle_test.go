@@ -123,3 +123,42 @@ func TestStopAllIdempotent(t *testing.T) {
 	// WaitStopped 不会卡住
 	_ = m.WaitStopped()
 }
+
+
+// TestRetryRestartExhaustsAndErrors verifies that retryRestart returns false
+// when dialer consistently fails (attempts exhausted, no successful replacement).
+// retryRestart calls m.loader.Start; mock dialer with ErrPluginConnectionTimeout.
+func TestRetryRestartExhaustsAndErrors(t *testing.T) {
+	dir := t.TempDir()
+	l, err := NewLoader(dir, []string{"./plugins"}, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.dial = func(ctx context.Context, endpoint string) (pluginRPCInterface, error) {
+		return nil, ErrPluginConnectionTimeout // dial fail → loader.Start Terminate
+	}
+	cfg := config.PluginsConfig{
+		AutoStart:      true,
+		Restart:        config.RestartConfig{Enabled: true, MaxAttempts: 2, Backoff: 10 * time.Millisecond},
+		StartupTimeout: 200 * time.Millisecond,
+	}
+	m, err := NewManager(context.Background(), cfg, l, nil, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// mock old client 已 Exited
+	old := &RPCClient{Exited: closedChan()}
+	e := &Entry{
+		Descriptor: PluginDescriptor{Manifest: Manifest{ID: "p"}},
+		Handle:    &ProxyHandle{},
+		State:     StateReady,
+	}
+	e.Handle.Store(old)
+	m.entries["p"] = e
+	if ok := m.retryRestart(e, old); ok {
+		t.Fatal("expected retryRestart to return false (dialer fails)")
+	}
+}
+
+// TestRetryRestartDisabledReturnsFalse verifies that retryRestart respects Restart.Enabled=false.
+// ponytail: 不调用 retryRestart, caller 在 monitor 中直接设置 state=Error.
