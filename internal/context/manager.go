@@ -6,6 +6,7 @@ package context
 import (
 	stdctx "context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/imshuai/yaa/internal/config"
@@ -13,7 +14,9 @@ import (
 )
 
 // Manager 是 Context 窗口管理器；无内部状态，每次 Build 独立。
-type Manager struct{}
+type Manager struct{
+	metrics *contextMetrics
+}
 
 // NewManager 构造 Manager。
 func NewManager() *Manager { return &Manager{} }
@@ -89,13 +92,25 @@ func (m *Manager) Build(ctx stdctx.Context, in BuildInput) (*BuildOutput, error)
 	originalCount := len(in.Request.Messages)
 
 	// 估算完整候选请求
+	providerID := in.Provider.ID()
+	model := in.Request.Model
+	m.metrics.inputBudgetSet("", providerID, model, budget.Input)
+
 	tokens, err := in.Provider.EstimateInputTokens(ctx, &in.Request)
 	if err != nil {
+		m.metrics.estimationFailedInc(providerID, model)
+		m.metrics.buildInc(providerID, model, stategy, "estimation_failed")
 		return nil, fmt.Errorf("%w: %v", ErrTokenEstimationFailed, err)
 	}
 
 	// 不超预算则直接返回
 	if tokens <= budget.Input {
+		m.metrics.buildInc(providerID, model, stategy, "ok")
+		m.metrics.buildDurationObserve(providerID, model, stategy, time.Since(start).Seconds())
+		m.metrics.inputTokensObserve(providerID, model, tokens)
+		if budget.Input > 0 {
+			m.metrics.utilRatioObserve(providerID, model, float64(tokens)/float64(budget.Input))
+		}
 		return &BuildOutput{
 			Request:         copyRequest(in.Request),
 			InputTokens:     tokens,
@@ -117,25 +132,45 @@ func (m *Manager) Build(ctx stdctx.Context, in BuildInput) (*BuildOutput, error)
 		protectedReq.Messages = protectedMessages
 		ptokens, perr := in.Provider.EstimateInputTokens(ctx, &protectedReq)
 		if perr != nil {
+			m.metrics.estimationFailedInc(providerID, model)
 			return nil, fmt.Errorf("%w: protected estimate: %v", ErrTokenEstimationFailed, perr)
 		}
 		if ptokens > budget.Input {
+			m.metrics.overflowInc(providerID, model, stategy, "protected")
+			m.metrics.buildInc(providerID, model, stategy, "overflow")
 			return nil, fmt.Errorf("%w: protected input %d > budget %d", ErrContextOverflow, ptokens, budget.Input)
 		}
 	}
 
 	switch stategy {
 	case "reject":
+		m.metrics.overflowInc(providerID, model, stategy, "reject")
+		m.metrics.buildInc(providerID, model, stategy, "overflow")
 		return nil, fmt.Errorf("%w: reject strategy, tokens %d > budget %d", ErrContextOverflow, tokens, budget.Input)
 	case "truncate":
 		return m.truncate(ctx, in, units, budget, stategy, originalCount, start)
 	case "hybrid":
-		// ponytail: v1 摘要需要 Provider Chat 调用，Phase2 暂降级为 truncate。
-		// 等摘要逻辑实现后再接 hybrid 完整路径。
-		if in.Config.Compression.Enabled {
-			// TODO: 同步摘要。当前先直接降级 truncate。
+		// hybrid: 同步摘要 → 失败/超过 target → fallback truncate. docs/context/manager.md §5.3.
+		if in.Config.Compression.Enabled && budget.Input > 0 {
+			util := float64(tokens) / float64(budget.Input)
+			if util >= in.Config.Compression.Threshold {
+				out, compressed, ok := m.summarize(ctx, in, units, budget, stategy, originalCount, start, tokens)
+				if ok {
+					return out, nil
+				}
+				if compressed != nil && compressed.compressionFailure != "" {
+					// 记录 failure 后, 原 tokens 仍超过 budget 则 fallback truncate
+					_ = compressed
+				}
+			}
 		}
-		return m.truncate(ctx, in, units, budget, stategy, originalCount, start)
+		// 摘要未启用 / 未达阈值 / 摘要失败 → fallback truncate
+		out, err := m.truncate(ctx, in, units, budget, stategy, originalCount, start)
+		if err != nil {
+			return nil, err
+		}
+		out.Metadata.CompressionFailed = true
+		return out, nil
 	}
 	return nil, fmt.Errorf("%w: unhandled strategy %q", ErrContextBuildFailed, stategy)
 }
@@ -170,6 +205,20 @@ func (m *Manager) truncate(ctx stdctx.Context, in BuildInput, units []messageUni
 			return nil, fmt.Errorf("%w: %v", ErrTokenEstimationFailed, err)
 		}
 		if tokens <= budget.Input {
+			// metrics emit: truncate 成功 → truncationInc + droppedUnits + build ok
+			providerID := in.Provider.ID()
+			model := in.Request.Model
+			strategyTag := strategy
+			m.metrics.truncationInc(providerID, model)
+			if truncated > 0 {
+				m.metrics.droppedUnitsInc(providerID, model, truncated)
+			}
+			m.metrics.buildDurationObserve(providerID, model, strategyTag, time.Since(start).Seconds())
+			m.metrics.inputTokensObserve(providerID, model, tokens)
+			if budget.Input > 0 {
+				m.metrics.utilRatioObserve(providerID, model, float64(tokens)/float64(budget.Input))
+			}
+			m.metrics.buildInc(providerID, model, strategyTag, "ok")
 			return &BuildOutput{
 				Request:         req,
 				InputTokens:     tokens,
@@ -310,4 +359,155 @@ func copyRequest(req provider.ChatRequest) provider.ChatRequest {
 		}
 	}
 	return c
+}
+
+type summarizeResult struct {
+	compressionFailure string
+}
+
+// summarize 是 hybrid 策略的核心: 同步调用 Provider.Chat 生成摘要,
+// 用一条 system summary 替换候选 turn, 估算后若 Token 减少且摘要非空则接受.
+// docs/context/manager.md §5.3:
+//   - 候选 = 旧到新的可压缩、非受保护 turn, 排除 preserve_recent 个最新可压缩 turn
+//   - 候选消息数 < min_messages → 跳过摘要, 返回 (nil, nil, false)
+//   - 摘要请求 inherit ctx + compression.timeout deadline; MaxTokens 使用原请求输出上限
+//   - 摘要为空 / 不减 Token → 拒绝摘要 (ok=false), 走 truncate fallback
+//   - 摘要后仍超 Input budget → fallback truncate
+//   - 摘要后 ≤ target_ratio 且 ≤ Input budget → 接受
+func (m *Manager) summarize(ctx stdctx.Context, in BuildInput, units []messageUnit, budget Budget, strategy string, originalCount int, start time.Time, originalTokens int) (*BuildOutput, *summarizeResult, bool) {
+	cfg := in.Config.Compression
+	// 1. 选可压缩 units, 排除 preserve_recent 个最新可压缩 turn
+	var compressible []int
+	for i, u := range units {
+		if u.Compressible {
+			compressible = append(compressible, i)
+		}
+	}
+	if len(compressible) <= cfg.PreserveRecent {
+		return nil, nil, false
+	}
+	// 倒序保留 preserveRecent 个最新可压缩 unit
+	preserve := cfg.PreserveRecent
+	candidateIdx := compressible[:len(compressible)-preserve]
+	// 2. 计算候选消息数, < min_messages 跳过
+	var candidateMsgs []provider.Message
+	for _, ui := range candidateIdx {
+		candidateMsgs = append(candidateMsgs, units[ui].Messages...)
+	}
+	if len(candidateMsgs) < cfg.MinMessages {
+		return nil, nil, false
+	}
+	// 3. 在 compression.timeout 内调用 Provider.Chat 生成摘要. MaxTokens = 原请求输出上限.
+	summaryReq := provider.ChatRequest{
+		Model:     in.Request.Model,
+		MaxTokens: in.Request.MaxTokens,
+		Messages: []provider.Message{
+			{Role: "system", Content: "Summarize the following conversation concisely while preserving key context; output only the summary, no preamble."},
+			{Role: "user", Content: joinMessages(candidateMsgs)},
+		},
+	}
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = 20 * time.Minute // 防御: docs 默认 20s, 但若 cfg 未正确 init 用足够大值
+	}
+	sumCtx, cancel := stdctx.WithTimeout(ctx, timeout)
+	defer cancel()
+	resp, err := in.Provider.Chat(sumCtx, &summaryReq)
+	if err != nil {
+		// 摘要失败/超时
+		return nil, &summarizeResult{compressionFailure: err.Error()}, false
+	}
+	summary := ""
+	if resp != nil {
+		summary = resp.Content
+	}
+	if summary == "" {
+		return nil, &summarizeResult{compressionFailure: "empty summary"}, false
+	}
+	// 4. 用一条 system summary 替换候选 turn. summary unit 标记 Protected=true 防止被后续 truncate 删除.
+	newUnits := buildSummaryReplacedUnits(units, candidateIdx, summary)
+	newMsgs := collectAllMessages(newUnits)
+	newReq := copyRequest(in.Request)
+	newReq.Messages = newMsgs
+	newTokens, estErr := in.Provider.EstimateInputTokens(ctx, &newReq)
+	if estErr != nil {
+		return nil, &summarizeResult{compressionFailure: estErr.Error()}, false
+	}
+	// 5. 只在新 tokens 更少且摘要非空时接受 (已校验非空)
+	if newTokens >= originalTokens {
+		return nil, &summarizeResult{compressionFailure: "summary not shorter"}, false
+	}
+	// 6. 接受摘要. 若仍超 budget, 走 truncate 新的 units (含 summary unit).
+	if newTokens > budget.Input {
+		out, terr := m.truncate(ctx, in, newUnits, budget, strategy, originalCount, start)
+		if terr != nil {
+			return nil, &summarizeResult{compressionFailure: fmt.Sprintf("truncate after summary: %v", terr)}, false
+		}
+		out.Metadata.CompressedTurns = len(candidateIdx)
+		return out, nil, true
+	}
+	// 摘要已满足预算. target_ratio 仅作为软目标, 不递归调用.
+	if budget.Input > 0 {
+		m.metrics.utilRatioObserve(in.Provider.ID(), in.Request.Model, float64(newTokens)/float64(budget.Input))
+	}
+	m.metrics.compressionInc(in.Provider.ID(), in.Request.Model, "ok")
+	m.metrics.buildDurationObserve(in.Provider.ID(), in.Request.Model, strategy, time.Since(start).Seconds())
+	m.metrics.buildInc(in.Provider.ID(), in.Request.Model, strategy, "ok")
+	m.metrics.inputTokensObserve(in.Provider.ID(), in.Request.Model, newTokens)
+	out := &BuildOutput{
+		Request:         newReq,
+		InputTokens:     newTokens,
+		InputBudget:     budget.Input,
+		EffectiveWindow: budget.EffectiveWindow,
+		Metadata: BuildMetadata{
+			Strategy:         strategy,
+			OriginalMessages: originalCount,
+			FinalMessages:    len(newMsgs),
+			CompressedTurns:  len(candidateIdx),
+			BuildDuration:    time.Since(start),
+		},
+	}
+	return out, nil, true
+}
+
+// buildSummaryReplacedUnits 用一条 system summary 替换 candidateIdx 列出的 units.
+// summary unit 放置在 candidates 中首个的位置, 标记 Protected 防止被片面 truncate.
+func buildSummaryReplacedUnits(units []messageUnit, candidateIdx []int, summary string) []messageUnit {
+	if len(candidateIdx) == 0 {
+		return units
+	}
+	// 标记被替换的 unit 索引
+	skip := make(map[int]bool, len(candidateIdx))
+	for _, i := range candidateIdx {
+		skip[i] = true
+	}
+	summaryUnit := messageUnit{
+		Messages:  []provider.Message{{Role: "system", Name: "yaa-summary", Content: summary}},
+		Protected: true, // 防止后续 truncate 删除; ponytail: summary 是受保护的整体摘要.
+	}
+	// 在 candidate 中第一个 unit 之前插入 summary unit
+	insertAt := candidateIdx[0]
+	out := make([]messageUnit, 0, len(units)-len(candidateIdx)+1)
+	for i, u := range units {
+		if i == insertAt {
+			out = append(out, summaryUnit)
+		}
+		if !skip[i] {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// joinMessages 把候选消息拼成用于摘要请求的文本.
+// ponytail: 简单拼接 role + content, 不解析 metadata.
+func joinMessages(msgs []provider.Message) string {
+	var sb strings.Builder
+	for _, m := range msgs {
+		sb.WriteString(m.Role)
+		sb.WriteString(": ")
+		sb.WriteString(m.Content)
+		sb.WriteString("\n")
+	}
+	return sb.String()
 }

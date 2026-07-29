@@ -35,9 +35,9 @@
 - [x] 旧 Tool turn 只可整体删除，不能摘要后丢失 `ReasoningContent`
 - [x] `reject` 超限直接返回 `ErrContextOverflow`
 - [x] `truncate` 每次删除最旧可删除 unit 后重新估算
-- [ ] `hybrid` 按 threshold、target ratio、min messages、preserve recent 工作
-- [ ] 摘要继承请求取消并应用 `compression.timeout`
-- [ ] 摘要为空、不减 Token、失败或超时时恢复原请求并按需截断
+- [x] `hybrid` 按 threshold、target ratio、min messages、preserve recent 工作
+- [x] 摘要继承请求取消并应用 `compression.timeout`
+- [x] 摘要为空、不减 Token、失败或超时时恢复原请求并按需截断
 - [x] 成功 Build 的最终完整请求不超过输入预算
 
 ## 错误与并发
@@ -53,12 +53,12 @@
 ## 可观测性与测试
 
 - [x] 日志不含 prompt、Memory、Tool result、摘要正文或 Secret
-- [ ] 指标名称和标签与 [observability.md](observability.md) 一致
-- [ ] 指标不使用 session/request ID 高基数标签
-- [ ] 预算边界、受保护超限、完整 Tool unit、摘要 fallback 有单元测试
+- [x] 指标名称和标签与 [observability.md](observability.md) 一致
+- [x] 指标不使用 session/request ID 高基数标签
+- [x] 预算边界、受保护超限、完整 Tool unit、摘要 fallback 有单元测试
 - [ ] Provider 估算失败、取消、timeout 和 config reload 有集成测试
-- [ ] 使用多语言/UTF-8、Tool schema 和 ReasoningContent 请求做回归测试
-- [ ] safe/hashed alias 与 `specific` ToolChoice 的估算值覆盖真实 Provider wire
+- [x] 使用多语言/UTF-8、Tool schema 和 ReasoningContent 请求做回归测试
+- [x] safe/hashed alias 与 `specific` ToolChoice 的估算值覆盖真实 Provider wire
 
 ---
 

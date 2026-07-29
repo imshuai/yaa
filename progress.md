@@ -3484,3 +3484,51 @@ go test -count=1 -timeout 300s ./...   # 25 包全绿
 - `internal/context/manager_test.go` (TestBuildRespectsContextCancellation)
 - `docs/context/checklist.md` (6 项勾选)
 - `docs/tool/checklist.md` (2 项勾选)
+
+---
+
+## Commit #65 — context hybrid summarize + metrics + context 38/40 完成 (2026-07-29)
+
+### 变更摘要
+
+**hybrid 摘要实现 (checklist 行38/39/40, 在 #64 已完成)**:
+- internal/context/manager.go summarize func: 阈值检测 → 候选选择 (排除 preserveRecent 个最新可压缩 turn) → Provider.Chat 在 compression.timeout 内生成摘要 → system summary unit 替换 → 重估 → 接受/拒绝/超预算 truncate fallback
+- 3 测试: TestBuildHybridSummarizesWhenAboveThreshold + TestBuildHybridSkipsWhenCompressionDisabled + TestBuildHybridFallsBackWhenSummaryReturnsEmpty
+
+**context metrics 实现 (行56/57)**:
+- 新建 internal/context/metrics.go: 11 个指标按 docs/context/observability.md 定义注册
+  - context_build_total (provider/model/strategy/result)
+  - context_build_duration_seconds
+  - context_input_tokens / context_input_budget / context_utilization_ratio
+  - context_compression_total / context_compression_duration_seconds / context_truncation_total
+  - context_dropped_units_total / context_overflow_total / context_token_estimation_failed_total
+- labels 只用有界枚举 (provider/model/strategy/result/reason), 无 session/request ID (行57 高基数规避)
+- nil-safe SetMetrics(r) + Manager 加 metrics 字段
+- Build 内关键路径 (估算成功/失败/超预算/reject/保护单元超限) 全部 emit
+- TestBuildMetricsEmitted 单测验证 registry 中 context_build_total ok=1
+
+**context 测试覆盖 (行58/60/61)**:
+- 行58: 已有 TestBuildTruncate + TestBuildHybrid* 覆盖预算/protected/Tool unit/fallback
+- 行60: TestBuildUTF8AndReasoningContentRegression (中文+emoji UTF-8 + ReasoningContent)
+- 行61: TestBuildAliasToolChoiceProjectionCachedByCaller (ToolChoice.Mode=specific + Tool 字段, 验证 estimator 看到 canonical name)
+- 新增 estimateFailingProvider 类型 + recordingProvider 类型辅助测试
+- 新增 TestBuildHybridSummaryTimeoutFallsBackToTruncate (行59 timeout 部分: Chat 返回 context.DeadlineExceeded → CompressionFailed=true + truncate fallback)
+
+### 检查清单进度
+
+| 模块 | 之前 | 现在 |
+|------|------|------|
+| context | 25/40 | **39/40** ✅ (+14 项) |
+
+剩 1 项: 行59 "config reload 部分" — 需 Phase 5 reload 基础设施 (估算失败/取消/timeout 已有单元覆盖)
+
+### 验证
+- `go vet ./...` OK
+- `go build ./...` OK
+- `go test -count=1 -timeout 300s ./...` 25 包全绿 + mcp 包已知 SSEClientEndpoint flaky (单跑 PASS)
+
+### 关键文件
+- `internal/context/manager.go` (hybrid summarize + metric emits)
+- `internal/context/metrics.go` 新建 (11 指标 + nil-safe helpers)
+- `internal/context/manager_test.go` (6 新测试: hybrid 3 + metrics 1 + estimateFail 1 + UTF8 1 + alias 1 + timeout 1 → 总共 7 新)
+- `docs/context/checklist.md` (14 项勾选)

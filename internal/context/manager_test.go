@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/imshuai/yaa/internal/config"
+	"encoding/json"
+	"github.com/imshuai/yaa/internal/metrics"
 	"github.com/imshuai/yaa/internal/provider"
 )
 
@@ -315,5 +318,380 @@ func TestBuildRespectsContextCancellation(t *testing.T) {
 	// 应该返回 ctx.Canceled 或 ErrContextBuildFailed (wrap ctx.Err)
 	if !errors.Is(err, context.Canceled) && !errors.Is(err, ErrContextBuildFailed) {
 		t.Fatalf("expected ctx-related error, got %v", err)
+	}
+}
+
+// summarizingProvider 在 Chat 调用时返回固定 summary, 估算 tokens 按消息条数计.
+// 用于 hybrid 测试.
+type summarizingProvider struct {
+	model       provider.ModelInfo
+	summaryText string
+	chatCalled  bool
+	chatErr     error
+}
+
+func (s *summarizingProvider) ID() string         { return "summarizing" }
+func (s *summarizingProvider) Type() string       { return "summarizing" }
+func (s *summarizingProvider) Models() []provider.ModelInfo { return []provider.ModelInfo{s.model} }
+func (s *summarizingProvider) Close() error       { return nil }
+
+func (s *summarizingProvider) Chat(ctx context.Context, req *provider.ChatRequest) (*provider.ChatResponse, error) {
+	s.chatCalled = true
+	if s.chatErr != nil {
+		return nil, s.chatErr
+	}
+	return &provider.ChatResponse{Content: s.summaryText}, nil
+}
+
+func (s *summarizingProvider) StreamChat(context.Context, *provider.ChatRequest) (<-chan provider.ChatChunk, error) {
+	return nil, nil
+}
+
+func (s *summarizingProvider) EstimateInputTokens(ctx context.Context, req *provider.ChatRequest) (int, error) {
+	// 每条消息 = 100 tokens, 帮助 hybrid 路径触发 (1600 > 2304 input budget)
+	return len(req.Messages) * 100, nil
+}
+
+// TestBuildHybridSummarizesWhenAboveThreshold 验证 hybrid 策略在达到阈值时调用 summary.
+// consensus checklist 行38: hybrid 按 threshold/target_ratio/min_messages/preserve_recent 工作.
+func TestBuildHybridSummarizesWhenAboveThreshold(t *testing.T) {
+	m := NewManager()
+	// 摘要 provider 返回 100 字摘要, 比原消息短得多
+	sp := &summarizingProvider{
+		model:       provider.ModelInfo{ID: "test-model", ContextWindow: 10000, MaxOutput: 1000},
+		summaryText: "summary of the conversation about topic.",
+	}
+	// 配置 hybrid + compression enabled, threshold 0.85 (=  0.85*input budget = 0.85*5904 = 5018)
+	// 30 条消息 → 30*100 = 3000 tokens, 仍低于 threshold 5018, 需要更大消息数
+	// 用 70 条消息 → 7000 tokens > 5018 threshold
+	msgs := make([]provider.Message, 70)
+	for i := range msgs {
+		if i == len(msgs)-1 {
+			msgs[i] = provider.Message{Role: "user", Content: "last"}
+		} else if i%2 == 0 {
+			msgs[i] = provider.Message{Role: "user", Content: "msg"}
+		} else {
+			msgs[i] = provider.Message{Role: "assistant", Content: "resp"}
+		}
+	}
+	cfg := config.ContextConfig{
+		MaxTokens: 0, ReservedTokens: 4096, Strategy: "hybrid",
+		Compression: config.ContextCompressionConfig{
+			Enabled: true, Threshold: 0.85, TargetRatio: 0.6, MinMessages: 2, PreserveRecent: 3, Timeout: 5 * time.Second,
+		},
+	}
+	maxTokens := 1000
+	out, err := m.Build(context.Background(), BuildInput{
+		Provider: sp, Model: sp.model,
+		Request:          provider.ChatRequest{Model: "test-model", Messages: msgs, MaxTokens: &maxTokens},
+		Config:           cfg,
+		CurrentTurnStart: len(msgs) - 1,
+	})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if !sp.chatCalled {
+		t.Fatal("expected Provider.Chat to be called for summary")
+	}
+	if out.Metadata.CompressedTurns == 0 {
+		t.Fatal("expected CompressedTurns > 0 when summary is taken")
+	}
+}
+
+// TestBuildHybridSkipsWhenCompressionDisabled 验证 compression disabled 时 hybrid 回退 truncate.
+func TestBuildHybridSkipsWhenCompressionDisabled(t *testing.T) {
+	m := NewManager()
+	sp := &summarizingProvider{
+		model:       provider.ModelInfo{ID: "test-model", ContextWindow: 10000, MaxOutput: 1000},
+		summaryText: "should not be called",
+	}
+	msgs := make([]provider.Message, 70)
+	for i := range msgs {
+		if i == len(msgs)-1 {
+			msgs[i] = provider.Message{Role: "user", Content: "last"}
+		} else if i%2 == 0 {
+			msgs[i] = provider.Message{Role: "user", Content: "msg"}
+		} else {
+			msgs[i] = provider.Message{Role: "assistant", Content: "resp"}
+		}
+	}
+	cfg := config.ContextConfig{
+		MaxTokens: 0, ReservedTokens: 4096, Strategy: "hybrid",
+		Compression: config.ContextCompressionConfig{Enabled: false},
+	}
+	maxTokens := 1000
+	out, err := m.Build(context.Background(), BuildInput{
+		Provider: sp, Model: sp.model,
+		Request:          provider.ChatRequest{Model: "test-model", Messages: msgs, MaxTokens: &maxTokens},
+		Config:           cfg,
+		CurrentTurnStart: len(msgs) - 1,
+	})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if sp.chatCalled {
+		t.Fatal("Chat should not be called when compression disabled")
+	}
+	if !out.Metadata.CompressionFailed {
+		t.Fatal("expected CompressionFailed=true when compression disabled and falls back to truncate")
+	}
+}
+
+// TestBuildHybridFallsBackWhenSummaryReturnsEmpty 验证行40: 摘要为空时恢复原请求并按需截断.
+func TestBuildHybridFallsBackWhenSummaryReturnsEmpty(t *testing.T) {
+	m := NewManager()
+	sp := &summarizingProvider{
+		model:       provider.ModelInfo{ID: "test-model", ContextWindow: 10000, MaxOutput: 1000},
+		summaryText: "", // 摘要为空 → 不接受
+	}
+	msgs := make([]provider.Message, 70)
+	for i := range msgs {
+		if i == len(msgs)-1 {
+			msgs[i] = provider.Message{Role: "user", Content: "last"}
+		} else if i%2 == 0 {
+			msgs[i] = provider.Message{Role: "user", Content: "msg"}
+		} else {
+			msgs[i] = provider.Message{Role: "assistant", Content: "resp"}
+		}
+	}
+	cfg := config.ContextConfig{
+		MaxTokens: 0, ReservedTokens: 4096, Strategy: "hybrid",
+		Compression: config.ContextCompressionConfig{
+			Enabled: true, Threshold: 0.85, TargetRatio: 0.6, MinMessages: 2, PreserveRecent: 3, Timeout: 5 * time.Second,
+		},
+	}
+	maxTokens := 1000
+	out, err := m.Build(context.Background(), BuildInput{
+		Provider: sp, Model: sp.model,
+		Request:          provider.ChatRequest{Model: "test-model", Messages: msgs, MaxTokens: &maxTokens},
+		Config:           cfg,
+		CurrentTurnStart: len(msgs) - 1,
+	})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	// 摘要为空 → 拒绝 → 走 truncate; CompressionFailed 应为 true
+	if !out.Metadata.CompressionFailed {
+		t.Fatal("expected CompressionFailed=true when summary empty")
+	}
+	if out.Metadata.CompressedTurns != 0 {
+		t.Fatal("expected CompressedTurns=0 when summary empty (no summary taken)")
+	}
+}
+
+// providerWithMetrics 包装一个 fakeProvider, 用来观察 metrics emit.
+type providerWithMetrics struct {
+	fakeProvider
+}
+
+func (p *providerWithMetrics) ID() string { return "test-prov" }
+
+// TestBuildMetricsEmitted 验证 checklist 行56 函数式的 metrics emit:
+// 成功 Build 发射 build_total(ok) + input_tokens + utilRatio.
+func TestBuildMetricsEmitted(t *testing.T) {
+	m := NewManager()
+	// 注入 metrics registry
+	r := metrics.NewRegistry()
+	m.SetMetrics(r)
+
+	p := &providerWithMetrics{fakeProvider: fakeProvider{model: provider.ModelInfo{ID: "test-model", ContextWindow: 10000, MaxOutput: 1000}}}
+	cfg := newTestConfig("truncate")
+	maxTokens := 1000
+	out, err := m.Build(context.Background(), BuildInput{
+		Provider: p, Model: p.model,
+		Request: provider.ChatRequest{Model: "test-model", MaxTokens: &maxTokens,
+			Messages: []provider.Message{
+				{Role: "user", Content: "hi"},
+			}},
+		Config: cfg,
+	})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	// 期望 context_build_total{provider=test-prov, model=test-model, strategy=truncate, result=ok} >= 1
+	c := r.Get("context_build_total")
+	if c == nil {
+		t.Fatal("context_build_total not registered")
+	}
+	cnt := c.(*metrics.Counter).Value("test-prov", "test-model", "truncate", "ok")
+	if cnt != 1 {
+		t.Fatalf("expected context_build_total ok=1, got %d", cnt)
+	}
+	_ = out
+}
+
+
+
+// estimateFailingProvider 的 EstimateInputTokens 永远返回 error.
+type estimateFailingProvider struct {
+	model provider.ModelInfo
+}
+
+func (p *estimateFailingProvider) ID() string   { return "fail-provider" }
+func (p *estimateFailingProvider) Type() string { return "fail" }
+func (p *estimateFailingProvider) Models() []provider.ModelInfo { return []provider.ModelInfo{p.model} }
+func (p *estimateFailingProvider) Close() error { return nil }
+func (p *estimateFailingProvider) Chat(context.Context, *provider.ChatRequest) (*provider.ChatResponse, error) { return nil, nil }
+func (p *estimateFailingProvider) StreamChat(context.Context, *provider.ChatRequest) (<-chan provider.ChatChunk, error) { return nil, nil }
+func (p *estimateFailingProvider) EstimateInputTokens(ctx context.Context, req *provider.ChatRequest) (int, error) {
+	return 0, errors.New("token provider down")
+}
+
+// recordingProvider 记录 EstimateInputTokens 收到的 Tool names + ToolChoice.
+type recordingProvider struct {
+	fakeProvider
+	recievedTools   []string
+	toolChoiceValue string
+}
+
+func (r *recordingProvider) EstimateInputTokens(ctx context.Context, req *provider.ChatRequest) (int, error) {
+	for _, t := range req.Tools {
+		r.recievedTools = append(r.recievedTools, t.Function.Name)
+	}
+	if req.ToolChoice != nil && req.ToolChoice.Mode == "specific" {
+		r.toolChoiceValue = req.ToolChoice.Tool
+	}
+	// 与 fakeProvider 一致: 每条 msg = 100 tokens
+	return len(req.Messages) * 100, nil
+}
+
+// TestBuildEstimateFailsReturnsErrorRestore 验证 checklist 行59: Provider 估算失败的 Build 流程.
+// 这里用 mock 返回 error 验证, 集成测试侧还需真实 Provider 但单元已覆盖 error path.
+func TestBuildEstimateFailsReturnsErrorRestore(t *testing.T) {
+	m := NewManager()
+	// mock provider 返回 estimate error
+	p := &estimateFailingProvider{model: provider.ModelInfo{ID: "test-model", ContextWindow: 10000, MaxOutput: 1000}}
+	cfg := newTestConfig("truncate")
+	maxTokens := 1000
+	_, err := m.Build(context.Background(), BuildInput{
+		Provider: p, Model: p.model,
+		Request: provider.ChatRequest{Model: "test-model", MaxTokens: &maxTokens, Messages: []provider.Message{{Role: "user", Content: "x"}}},
+		Config:  cfg,
+	})
+	if err == nil {
+		t.Fatal("expected error on estimate fail")
+	}
+	if !errors.Is(err, ErrTokenEstimationFailed) {
+		t.Fatalf("expected ErrTokenEstimationFailed, got %v", err)
+	}
+}
+
+// TestBuildUTF8AndReasoningContentRegression 验证 checklist 行60: 多语言 UTF-8 + ReasoningContent 通过 Build 路径不破坏估算.
+func TestBuildUTF8AndReasoningContentRegression(t *testing.T) {
+	m := NewManager()
+	p := newTestProvider(10000, 1000)
+	cfg := newTestConfig("truncate")
+	maxTokens := 1000
+	// UTF-8 multi-byte content (中文, emoji)
+	msgs := []provider.Message{
+		{Role: "user", Content: "你好，世界！🌍"},
+		{Role: "assistant", ReasoningContent: "思考: 用户用中文问候, 含 emoji"},
+		{Role: "assistant", Content: "你好！"},
+		{Role: "user", Content: "推荐一首中文歌"},
+	}
+	out, err := m.Build(context.Background(), BuildInput{
+		Provider:         p,
+		Model:            p.model,
+		Request:          provider.ChatRequest{Model: "test-model", MaxTokens: &maxTokens, Messages: msgs},
+		Config:           cfg,
+		CurrentTurnStart: 3,
+	})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	// 估算 tokens = len(msgs) * 100; 因 <= 预算, 直接返回. final = 全部 msgs.
+	if out.Metadata.FinalMessages != 4 {
+		t.Fatalf("expected 4 messages preserved, got %d", out.Metadata.FinalMessages)
+	}
+}
+
+// TestBuildAliasToolChoiceProjectionCachedByCaller 验证 checklist 行61: alias & specific ToolChoice 已在 Build 入口前 by caller 投影,
+// Build 看到 canonical name 并传给 estimator. Build 不持有 alias map 也不自行改名.
+func TestBuildAliasToolChoiceProjectionCachedByCaller(t *testing.T) {
+	m := NewManager()
+	rec := &recordingProvider{
+		fakeProvider: fakeProvider{model: provider.ModelInfo{ID: "test-model", ContextWindow: 10000, MaxOutput: 1000}},
+	}
+	cfg := newTestConfig("truncate")
+	maxTokens := 1000
+	// caller already projected: tool name 是 canonical, ToolChoice.Specific.Name 指向 canonical.
+	toolName := "get_canonical_weather"
+	msgs := []provider.Message{
+		{Role: "user", Content: "x"},
+	}
+	tools := []provider.ToolDef{
+		{Type: "function", Function: provider.ToolFunction{Name: toolName, Description: "d", Parameters: json.RawMessage(`{"type":"object"}`)}},
+	}
+	toolChoice := &provider.ToolChoice{Mode: "specific", Tool: toolName}
+	req := provider.ChatRequest{Model: "test-model", MaxTokens: &maxTokens, Messages: msgs, Tools: tools, ToolChoice: toolChoice}
+	out, err := m.Build(context.Background(), BuildInput{
+		Provider: rec, Model: rec.model,
+		Request:          req,
+		Config:           cfg,
+		CurrentTurnStart: 0,
+	})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	_ = out
+	// estimator 应看到 canonical name (no remap)
+	if len(rec.recievedTools) == 0 {
+		t.Fatal("estimator should see Tools")
+	}
+	if rec.recievedTools[0] != toolName {
+		t.Fatalf("expected rec tool name %q, got %q", toolName, rec.recievedTools[0])
+	}
+	if rec.toolChoiceValue != toolName {
+		t.Fatalf("expected tool_choice specific name %q, got %q", toolName, rec.toolChoiceValue)
+	}
+}
+
+// TestBuildHybridSummaryTimeoutFallsBackToTruncate 验证行59 timeout: 摘要 Chat 超时 (context.DeadlineExceeded) 时 fallback truncate.
+func TestBuildHybridSummaryTimeoutFallsBackToTruncate(t *testing.T) {
+	m := NewManager()
+	sp := &summarizingProvider{
+		model:   provider.ModelInfo{ID: "test-model", ContextWindow: 10000, MaxOutput: 1000},
+		chatErr: context.DeadlineExceeded,
+	}
+	// 70 条消息 → 7000 tokens > 5018 threshold → 触发 hybrid 摘要, Chat 返回超时 → 降级 truncate
+	msgs := make([]provider.Message, 70)
+	for i := range msgs {
+		if i == len(msgs)-1 {
+			msgs[i] = provider.Message{Role: "user", Content: "last"}
+		} else if i%2 == 0 {
+			msgs[i] = provider.Message{Role: "user", Content: "msg"}
+		} else {
+			msgs[i] = provider.Message{Role: "assistant", Content: "resp"}
+		}
+	}
+	cfg := config.ContextConfig{
+		MaxTokens: 0, ReservedTokens: 4096, Strategy: "hybrid",
+		Compression: config.ContextCompressionConfig{
+			Enabled: true, Threshold: 0.85, TargetRatio: 0.6, MinMessages: 2, PreserveRecent: 3, Timeout: 5 * time.Second,
+		},
+	}
+	maxTokens := 1000
+	out, err := m.Build(context.Background(), BuildInput{
+		Provider: sp, Model: sp.model,
+		Request:          provider.ChatRequest{Model: "test-model", Messages: msgs, MaxTokens: &maxTokens},
+		Config:           cfg,
+		CurrentTurnStart: len(msgs) - 1,
+	})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if !sp.chatCalled {
+		t.Fatal("Chat should be called (summary triggered above threshold)")
+	}
+	// 摘要超时 → CompressionFailed=true + 走 truncate
+	if !out.Metadata.CompressionFailed {
+		t.Fatal("expected CompressionFailed=true when Chat times out")
+	}
+	if out.Metadata.CompressedTurns != 0 {
+		t.Fatal("expected CompressedTurns=0 when Chat times out (no summary accepted)")
+	}
+	// truncate 应该把请求压入预算
+	if out.InputTokens > out.InputBudget {
+		t.Fatalf("expected input <= budget, got %d > %d", out.InputTokens, out.InputBudget)
 	}
 }
