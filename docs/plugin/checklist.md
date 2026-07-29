@@ -30,7 +30,7 @@
 - [ ] 每个 `cmd.Start` 成功路径恰有一个 `cmd.Wait` owner；失败统一 Terminate + endpoint cleanup
 - [ ] 无法解析 ID 的错误只进 diagnostics；已知 ID 的错误建立 error Entry
 - [x] 重复 ID 全部拒绝，不按路径顺序覆盖
-- [ ] `RPCClient` 私有持有 transport/process/endpoint；外部只用 Health/Stop/InvokeTool 转发和幂等生命周期方法
+- [x] `RPCClient` 私有持有 transport/process/endpoint；外部只用 Health/Stop/InvokeTool 转发和幂等生命周期方法
 
 ## Manager
 
