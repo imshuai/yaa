@@ -3610,3 +3610,28 @@ go test -count=1 -timeout 300s ./...   # 25 包全绿
 - `internal/tool/builtin/config_reload.go` + test (新建)
 - `go.mod/go.sum` (fsnotify v1.6.0)
 - `docs/config/checklist.md` (11 项) + `docs/tool/checklist.md` (1 项)
+
+---
+
+## #68 — plugin/skill Phase 5 restart-required 集成测试 (plugin 52/52, skill 24/24 ✅)
+
+### 完成内容
+已分析的契约: docs/plugin/config-ref.md §52 "所有 plugins.* 都需要重启" + docs/skill/config.md §72 "skills.dir/per_skill/agents[].skills/agents[].skills_config 全 restart-required".
+已实现机制: #67 的 ReloadManager hotReloadAllowlist 不含任何 plugins.* 或 skills.* 路径前缀, 因此这些字段变化自动归类为 restart-required.
+
+补集成测试 internal/config/reload_test.go (+3 测试):
+- TestReloadPluginsAnyFieldIsRestartRequired: plugins.auto_start 改动 → restart-required (Paths 含 plugins.*)
+- TestReloadSkillsDirIsRestartRequired: skills.dir 改 → restart-required (Paths 含 skills.*)
+- TestReloadSkillsPerSkillOptionsIsRestartRequired: skills.per_skill.<name>.options 改 → restart-required
+  (与 tools.builtin.<name>.options 在 allowlist 形成对比)
+
+检查清单: plugin 勾选行60 (52→52/52 ✅), skill 勾选行23 (23→24/24 ✅)
+
+### 验证
+- go vet/build OK
+- internal/config + tool/builtin 测试全绿
+
+### 关键文件
+- `internal/config/reload_test.go` (+3 测试)
+- `docs/plugin/checklist.md` (行60)
+- `docs/skill/checklist.md` (行23)

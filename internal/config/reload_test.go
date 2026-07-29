@@ -432,3 +432,80 @@ func TestDiffAndClassifyBasic(t *testing.T) {
 		t.Fatalf("restart = %+v, want empty", restart)
 	}
 }
+
+// TestReloadPluginsAnyFieldIsRestartRequired 覆盖 plugins.* 任意字段变化都 restart-required.
+// docs/plugin/config-ref.md §"hot-reload note": 所有 plugins.* 都需要重启, 不能通过 config reload 改变正在运行的 Plugin.
+func TestReloadPluginsAnyFieldIsRestartRequired(t *testing.T) {
+	m, p := newTestReloadManager(t, nil)
+	// 改 plugins.auto_start (true→false): 非 allowlist → restart-required
+	// minimalValidYAML 无 plugins 配置, default 已有 auto_start=true/paths; 写入新 map 会 override.
+	newContent := minimalValidYAML + "plugins:\n  paths: [./plugins]\n  auto_start: false\n"
+	if err := os.WriteFile(p, []byte(newContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.Reload()
+	if err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if result.Applied || !result.RestartRequired {
+		t.Fatalf("plugins.* change must be restart-required, got %+v", result)
+	}
+	// 验证 Paths 至少含 plugins.* 路径之一
+	found := false
+	for _, path := range result.Paths {
+		if len(path) >= len("plugins") && path[:len("plugins")] == "plugins" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Paths should include plugins.* , got %+v", result.Paths)
+	}
+}
+
+// TestReloadSkillsDirIsRestartRequired 覆盖 skills.dir 变化 restart-required.
+// docs/skill/config.md §72: skills.dir, per_skill, agents[].skills, agents[].skills_config 全 restart-required.
+func TestReloadSkillsDirIsRestartRequired(t *testing.T) {
+	m, p := newTestReloadManager(t, nil)
+	// 改 skills.dir: "./skills" → "/usr/local/yaa/skills"
+	newContent := minimalValidYAML + "skills:\n  dir: /usr/local/yaa/skills\n"
+	if err := os.WriteFile(p, []byte(newContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.Reload()
+	if err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if result.Applied || !result.RestartRequired {
+		t.Fatalf("skills.dir change must be restart-required, got %+v", result)
+	}
+	// Paths 至少含 skills.* 路径
+	found := false
+	for _, path := range result.Paths {
+		if len(path) >= len("skills") && path[:len("skills")] == "skills" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Paths should include skills.* , got %+v", result.Paths)
+	}
+}
+
+// TestReloadSkillsPerSkillOptionsIsRestartRequired 覆盖 skills.per_skill.<name>.options 也 restart-required,
+// 不像 tools.builtin.<name>.options 那样在 allowlist.
+func TestReloadSkillsPerSkillOptionsIsRestartRequired(t *testing.T) {
+	m, p := newTestReloadManager(t, nil)
+	newContent := minimalValidYAML + "skills:\n  per_skill:\n    translator:\n      enabled: true\n      options:\n        lang: en\n"
+	// 注意 minimalValidYAML 此处没有 skills.per_skill 字段, 默认 PerSkill=nil, 新增 map → changed.
+	if err := os.WriteFile(p, []byte(newContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.Reload()
+	if err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if result.Applied || !result.RestartRequired {
+		t.Fatalf("skills.per_skill.<name>.options change must be restart-required, got %+v", result)
+	}
+}

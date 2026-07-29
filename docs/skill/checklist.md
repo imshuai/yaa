@@ -20,7 +20,7 @@
 - [x] Tool 依赖存在、enabled 且通过 Agent Tool allowlist
 - [x] options 按 frontmatter → root → Agent 顶层 shallow merge
 - [x] options 敏感 key、JSON 类型和 64 KiB 合并后上限校验
-- [ ] 全部 Skill 文件/配置变化标记 restart-required
+- [x] 全部 Skill 文件/配置变化标记 restart-required
 
 ## Agent 集成
 

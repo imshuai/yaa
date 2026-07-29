@@ -57,7 +57,7 @@
 - [x] `stop_timeout` 覆盖 Stop 到 Wait
 - [x] `health_interval` / `health_timeout` 生效
 - [x] `restart.enabled/max_attempts/backoff` 只用于运行中 unexpected exit
-- [ ] 所有 `plugins.*` 变更返回 restart_required，不热加载
+- [x] 所有 `plugins.*` 变更返回 restart_required，不热加载
 - [x] v1 不实现远程 endpoint、动态库、下载/安装或签名信任库
 - [x] Plugin 不接收 Runtime 指针、Manager、数据库连接或 internal Go object
 
