@@ -97,6 +97,9 @@ func NewManager(store ContentStore, em Embedder, fac VectorIndexFactory, clk Clo
 
 // beginOp 在 lifecycleMu 内原子检查 closing 并 inFlight.Add(1)
 // （architecture.md §2）。IndexStatus 是唯一不调用 beginOp 的方法。
+// BeginOpForTest 暴露 beginOp 给测试使用 (docs/memory checklist 行16).
+func (m *Manager) BeginOpForTest() error { return m.beginOp() }
+
 // ClockForTest 暴露 Manager 内部 Clock 给测试场景。
 // 正式调用方不应使用此方法；仅同 monorepo 测试包通过包外 mock 来推进时间。
 func (m *Manager) ClockForTest() Clock { return m.clock }

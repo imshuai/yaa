@@ -124,6 +124,8 @@ func notExpiredAt(item memory.MemoryItem, now time.Time) bool {
 // upsert target（保留 CreatedAt，Version+1，新 row Version=1）。任一步失败保留
 // 提交前状态并返回 error（docs/memory/architecture.md §3 + storage.md §2）。
 func (s *Store) CommitPut(ctx context.Context, item memory.MemoryItem, victims []memory.ItemRef, now time.Time) (memory.CommitPutResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	target := pkFor(item)
 	existing, exists := s.data[target]
 

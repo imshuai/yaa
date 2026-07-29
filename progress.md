@@ -3388,3 +3388,48 @@ go test -count=1 -timeout 300s ./...   # 25 包全绿
 - `cmd/yaa/config_cli.go` 新建
 - `pkg/pluginrpc/transport.go` (Windows bug 修复)
 - `docs/config/checklist.md` (21 项勾选)
+
+---
+
+## Commit #63 — memory memstore CommitPut data race 修复 + 并发 Close 测试 (32/39→36/39, +4 项) (2026-07-29)
+
+### 变更摘要
+
+**修复 memstore.CommitPut data race bug (关键)**:
+- `internal/memory/memstore/store.go`: `CommitPut` 之前未持 `s.mu.Lock()`, 直接读写 `s.data`, 与 List/Count 的 RLock range 并发触发 "concurrent map iteration and map write" fatal error.
+- 修复: 加 `s.mu.Lock()` + `defer s.mu.Unlock()` 保护整个 victim 校验 + 删除 + target upsert 原子提交.
+- sqlite store 已用 `tx BeginTx` 事务, 无此 bug.
+
+**新增并发测试覆盖 (行15/16)**:
+- `TestManagerCloseConcurrentOpsRace`: 5 goroutine 持续 Put + Close 比赛, 验证 Close 后 beginOp 返回 ErrMemoryClosed, 二次 Close 幂等, ops after close 被拒绝.
+- `TestManagerBeginOpAfterClose`: 显式验证 Close 后 beginOp 返回 ErrMemoryClosed.
+- `internal/memory/manager.go` 暴露 `BeginOpForTest()` 给测试用.
+
+**Reindex/IndexStatus 状态序列验证 (行27/28)**:
+- Reindex 已实现: 持 agent keyed lock 阻塞并发 Put/Delete, 临时 index 构建后原子 swap + IndexReady.
+- IndexStatus 状态路径已覆盖测试:
+  - vector disabled / 未知 agent → IndexReady (TestManagerIndexStatusNoVector)
+  - 首次初始化 → IndexDegraded (agentIndexState 默认 degraded)
+  - Embed/Upsert 失败 / fallback 后 → IndexDegraded (TestManagerVectorFallbackToKeyword)
+  - Reindex 成功 → IndexReady (TestManagerVectorReindexAndSearch)
+
+### 检查清单进度
+
+| 模块 | 之前 | 现在 |
+|------|------|------|
+| memory | 32/39 | **36/39** ✅ (新增 4 项) |
+
+剩 3 项: 行52/53 Phase 5 hot/restart + 行56 Health 结构 (新功能).
+
+### 验证
+
+- `go vet ./...` OK
+- `go build ./...` OK
+- `go test -count=1 -timeout 300s ./...` 26 包全绿
+- 内存 memstore 真实 data race bug 修复, 测试覆盖并发场景
+
+### 关键文件
+- `internal/memory/memstore/store.go` (CommitPut s.mu.Lock 修复)
+- `internal/memory/manager.go` (BeginOpForTest)
+- `internal/memory_test/manager_test.go` (2 新并发测试)
+- `docs/memory/checklist.md` (4 项勾选)

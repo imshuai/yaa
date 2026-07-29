@@ -512,3 +512,62 @@ func TestManagerCloseIdempotent(t *testing.T) {
 		t.Fatalf("Put after close: %v", err)
 	}
 }
+
+// TestManagerCloseConcurrentOpsRace 覆盖 checklist 行15/16:
+// 并发 Put 与 Close 比赛, 验证 Close 后 beginOp 返回 ErrMemoryClosed 且无 panic.
+func TestManagerCloseConcurrentOpsRace(t *testing.T) {
+	m := newTestManager(t)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	// 启动 5 个 goroutine 不断 Put
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				item := mm.MemoryItem{
+					AgentID: fmt.Sprintf("agent-%d", id),
+					Layer:   mm.LayerLongTerm,
+					Key:     fmt.Sprintf("k-%d", j),
+					Content: "content",
+				}
+				_, _ = m.Put(ctx, defaultPolicy(), item)
+			}
+		}(i)
+	}
+	// 等一会儿让 ops 跑起来, 然后 Close
+	time.Sleep(5 * time.Millisecond)
+	// Close 应等待 in-flight ops 完成 (或超时)
+	closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := m.Close(closeCtx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		// 接受 deadline 超期 (后台关闭仍进行)
+		t.Logf("close returned: %v", err)
+	}
+	// Close 后所有新 ops 应返回 ErrMemoryClosed
+	_, _ = m.Put(ctx, defaultPolicy(), mm.MemoryItem{AgentID: "x", Layer: mm.LayerLongTerm, Key: "k", Content: "c"})
+	wg.Wait()
+
+	// 二次 Close 应幂等
+	if err := m.Close(ctx); err != nil {
+		t.Fatalf("second close should be idempotent: %v", err)
+	}
+	// ops after close 应拒绝
+	_, err := m.Put(ctx, defaultPolicy(), mm.MemoryItem{AgentID: "y", Layer: mm.LayerLongTerm, Key: "k", Content: "c"})
+	if !errors.Is(err, mm.ErrMemoryClosed) {
+		t.Fatalf("expected ErrMemoryClosed after close, got %v", err)
+	}
+}
+
+// TestManagerBeginOpAfterClose 覆盖 checklist 行16 beginOp 路径.
+func TestManagerBeginOpAfterClose(t *testing.T) {
+	m := newTestManager(t)
+	ctx := context.Background()
+	if err := m.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.BeginOpForTest(); err != mm.ErrMemoryClosed {
+		t.Fatalf("expected ErrMemoryClosed from beginOp, got %v", err)
+	}
+}

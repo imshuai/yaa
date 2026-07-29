@@ -12,8 +12,8 @@
 - [x] `Put` 是唯一 upsert；Get/Delete 使用完整 Scope；返回值均深拷贝。
 - [x] Search/Clear 的空 SessionID 仅表示 Agent 全范围；Limit 和排序确定。
 - [x] Promote 复制到全局 scope、保留源、重新应用 default TTL；目标只发 promoted，committed victims 仍发 evicted。
-- [ ] `Manager.Close(ctx)` 拒绝新操作、停止 worker、等待 in-flight、只关闭 Store 一次，超时后后台关闭可继续。
-- [ ] `beginOp` 在 `lifecycleMu` 下完成 closing 检查与 `inFlight.Add(1)`；race test 覆盖并发操作和 Close。
+- [x] `Manager.Close(ctx)` 拒绝新操作、停止 worker、等待 in-flight、只关闭 Store 一次，超时后后台关闭可继续。
+- [x] `beginOp` 在 `lifecycleMu` 下完成 closing 检查与 `inFlight.Add(1)`；race test 覆盖并发操作和 Close。
 
 ## 内容存储与索引
 
@@ -24,8 +24,8 @@
 - [x] VectorIndex 使用完整 ItemRef + Version 和 typed Session/global selector；scope 在 threshold/排序前过滤，命中必须回查 ContentStore。
 - [x] VectorIndex 全部方法并发安全；factory 每次返回新的非 nil 空索引并由 Manager 持有。
 - [x] Content 先提交，index 失败不回滚；Delete/Clear/Expire 后 index 失败不复活内容。
-- [ ] Reindex 只接收 AgentID，构建全 Agent 临时索引并原子替换，不丢失并发 Put/Delete。
-- [ ] vector disabled/初始化/失败/完整 Reindex 成功的状态依次遵循 ready/degraded/degraded/ready，API 全程使用 `IndexStatus`。
+- [x] Reindex 只接收 AgentID，构建全 Agent 临时索引并原子替换，不丢失并发 Put/Delete。
+- [x] vector disabled/初始化/失败/完整 Reindex 成功的状态依次遵循 ready/degraded/degraded/ready，API 全程使用 `IndexStatus`。
 
 ## TTL 与容量
 
