@@ -70,7 +70,7 @@
 - [x] 指标名称与 [observability.md](observability.md) 唯一表一致
 - [x] 当前不宣称 Plugin Remote API、SSE endpoint 或未登记 Tool
 - [x] 单元测试覆盖 Manifest/config schema/依赖图/能力冲突
-- [ ] 集成测试覆盖启动失败、unexpected exit/restart、Stop timeout 和 Windows loopback
+- [x] 集成测试覆盖启动失败、unexpected exit/restart、Stop timeout 和 Windows loopback
 
 ---
 

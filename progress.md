@@ -3282,3 +3282,44 @@ go test -count=1 -timeout 300s ./...   # 25 包全绿
 - **行60** plugins.* 全增 restart_required (Phase 5 ReloadManager)
 - **行66-71** Tool Proxy/RBAC/Secret/指标/Remote API 边界承诺
 - **行72-73** 单元/集成测试覆盖
+
+---
+
+## Commit #61 — 集成测试覆盖 (行73, checklist → 51/52) (2026-07-29)
+
+### 变更摘要
+
+**修复 integration_test.go 2 个 FAIL**:
+- `TestStartUpFailureRecording` + `TestMetricsAreCollected` 之前 FailedIDs=[] 因为 `writePluginWithDeps` 不写 `default_enabled: true` → `effectiveEnabled` 返回 false → StartAll 标记 Stopped 不走 Loader.Start。
+- 修复: 在两测试的 `cfg.Entries` 中显式加 `{ID: "alpha", Enabled: &enabledTrue}` (方案最小: 不改 helper 不影响其他测试)。
+
+**新增 2 个集成测试覆盖集成点**:
+- `TestUnexpectedExitSetsErrorWhenRestartDisabled`: 构造可控行 Exited channel 的 RPCClient + fakeRPC, Ready state, 启动 monitor goroutine, 关闭 Exited → 验证 State=Error (restart disabled 路径)。
+- `TestStopTimeoutContinuesTeardown`: 构造 Stop 后不退出的 client, StopAll 用 50ms 超时返回, 关闭 Exited 后 WaitStopped 完成 → 验证 state=Stopped 或 Error, 验证 GetTimeout ctx 超时后台 teardown 仍完成。
+
+**修复 transport.go Windows loopback bug**:
+- Windows 分支返回 `l.Addr().String()` (e.g. "127.0.0.1:port") 但 `DialPlugin` 期望 `tcp://` 前缀 → Windows 拨号会失败。
+- 修复: 返回 `"tcp://" + l.Addr().String()`。
+- 去掉过时 TODO 注释。
+
+**新增 pkg/pluginrpc/transport_test.go (3 测试)**:
+- `TestAllocateAndDialUnixSocket`: Unix Socket 分配+listener+DialPlugin round-trip
+- `TestDialPluginTCPScheme`: TCP loopback 拨号 (Windows loopback 等价路径覆盖, Linux 上跑)
+- `TestDialPluginUnknownScheme`: 未知 scheme 返回 error
+
+### 检查清单更新
+- plugin: 50/52 → **51/52** ✅ (行73 勾选)
+- 剩余 1 项: 行60 `所有 plugins.* 变更返回 restart_required，不热加载` — Phase 5 ReloadManager, 依赖 config 热更新基础设施。
+
+### 验证
+- `go vet ./...` OK
+- `go build ./...` OK
+- `go test -count=1 -timeout 300s ./...` 26 包全绿 (新增 pkg/pluginrpc 测试)
+- internal/plugin 包 5 个集成测试全 PASS
+- pkg/pluginrpc 包 3 个 transport 测试全 PASS
+
+### 关键文件
+- `internal/plugin/integration_test.go` (修 2 FAIL + 新增 2 测试)
+- `pkg/pluginrpc/transport.go` (Windows loopback 前缀 bug 修复)
+- `pkg/pluginrpc/transport_test.go` (新建, 3 测试)
+- `docs/plugin/checklist.md` (行73 勾选, 51/52)

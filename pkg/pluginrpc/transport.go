@@ -12,7 +12,7 @@ import (
 
 // AllocateLocalEndpoint 分配本地 IPC endpoint 和 cleanup 函数.
 // Linux/macOS: 临时目录中的 Unix Socket, 仅当前用户可访问.
-// Windows: 随机 loopback TCP 端口 (TODO MVP 留 stub).
+// Windows: 随机 loopback TCP 端口.
 func AllocateLocalEndpoint(pluginID string) (endpoint string, cleanup func(), err error) {
 	if runtime.GOOS == "windows" {
 		// Windows: loopback TCP
@@ -21,7 +21,7 @@ func AllocateLocalEndpoint(pluginID string) (endpoint string, cleanup func(), er
 			return "", nil, fmt.Errorf("allocate tcp endpoint: %w", err)
 		}
 		cleanup = func() { _ = l.Close() }
-		return l.Addr().String(), cleanup, nil
+		return "tcp://" + l.Addr().String(), cleanup, nil
 	}
 
 	// Unix: 临时目录 Unix Socket
