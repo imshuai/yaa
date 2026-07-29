@@ -3660,3 +3660,37 @@ import 顺序整理 (合并 import 块 + 加 os import)
 ### 关键文件
 - `internal/context/manager_test.go` (+2 集成测试)
 - `docs/context/checklist.md` (行59)
+
+---
+
+## #70 — Memory Phase 5 strict decoder + cleanup reload (memory 37→39/39 ✅)
+
+### 完成内容
+- **行52 strict decoder unknown field**: 已有 decode.go 拒绝未知字段, 补 2 集成测试证明:
+  - `internal/config/memory_unknown_test.go`: TestMemoryUnknownFieldRejectedStrict (memory.nonsense_field) +
+    TestMemoryOverrideUnknownFieldRejectedStrict (agents[].memory.made_up)
+  - 字段一致性: MemoryOverride 字段集 (max_items/default_ttl/eviction_policy hot + enabled/vector restart) 与 hot-reload.md §4 allowlist 一致
+- **行53 cleanup tick snapshot** 改造 `internal/memory/manager.go`:
+  - 新增 `StartCleanupWithReload(ctx, snapshot func() (interval, batchSize))`: 每 tick 调 snapshot 取最新 (interval,batchSize), interval 变化→ticker.Reset
+  - 与 StartCleanup 共享同一 lifecycleMu 保护的 workerCancel/workerDone, 不可重复启动
+  - snapshot disabled (interval<=0 或 batchSize<=0) → 该 tick 跳过 DeleteExpired (1s fallback 重试)
+  - 现有 StartCleanup 保留兼容 (固定 interval/batchSize)
+- 补 3 集成测试 `internal/memory_test/cleanup_reload_test.go`:
+  - TestStartCleanupWithReloadInvokesSnapshot: 10ms interval 触发 DeleteExpired
+  - TestStartCleanupWithReloadDisabledSnapshotSkipsCleanup: disabled snapshot 跳 cleanup
+  - TestStartCleanupWithReloadIntervalReset: interval 切换 5ms→30ms 后 worker 仍持续 tick
+- 补 2 集成测试 `internal/memory_test/policy_explicit_test.go`:
+  - TestManagerUsesExplicitPolicyPerOp: 同一 Manager 两次 Put 用不同 MaxItems (10→1), 第二次触发 eviction (证明 caller 决定 policy)
+  - TestManagerPolicyEnabledFalseShortCircuit: policy.Enabled=false 直接返 ErrMemoryDisabled
+
+检查清单: memory 勾选行52/53 (37→39/39 ✅)
+
+### 验证
+- go vet/build OK
+- go test -count=1 -timeout 300s ./... 25 包全绿 (本次 mcp 无 flaky)
+
+### 关键文件
+- `internal/memory/manager.go` (新增 StartCleanupWithReload, inline StartCleanup goroutine)
+- `internal/config/memory_unknown_test.go` (新建, 2 测试)
+- `internal/memory_test/cleanup_reload_test.go` (新建, 3 测试) + policy_explicit_test.go (2 测试)
+- `docs/memory/checklist.md` (行52/53)

@@ -49,8 +49,8 @@
 - [x] 根内容后端唯一 owner 为 `memory.storage.type`，只接受 `sqlite|memory`。
 - [x] Agent 类型为 `*MemoryOverride`，所有 override scalar/vector 字段为 pointer。
 - [x] Agent 不能覆盖 storage/embedding/cleanup，也不能在 root disabled 上启用。
-- [ ] hot/restart 字段与 config-ref/hot-reload 完全一致；strict decoder 拒绝未知字段。
-- [ ] Agent turn 显式复用同一 policy；Remote 每请求、cleanup 每 tick各捕获一个 Config snapshot。
+- [x] hot/restart 字段与 config-ref/hot-reload 完全一致；strict decoder 拒绝未知字段。
+- [x] Agent turn 显式复用同一 policy；Remote 每请求、cleanup 每 tick各捕获一个 Config snapshot。
 - [x] Remote 仅 request deadline 映射 504；client cancel 不写响应，quota/closed 分别映射 429/503。
 - [x] 事件只使用 canonical 8 种名称；指标统一 `yaa_memory_*` 且无高基数/敏感 label。
 - [x] 健康只反映 content/embedder/index，不根据 Session 状态判断。

@@ -114,6 +114,9 @@ func (m *Manager) MarkDegradedForTest(agentID string, reason string) {
 // docs/memory checklist 行32: cleanup 有稳定顺序、batch 和取消.
 // interval<=0 或 batchSize<=0 表示不启用后台 cleanup (v1 可由外部显式调 DeleteExpired).
 // 幂等: 重复调用不启动多个 worker. Close 会 cancel worker 并等 workerDone.
+//
+// 此固定 interval/batchSize 版本不接受 reload; 调用方需要 hot-reload memory.expire_interval /
+// memory.expire_batch_size (docs/config hot-reload allowlist) 应改用 StartCleanupWithReload.
 func (m *Manager) StartCleanup(ctx context.Context, interval time.Duration, batchSize int) {
 	if interval <= 0 || batchSize <= 0 {
 		return
@@ -128,10 +131,70 @@ func (m *Manager) StartCleanup(ctx context.Context, interval time.Duration, batc
 	m.workerDone = make(chan struct{})
 	m.lifecycleMu.Unlock()
 
-	go m.cleanupWorker(workerCtx, interval, batchSize)
+	go func() {
+		defer close(m.workerDone)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-ticker.C:
+				// cleanup 每 tick 采样一次 now (docs/memory checklist 行52)
+				now := m.clock.Now()
+				_, _ = m.DeleteExpired(workerCtx, now, batchSize)
+			}
+		}
+	}()
 }
 
-// cleanupWorker 定期执行 DeleteExpired 直到 ctx 取消或 Manager Close.
+// StartCleanupWithReload 启动支持 reload 的 cleanup goroutine.
+// snapshot 在每个 tick 被调用, 返回当前 effective interval 与 batchSize (来自调用方捕获的
+// 当前 Config snapshot; docs/memory checklist 行53 "cleanup 每 tick 各捕获一次 snapshot").
+// interval <= 0 或 batchSize <= 0 时该 tick 跳过.
+// 若 interval 与上一 tick 的实际 interval 不同, ticker.Reset 到新值.
+// ponytail: 用 ticker.Reset 按需调整间隔, 不重建 ticker.
+// 与 StartCleanup 共享同一 lifecycleMu 保护的 workerCancel/workerDone, 不可重复启动.
+func (m *Manager) StartCleanupWithReload(ctx context.Context, snapshot func() (interval time.Duration, batchSize int)) {
+	if snapshot == nil {
+		return
+	}
+	m.lifecycleMu.Lock()
+	if m.workerCancel != nil {
+		m.lifecycleMu.Unlock()
+		return // 已启动
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	m.workerCancel = cancel
+	m.workerDone = make(chan struct{})
+	m.lifecycleMu.Unlock()
+
+	go func() {
+		defer close(m.workerDone)
+		// ponytail: 用单一 timer 推进 tick; 首次立即 fire, 之后每次 snapshot 决定下一 tick 间隔.
+		// interval<=0 (snapshot 暂为 disabled) → 下次用 1s 作 fallback 周期轮询 cfg.
+		timer := time.NewTimer(0)
+		defer timer.Stop()
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-timer.C:
+				interval, batchSize := snapshot()
+				if interval > 0 && batchSize > 0 {
+					now := m.clock.Now()
+					_, _ = m.DeleteExpired(workerCtx, now, batchSize)
+				} else {
+					interval = time.Second // fallback: snapshot disabled -> 每 1s 重新检查 (cfg reload 后能恢复)
+				}
+				timer.Reset(interval)
+			}
+		}
+	}()
+}
+
+// cleanupWorker 保留兼容入口 (内嵌 integer version 已在 StartCleanup 内联). 仅供旧调用方/测试.
+// ponytail: 不删除以避免破坏符号兼容; 内部等价 implementation inline 在 StartCleanup.
 func (m *Manager) cleanupWorker(ctx context.Context, interval time.Duration, batchSize int) {
 	defer close(m.workerDone)
 	ticker := time.NewTicker(interval)
@@ -141,7 +204,6 @@ func (m *Manager) cleanupWorker(ctx context.Context, interval time.Duration, bat
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// cleanup 每 tick 采样一次 now (docs/memory checklist 行52)
 			now := m.clock.Now()
 			_, _ = m.DeleteExpired(ctx, now, batchSize)
 		}
