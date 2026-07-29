@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"os"
 
 	"golang.org/x/exp/slog"
 )
@@ -91,5 +92,64 @@ func migrateRaw(raw map[string]any, logger *slog.Logger) (map[string]any, error)
 		return nil, err
 	}
 	logger.Info("config migrated", "from", from.String(), "to", CurrentSchemaVersion.String())
+	return migrated, nil
+}
+
+// MigrateFile 解析给定配置文件, 执行迁移, 可选备份/写回/dry-run.
+// docs/config/migration.md §4: --backup 写回, --dry-run 只输出摘要.
+// 返回迁移结果 raw map 和写回状态.
+func MigrateFile(path string, backup bool, dryRun bool) (map[string]any, error) {
+	raw, err := ParseFileToMap(path)
+	if err != nil {
+		return nil, err
+	}
+	versionText, _ := raw["config_version"].(string)
+	if versionText == "" {
+		versionText = CurrentSchemaVersion.String()
+	}
+	from, err := ParseVersion(versionText)
+	if err != nil {
+		return nil, fmt.Errorf("parse config_version %q: %w", versionText, err)
+	}
+	if from.Compare(CurrentSchemaVersion) > 0 {
+		return nil, fmt.Errorf("config_version %s is newer than Runtime %s", from, CurrentSchemaVersion)
+	}
+	if from.Compare(CurrentSchemaVersion) == 0 {
+		// 无需迁移
+		return raw, nil
+	}
+	migrated, err := Migrate(raw, from, CurrentSchemaVersion)
+	if err != nil {
+		return nil, err
+	}
+	if dryRun {
+		// 只返回结果, 不写盘
+		return migrated, nil
+	}
+	if !backup {
+		// 不写回
+		return migrated, nil
+	}
+	// 备份原文件
+	bakPath := path + ".bak"
+	origData, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read original for backup: %w", err)
+	}
+	if err := atomicWriteFile(bakPath, origData, 0o600); err != nil {
+		return nil, fmt.Errorf("write backup %s: %w", bakPath, err)
+	}
+	// 写回迁移后的配置 (保持原格式)
+	format, err := DetectFormat(path)
+	if err != nil {
+		return nil, err
+	}
+	data, err := MarshalMap(migrated, format)
+	if err != nil {
+		return nil, err
+	}
+	if err := atomicWriteFile(path, data, 0o600); err != nil {
+		return nil, fmt.Errorf("write migrated config: %w", err)
+	}
 	return migrated, nil
 }

@@ -146,3 +146,44 @@ func assertDefaultBuiltinConfig(t *testing.T, tools ToolsConfig) {
 		t.Errorf("file defaults = %#v", got)
 	}
 }
+
+// TestConfigToMapNotNil 验证 ConfigToMap 返回非空 raw map.
+func TestConfigToMapNotNil(t *testing.T) {
+	cfg := Default()
+	m, err := ConfigToMap(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m == nil {
+		t.Fatal("ConfigToMap returned nil")
+	}
+	if m["config_version"] != "1.0" {
+		t.Fatalf("expected config_version=1.0, got %v", m["config_version"])
+	}
+}
+
+// TestConfigToMapNilReturnsEmpty 验证 nil Config 返回空 map.
+func TestConfigToMapNilReturnsEmpty(t *testing.T) {
+	m, err := ConfigToMap(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m) != 0 {
+		t.Fatalf("expected empty map, got %v", m)
+	}
+}
+
+// TestDefaultConfigMarshalable 验证 Default() 可被序列化为 YAML/JSON/TOML 三种格式.
+// 用于验证 yaa config defaults --format 的多种输出.
+func TestDefaultConfigMarshalable(t *testing.T) {
+	cfg := Default()
+	m, err := ConfigToMap(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []Format{FormatYAML, FormatJSON, FormatTOML} {
+		if _, err := MarshalMap(m, f); err != nil {
+			t.Fatalf("marshal %s: %v", f, err)
+		}
+	}
+}

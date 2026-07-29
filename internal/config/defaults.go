@@ -1,6 +1,11 @@
 package config
 
-import "time"
+import (
+	"fmt"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
 
 // Default returns a complete configuration populated with built-in defaults.
 func Default() *Config {
@@ -252,4 +257,21 @@ func DefaultPluginsConfig() PluginsConfig {
 
 func DefaultLogConfig() LogConfig {
 	return LogConfig{Level: "info", Format: "text", Output: "stderr"}
+}
+
+// ConfigToMap 将 typed Config 转 raw map. 用于 yaa config defaults CLI.
+// 用 YAML 序列化再解析为 map, 保留字段顺序与 presence (零值字段按 yaml 默认省略).
+func ConfigToMap(cfg *Config) (map[string]any, error) {
+	if cfg == nil {
+		return map[string]any{}, nil
+	}
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("marshal default config: %w", err)
+	}
+	out := map[string]any{}
+	if err := yaml.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("unmarshal default config: %w", err)
+	}
+	return out, nil
 }

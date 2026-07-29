@@ -23,7 +23,7 @@
 - [x] `${VAR_NAME}` 语法解析（配置文件值中的占位符）
 - [x] `${VAR_NAME:-default}` 默认值语法支持
 - [x] 环境变量缺失且无 `:-default` 时统一返回 `ErrConfigEnvVarMissing`
-- [ ] 敏感字段强制环境变量来源（API Key、Token 等不在配置文件中明文存储）
+- [x] 敏感字段强制环境变量来源（API Key、Token 等不在配置文件中明文存储）
 - [x] 环境变量展开在配置文件解析后、校验前执行
 - [x] 展开结果类型转换（字符串 → int / bool / duration）
 
@@ -75,8 +75,8 @@
 - [x] 格式自动检测（文件扩展名：`.yaml`/`.yml`/`.toml`/`.json`）
 - [x] 无扩展名时按 YAML 解析；需要其他格式时必须使用扩展名
 - [x] 统一中间表示（`map[string]any`）后解码到 `Config` 结构体
-- [ ] 格式转换工具（`yaa config convert --to yaml`，开发者工具）
-- [ ] 格式间语义等价性测试
+- [x] 格式转换工具（`yaa config convert --to yaml`，开发者工具）
+- [x] 格式间语义等价性测试
 
 ## 迁移
 
@@ -84,12 +84,12 @@
 - [x] 版本检测与迁移触发（加载时比较文件版本与当前版本）
 - [x] 迁移函数注册表（`[]Migration` 显式版本边，拒绝重复起点与隐式路径）
 - [x] 按显式迁移边逐步执行，不推测 `nextVersion` 或跳过缺失路径
-- [ ] 仅显式迁移 CLI 在写回前备份原配置文件（`.bak` 后缀）；启动加载不写盘
-- [ ] 显式迁移 CLI 写回成功后更新版本号；启动加载只更新内存中的 raw Map
-- [ ] CLI 写回失败时保留原文件；启动加载迁移失败不启动 Runtime
+- [x] 仅显式迁移 CLI 在写回前备份原配置文件（`.bak` 后缀）；启动加载不写盘
+- [x] 显式迁移 CLI 写回成功后更新版本号；启动加载只更新内存中的 raw Map
+- [x] CLI 写回失败时保留原文件；启动加载迁移失败不启动 Runtime
 - [x] 废弃字段警告（字段已废弃但仍可读，warn 日志提示替代方案）
 - [x] 移除字段报错（字段已移除，fatal 并提示迁移）
-- [ ] 迁移日志记录（from version → to version，变更明细）
+- [x] 迁移日志记录（from version → to version，变更明细）
 
 ## 默认值
 
@@ -101,8 +101,8 @@
 - [x] 元素默认注入不覆盖显式 `false`、`0`、`""`、`[]`、`{}` 或 `null`
 - [x] 切片/Map 字段默认值初始化（避免 nil panic）
 - [x] Duration 类型默认值（如 `timeout: 30s`）
-- [ ] 默认值文档同步（reference.md 中标注 `默认: xxx`）
-- [ ] `yaa config defaults` 命令 — 输出完整默认配置（开发者工具）
+- [x] 默认值文档同步（reference.md 中标注 `默认: xxx`）
+- [x] `yaa config defaults` 命令 — 输出完整默认配置（开发者工具）
 
 ## 错误处理
 
@@ -111,8 +111,8 @@
 - [x] `ErrConfigValidationFailed`
 - [x] `ErrConfigEnvVarMissing`
 - [x] `ErrConfigMigrationFailed`
-- [ ] `ErrConfigHotReloadFailed`
-- [ ] `ErrConfigNotActive`
+- [x] `ErrConfigHotReloadFailed`
+- [x] `ErrConfigNotActive`
 - [x] `ErrConfigFormatUnsupported`
 - [x] 错误消息包含上下文（文件路径 + 字段路径 + 原因）
 

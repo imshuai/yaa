@@ -2,6 +2,8 @@ package config
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -159,4 +161,72 @@ func TestMigrateFailedErrorsIsSentinel(t *testing.T) {
 			t.Fatalf("errors.Is(ErrConfigMigrationFailed) = false; err = %v", err)
 		}
 	})
+}
+
+// TestMigrateFileNoMigrationNeeded 验证 from==to 时 MigrateFile 返回原 raw 不写盘.
+func TestMigrateFileNoMigrationNeeded(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "yaa.yaml")
+	if err := os.WriteFile(path, []byte("config_version: \"1.0\"\nname: yaa\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := MigrateFile(path, true, false)
+	if err != nil {
+		t.Fatalf("MigrateFile: %v", err)
+	}
+	if result["name"] != "yaa" {
+		t.Fatalf("expected name=yaa, got %v", result["name"])
+	}
+	// 备份文件不应存在 (无迁移)
+	if _, err := os.Stat(path + ".bak"); !os.IsNotExist(err) {
+		t.Fatalf("backup should not exist, got err=%v", err)
+	}
+}
+
+// TestMigrateFileNonExistentSource 验证源文件不存在时返回 error.
+func TestMigrateFileNonExistentSource(t *testing.T) {
+	dir := t.TempDir()
+	_, err := MigrateFile(filepath.Join(dir, "nonexistent.yaml"), false, false)
+	if err == nil {
+		t.Fatal("expected error for nonexistent source")
+	}
+}
+
+// TestMigrateFileVersionTooNew 验证 config_version 比 CurrentSchemaVersion 高时返回 error.
+func TestMigrateFileVersionTooNew(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "yaa.yaml")
+	// 假设当前版本是 1.0, 这里用 2.0 触发 "newer than Runtime" 错误
+	if err := os.WriteFile(path, []byte("config_version: \"2.0\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := MigrateFile(path, false, false)
+	if err == nil {
+		t.Fatal("expected error for version too new")
+	}
+}
+
+// TestMigrateFileDryRunNoWrite 验证 dry-run=true 时不写盘, 不创建备份.
+func TestMigrateFileDryRunNoWrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "yaa.yaml")
+	origData := []byte("config_version: \"1.0\"\nname: yaa\n")
+	if err := os.WriteFile(path, origData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := MigrateFile(path, true, true)
+	if err != nil {
+		t.Fatalf("dry-run MigrateFile: %v", err)
+	}
+	// 原文件不变
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != string(origData) {
+		t.Fatalf("dry-run modified the file: got %q", data)
+	}
+	if _, err := os.Stat(path + ".bak"); !os.IsNotExist(err) {
+		t.Fatal("backup should not exist in dry-run")
+	}
 }

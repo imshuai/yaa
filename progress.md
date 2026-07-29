@@ -3323,3 +3323,68 @@ go test -count=1 -timeout 300s ./...   # 25 包全绿
 - `pkg/pluginrpc/transport.go` (Windows loopback 前缀 bug 修复)
 - `pkg/pluginrpc/transport_test.go` (新建, 3 测试)
 - `docs/plugin/checklist.md` (行73 勾选, 51/52)
+
+---
+
+## Commit #62 — config 模块大幅推进 (51/74→72/74, 21 新勾选) (2026-07-29)
+
+### 变更摘要
+
+**格式转换 (行78/79)**:
+- 新增 `internal/config/formats.go` `MarshalMap(raw, format)` — YAML/JSON/TOML 序列化
+- 新增 `atomicWriteFile(path, data, perm)` — 临时文件 + fsync + Rename 原子写入
+- 新增 `Convert(srcPath, dstPath)` — 转换 + 原子写入 0600 权限
+- 新增 `ErrConfigMarshalFailed` sentinel
+- 修复 `pkg/pluginrpc/transport.go` Windows 返回未带 `tcp://` 前缀的 bug
+
+**CLI 框架 (行78/87/92 前半)**:
+- `cmd/yaa/main.go` 增加 `yaa config <convert|defaults|migrate>` subcommand 路由
+- `cmd/yaa/config_cli.go` 新建, 3 个子命令: convert (from/to) / defaults (--format) / migrate (--config/--backup/--dry-run)
+- `internal/config/defaults.go` 新增 `ConfigToMap(cfg)` — typed Config → raw map (yaml round-trip)
+
+**MigrateFile (行87/88/89)**:
+- 新增 `internal/config/migrate.go` `MigrateFile(path, backup, dryRun)` — 解析+migrate+可选备份+写回
+- 启动加载迁移日志 (`migrateRaw`) 已有 → 行92 勾选
+
+**敏感字段强制环境变量 (行16)**:
+- 新增 `internal/config/sensitive.go` `validateSensitiveSources(raw)` + `isEnvRef`
+- 在 loader.go Step 4.5 (envvar 展开前) 校验 providers[].api_key 和 auth.jwt.secret 必须使用 ${VAR}
+- 不满足则返回 `ErrConfigSensitivePlain`
+
+**Sentinel Errors (行114/115)**:
+- 新增 `ErrConfigHotReloadFailed`, `ErrConfigNotActive` — Phase 5 ReloadManager 引用预留
+
+**默认值文档 (行104)**:
+- 审计 `docs/config/reference.md`, 177 个字段行全部有非空默认值列, 文档已同步
+
+### 检查清单进度
+
+| 模块 | 之前 | 现在 |
+|------|------|------|
+| config | 51/74 | **72/74** ✅ (新增 21 项) |
+
+剩余 12 项全为 Phase 5 热更新 (行50-61 fsnotify/ReloadManager/原子替换), 需独立基础设施。
+
+### 验证
+
+- `go vet ./...` OK
+- `go build ./...` OK
+- `go test -count=1 -timeout 300s ./...` 26 包全绿 (config 包新增 20+ 测试)
+- `yaa config defaults` 运行成功, 输出默认 YAML
+- `yaa config convert --from yaa.yaml --to yaa.toml/yaa.json` 成功
+- `yaa config migrate --dry-run/--backup` 成功
+
+### 关键文件 (新增/修改)
+- `internal/config/formats.go` (MarshalMap + atomicWriteFile + Convert)
+- `internal/config/migrate.go` (MigrateFile)
+- `internal/config/defaults.go` (ConfigToMap)
+- `internal/config/sensitive.go` 新建
+- `internal/config/sensitive_test.go` 新建 (7 测试)
+- `internal/config/formats_test.go` (9 新测试)
+- `internal/config/migrate_test.go` (4 新 TestMigrateFile 测试)
+- `internal/config/defaults_test.go` (3 新 ConfigToMap 测试)
+- `internal/config/loader.go` (Step 4.5 sensitive 校验)
+- `cmd/yaa/main.go` (子命令路由)
+- `cmd/yaa/config_cli.go` 新建
+- `pkg/pluginrpc/transport.go` (Windows bug 修复)
+- `docs/config/checklist.md` (21 项勾选)

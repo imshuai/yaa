@@ -15,6 +15,11 @@ import (
 )
 
 func main() {
+	// 子命令路由: yaa config <convert|defaults|migrate>
+	if len(os.Args) > 1 && os.Args[1] == "config" {
+		os.Exit(runConfigCLI(os.Args[2:]))
+	}
+
 	configPath := flag.String("config", "", "配置文件路径")
 	flag.Parse()
 

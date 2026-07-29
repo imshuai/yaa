@@ -106,3 +106,92 @@ func ParseFileToMap(path string) (map[string]any, error) {
 	}
 	return ParseToMap(data, format)
 }
+
+// MarshalMap 将 raw map 序列化为指定格式. docs/config/formats.md §4.
+// TOML 无法表达 null — 遇到会返回明确错误, 不静默删除.
+func MarshalMap(raw map[string]any, format Format) ([]byte, error) {
+	switch format {
+	case FormatYAML:
+		data, err := yaml.Marshal(raw)
+		if err != nil {
+			return nil, fmt.Errorf("marshal yaml: %w", err)
+		}
+		return data, nil
+	case FormatJSON:
+		// JSON 保留 key 顺序使用 json.MarshalIndent
+		data, err := json.MarshalIndent(raw, "", "  ")
+		if err != nil {
+			return nil, fmt.Errorf("marshal json: %w", err)
+		}
+		return append(data, '\n'), nil
+	case FormatTOML:
+		buf := &bytes.Buffer{}
+		if err := toml.NewEncoder(buf).Encode(raw); err != nil {
+			return nil, fmt.Errorf("marshal toml: %w", err)
+		}
+		return buf.Bytes(), nil
+	default:
+		return nil, fmt.Errorf("%w: %s", ErrConfigFormatUnsupported, format)
+	}
+}
+
+// ErrConfigMarshalFailed 表示配置序列化失败.
+var ErrConfigMarshalFailed = errors.New("config: marshal failed")
+
+// atomicWriteFile 原子写入文件: 写临时文件 → fsync → Rename 替换.
+// docs/config/formats.md §4: 目标文件权限固定为 perm.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	tmp, err := os.CreateTemp(dir, ".yaa-convert-*")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	// 失败路径: 清理临时文件
+	cleanup := func() { _ = os.Remove(tmpPath) }
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		cleanup()
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		cleanup()
+		return fmt.Errorf("sync temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if err := os.Chmod(tmpPath, perm); err != nil {
+		cleanup()
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		cleanup()
+		return fmt.Errorf("rename temp file: %w", err)
+	}
+	return nil
+}
+
+// Convert 转换配置文件格式. docs/config/formats.md §4.
+// 不做环境变量展开, 不输出 Effective Config, 避免 Secret 展开后写入磁盘.
+// 转换前可选 schema 校验 (由 caller 决定, Convert 本身只做格式转换).
+func Convert(srcPath, dstPath string) error {
+	raw, err := ParseFileToMap(srcPath)
+	if err != nil {
+		return err
+	}
+	dstFormat, err := DetectFormat(dstPath)
+	if err != nil {
+		return err
+	}
+	data, err := MarshalMap(raw, dstFormat)
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(dstPath, data, 0o600)
+}
