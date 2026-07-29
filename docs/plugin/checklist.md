@@ -8,7 +8,7 @@
 ## 协议与 Manifest
 
 - [x] 文档阶段只以 [interface.md](interface.md) 内嵌 proto 为权威；实现时原样落到 `api/plugin/v1/plugin.proto` 并切换唯一 wire authority
-- [ ] 生成 `pkg/pluginrpc/gen`，生成文件不手工修改；CI 校验 proto、生成物和保留镜像一致
+- [x] 生成 `pkg/pluginrpc/gen`，生成文件不手工修改；CI 校验 proto、生成物和保留镜像一致
 - [x] RPC major v1 只接受 `protocol_version: "1"`
 - [x] Manifest 完整字段和严格未知字段校验
 - [x] `provides[]` 只接受 `tool`，且 name/description/schema 必填
