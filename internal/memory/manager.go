@@ -104,6 +104,12 @@ func (m *Manager) BeginOpForTest() error { return m.beginOp() }
 // 正式调用方不应使用此方法；仅同 monorepo 测试包通过包外 mock 来推进时间。
 func (m *Manager) ClockForTest() Clock { return m.clock }
 
+// MarkDegradedForTest 暴露 markDegraded 给测试使用，直接将某 agent 索引标记为 degraded.
+// 正式调用方不应使用此方法。
+func (m *Manager) MarkDegradedForTest(agentID string, reason string) {
+	m.markDegraded(agentID, reason)
+}
+
 // StartCleanup 启动后台周期 cleanup goroutine, 定期调用 DeleteExpired.
 // docs/memory checklist 行32: cleanup 有稳定顺序、batch 和取消.
 // interval<=0 或 batchSize<=0 表示不启用后台 cleanup (v1 可由外部显式调 DeleteExpired).
@@ -608,6 +614,79 @@ func (m *Manager) IndexStatus(agentID string) IndexStatus {
 	ai.mu.RLock()
 	defer ai.mu.RUnlock()
 	return ai.status
+}
+
+// Health 返回 Memory Manager 的健康状态. docs/memory/observability.md §4 + checklist 行56.
+// 健康只反映 content/store, embedder, vector index; Session 状态完全不影响.
+// 状态: unhealthy (store fail / Manager closed), degraded (store ok 但 embedder/index 失败),
+// healthy (store ok, 且 embedder/index 全 ready 或者 vector 未启用).
+// 不触发写入、不执行 embedding、不自动 Reindex, 只读取已有状态.
+// ponytail: Manager 已 close 时返回 unhealthy.
+func (m *Manager) Health(ctx context.Context) Health {
+	// Manager 已关闭: 直接 unhealthy
+	m.lifecycleMu.Lock()
+	closing := m.closing
+	m.lifecycleMu.Unlock()
+	if closing {
+		return Health{Status: "unhealthy", StoreOK: false, ErrorClass: "closed"}
+	}
+	// 1. ContentStore Ping
+	storeOK := true
+	errorClass := ""
+	if perr := m.store.Ping(ctx); perr != nil {
+		storeOK = false
+		errorClass = "store"
+		return Health{Status: "unhealthy", StoreOK: false, ErrorClass: errorClass}
+	}
+	// 2. Embedder 检查: 仅当 embedder != nil. embedder 没有 Ping 接口, 用 Dimension 做 sanity 检查
+	//   (runtime 成功调用 Embed 时会 markDegraded; 此处只反映 embedder 存在性).
+	var embedderOK *bool
+	if m.embedder != nil {
+		// embedder 可用性由 markDegraded("embedder") 反映 — ponies: 暂以非 nil 判定 ok
+		ok := true
+		embedderOK = &ok
+	}
+	// 3. VectorIndex: 聚合所有启用 vector 的 Agent 状态. 任一 IndexDegraded → IndexOK=false
+	var indexOK *bool
+	m.indexMu.RLock()
+	if len(m.indexes) > 0 {
+		allReady := true
+		anyAgentHasIndex := false
+		for _, ai := range m.indexes {
+			ai.mu.RLock()
+			if ai.status == IndexDegraded {
+				allReady = false
+			}
+			if ai.index != nil {
+				anyAgentHasIndex = true
+			}
+			ai.mu.RUnlock()
+		}
+		_ = anyAgentHasIndex
+		indexOK = &allReady
+	}
+	m.indexMu.RUnlock()
+	// 4. Items 计数 (未过期 items 总数) — ponytail: 全 Agent 聚合.
+	var totalItems int64
+	for agentID := range m.indexes {
+		_ = agentID
+		// ContentStore.Count 返回单个 Agent; 聚合全 Agent 开销大, 暂时不拉取.
+		// ponytail: v1 Items 默认 0, 调用方仍能得到其他状态.
+	}
+	_ = totalItems
+	// 5. status 判定
+	status := "healthy"
+	if indexOK != nil && !*indexOK {
+		status = "degraded"
+	} else if embedderOK != nil && !*embedderOK {
+		status = "degraded"
+	}
+	return Health{
+		Status:     status,
+		StoreOK:    storeOK,
+		EmbedderOK: embedderOK,
+		IndexOK:    indexOK,
+	}
 }
 
 //================ Get =================

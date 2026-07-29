@@ -53,7 +53,7 @@
 - [ ] Agent turn 显式复用同一 policy；Remote 每请求、cleanup 每 tick各捕获一个 Config snapshot。
 - [x] Remote 仅 request deadline 映射 504；client cancel 不写响应，quota/closed 分别映射 429/503。
 - [x] 事件只使用 canonical 8 种名称；指标统一 `yaa_memory_*` 且无高基数/敏感 label。
-- [ ] 健康只反映 content/embedder/index，不根据 Session 状态判断。
+- [x] 健康只反映 content/embedder/index，不根据 Session 状态判断。
 
 ## 文档门禁
 

@@ -113,3 +113,16 @@ const (
 	MaxSearchLimit = 100
 	MaxDeleteExpiredLimit = 10000
 )
+
+// Health 是 Memory Manager 的健康状态. docs/memory/observability.md §4.
+// 健康只反映 content/embedder/index, 不根据 Session 状态判断.
+// Status: healthy / degraded / unhealthy.
+type Health struct {
+	Status      string     `json:"status"`
+	StoreOK     bool       `json:"store_ok"`
+	EmbedderOK  *bool      `json:"embedder_ok,omitempty"`
+	IndexOK     *bool      `json:"index_ok,omitempty"`
+	Items       int64      `json:"items"`
+	LastErrorAt *time.Time `json:"last_error_at,omitempty"`
+	ErrorClass  string     `json:"error_class,omitempty"`
+}

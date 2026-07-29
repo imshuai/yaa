@@ -3532,3 +3532,37 @@ go test -count=1 -timeout 300s ./...   # 25 包全绿
 - `internal/context/metrics.go` 新建 (11 指标 + nil-safe helpers)
 - `internal/context/manager_test.go` (6 新测试: hybrid 3 + metrics 1 + estimateFail 1 + UTF8 1 + alias 1 + timeout 1 → 总共 7 新)
 - `docs/context/checklist.md` (14 项勾选)
+
+---
+
+## #66 — Memory Health 健康 API + MarkDegradedForTest (memory 36→37/39)
+
+### 完成内容
+- `internal/memory/types.go`: 新增 `Health` struct (Status/StoreOK/EmbedderOK/IndexOK/Items/LastErrorAt/ErrorClass)
+- `internal/memory/manager.go`: 
+  - 新增 `Health(ctx) Health` 函数: 聚合 ContentStore.Ping + embedder 非 nil + 全 Agent IndexStatus
+  - 状态: closed → unhealthy/closed; store fail → unhealthy/store; index degraded → degraded; 其余 → healthy
+  - Items 暂 0 (ponytail: v1 聚合全 Agent Count 开销大); LastErrorAt 暂 nil
+  - 新增 `MarkDegradedForTest` 导出 helper (与既有 BeginOpForTest/ClockForTest 风格一致)
+- `internal/memory_test/health_test.go` 新建: 6 个测试
+  - TestHealthStoreOKNoVector / StoreOKWithEmbedderNoIndex / Closed / StorePingFail / IndexDegraded / IndexReady
+  - 用 brokenPingStore (嵌入 memstore.Store 转发 + 覆盖 Ping) + fakeEmbedder 满足接口
+- `docs/memory/checklist.md` 行56 勾选 (健康只反映 content/embedder/index)
+
+### 检查清单进度
+| 模块 | 之前 | 现在 |
+|------|------|------|
+| memory | 36/39 | **37/39** (+1) |
+
+剩 2 项: 行52/53 hot/restart (Phase 5)
+
+### 验证
+- go vet ./... OK
+- go build ./... OK
+- go test -count=1 -timeout 300s ./... 25 包全绿 (无 flaky)
+
+### 关键文件
+- `internal/memory/types.go` (Health struct)
+- `internal/memory/manager.go` (Health + MarkDegradedForTest)
+- `internal/memory_test/health_test.go` 新建
+- `docs/memory/checklist.md` (行56)
