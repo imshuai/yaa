@@ -2,6 +2,12 @@
 package plugin
 
 import (
+	"context"
+	"errors"
+	"os"
+	"os/exec"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -44,14 +50,13 @@ type PluginDescriptor struct {
 }
 
 // DiscoveryDiagnostic 记录发现阶段的错误.
-// docs/plugin/loader.md §2.
 type DiscoveryDiagnostic struct {
 	PluginID   string            // 无法恢复 ID 时为空
 	Descriptor *PluginDescriptor // 已解析出 ID 时保留部分 Descriptor
 	Err        error             // 始终非 nil
 }
 
-func (d DiscoveryDiagnostic) Error() string { return d.Err.Error() }
+func (d DiscoveryDiagnostic) Error() string  { return d.Err.Error() }
 func (d DiscoveryDiagnostic) Unwrap() error { return d.Err }
 
 // PluginState 是 Plugin 的运行时状态. docs/plugin/manager.md §1.
@@ -67,18 +72,10 @@ const (
 
 // HealthStatus 是 Plugin Health RPC 的响应映射.
 // docs/plugin/interface.md §5: healthy/degraded/unhealthy/unknown.
-// docs/plugin/observability.md §2: manager.md Entry.Health 用 struct.
 type HealthStatus struct {
 	Level     string    `json:"level"` // healthy | degraded | unhealthy | unknown
 	Message   string    `json:"message"`
 	Timestamp time.Time `json:"timestamp"`
-}
-
-// HealthResponse 是 Health RPC 的响应.
-type HealthResponse struct {
-	Level     string    // healthy | degraded | unhealthy
-	Message   string
-	Timestamp time.Time
 }
 
 // 健康级别常量, docs/plugin/interface.md §5.
@@ -88,6 +85,13 @@ const (
 	HealthLevelUnhealthy = "unhealthy"
 	HealthLevelUnknown   = "unknown"
 )
+
+// HealthResponse 是 Health RPC 的响应.
+type HealthResponse struct {
+	Level     string    // healthy | degraded | unhealthy
+	Message   string
+	Timestamp time.Time
+}
 
 // ReadyResponse 是 Ready RPC 的响应, 包含能力列表.
 type ReadyResponse struct {
@@ -114,12 +118,132 @@ type ToolResponse struct {
 }
 
 // Entry 是 Manager 侧的单个 Plugin 条目. docs/plugin/manager.md §1.
+// ponytail: Client/Handle/ProxyNames 在 RPC 启动后填充, 当前 MVP 阶段先占位.
 type Entry struct {
 	Descriptor PluginDescriptor
+	Client     *RPCClient
+	Handle     *ProxyHandle
+	ProxyNames []string
 	State      PluginState
 	Health     HealthStatus
 	Config     map[string]any
 	Enabled    *bool
 	StartedAt  time.Time
 	LastError  error
+}
+
+// pluginRPCInterface 是 plugin RPC transport 的最小生命周期抽象.
+// docs/plugin/loader.md §3 pluginRPC interface.
+// 与 pkg/pluginrpc.Client adapter 形状一致; 测试 mock 也可实现该 interface.
+type pluginRPCInterface interface {
+	Handshake(ctx context.Context, protocolVersion, expectedPluginID string) (HandshakeResponse, error)
+	Init(ctx context.Context, cfg map[string]any) error
+	Ready(ctx context.Context) (ReadyResponse, error)
+	Health(ctx context.Context) (HealthResponse, error)
+	Stop(ctx context.Context) error
+	InvokeTool(ctx context.Context, req ToolRequest) (ToolResponse, error)
+	Close() error
+}
+
+// RPCClient 持有 pluginRPC transport、已启动进程和 endpoint cleanup.
+// docs/plugin/loader.md §3: cmd.Start 成功后唯一 cmd.Wait owner.
+type RPCClient struct {
+	rpc          pluginRPCInterface
+	cmd          *exec.Cmd
+	Exited       <-chan struct{}
+	Capabilities []CapabilityDescriptor
+	cleanup      func()
+
+	waitErr     error
+	closeOnce   sync.Once
+	closeErr    error
+	cleanupOnce sync.Once
+}
+
+// WaitErr 阻塞至 Exited 关闭并返回进程 Wait 结果.
+func (c *RPCClient) WaitErr() error {
+	<-c.Exited
+	return c.waitErr
+}
+
+// CloseTransport 幂等关闭 RPC transport.
+func (c *RPCClient) CloseTransport() error {
+	c.closeOnce.Do(func() {
+		if c.rpc != nil {
+			c.closeErr = c.rpc.Close()
+		}
+	})
+	return c.closeErr
+}
+
+// Health 转发 RPC Health 调用 (零值 RPCClient 也安全 — rpc nil 会 panic, 但只用于已发布 Client).
+func (c *RPCClient) Health(ctx context.Context) (HealthResponse, error) {
+	return c.rpc.Health(ctx)
+}
+
+// Stop 转发 RPC Stop 调用.
+func (c *RPCClient) Stop(ctx context.Context) error {
+	return c.rpc.Stop(ctx)
+}
+
+// InvokeTool 转发 RPC InvokeTool 调用.
+func (c *RPCClient) InvokeTool(ctx context.Context, req ToolRequest) (ToolResponse, error) {
+	return c.rpc.InvokeTool(ctx, req)
+}
+
+// CleanupEndpoint 幂等清理 endpoint 资源.
+func (c *RPCClient) CleanupEndpoint() {
+	c.cleanupOnce.Do(func() {
+		if c.cleanup != nil {
+			c.cleanup()
+		}
+	})
+}
+
+// KillAndWait Kill 子进程并等待 Exited channel 关闭.
+func (c *RPCClient) KillAndWait() error {
+	var killErr error
+	if c.cmd != nil && c.cmd.Process != nil {
+		if err := c.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			killErr = err
+		}
+	}
+	if c.Exited != nil {
+		<-c.Exited
+	}
+	return killErr
+}
+
+// Terminate 幂等全量回收: CloseTransport → KillAndWait → CleanupEndpoint.
+// docs/plugin/loader.md §3.
+func (c *RPCClient) Terminate() error {
+	transportErr := c.CloseTransport()
+	killErr := c.KillAndWait()
+	c.CleanupEndpoint()
+	return errors.Join(transportErr, killErr)
+}
+
+// ProxyHandle 是 Plugin 与 Tool proxy 的句柄, 原子持有当前 *RPCClient.
+// docs/plugin/manager.md §1.
+type ProxyHandle struct {
+	client atomic.Pointer[RPCClient]
+}
+
+// Load 返回当前 *RPCClient; nil → ErrPluginUnavailable.
+func (h *ProxyHandle) Load() (*RPCClient, error) {
+	c := h.client.Load()
+	if c == nil {
+		return nil, ErrPluginUnavailable
+	}
+	return c, nil
+}
+
+// Store 设置当前 *RPCClient (传 nil → unavailable).
+func (h *ProxyHandle) Store(c *RPCClient) {
+	h.client.Store(c)
+}
+
+// Invalidate CAS 把指定 *RPCClient 换 nil; 成功表示该调用方负责后续回收.
+func (h *ProxyHandle) Invalidate(c *RPCClient) bool {
+	return h.client.CompareAndSwap(c, nil)
 }
