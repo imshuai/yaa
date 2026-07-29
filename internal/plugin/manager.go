@@ -18,8 +18,6 @@ import (
 
 // Manager 管理 Plugin 发现、依赖图、启用决策和生命周期.
 // docs/plugin/manager.md §1.
-// ponytail: Client/Handle/ProxyNames/monitor/teardown 等 RPC 相关字段后续补,
-// 当前只实现发现结果合并 + 配置 entries 合并 + 依赖图 + enabled 决策.
 type Manager struct {
 	loader               *Loader
 	tools                *tool.Manager
@@ -34,6 +32,7 @@ type Manager struct {
 	mu                   sync.RWMutex
 	logger               *slog.Logger
 	wg                   sync.WaitGroup
+	metrics              *pluginMetrics // nil → nop; docs/plugin/observability.md §3
 	stopOnce             sync.Once
 	stopDone             chan struct{}
 	stopErr              error
@@ -256,14 +255,20 @@ func (m *Manager) StartAll() StartupReport {
 		e.State = StateStarting
 		m.mu.Unlock()
 		startCtx, cancel := context.WithTimeout(m.runCtx, m.config.StartupTimeout)
+		startBegin := time.Now()
 		client, err := m.loader.Start(startCtx, e.Descriptor, e.Config)
 		cancel()
+		startDurSec := time.Since(startBegin).Seconds()
+		m.metrics.startDurationObserve(id, startDurSec)
 		if err != nil {
+			m.metrics.startInc(id, "failed")
+			m.metrics.errorInc(id, "startup")
 			m.fail(e, err)
 			report.Diagnostics = append(report.Diagnostics, err)
 			report.FailedIDs = append(report.FailedIDs, id)
 			continue
 		}
+		m.metrics.startInc(id, "ok")
 
 		handle, names, rollback, err := m.registerProxies(e, client)
 		if err != nil {
@@ -291,9 +296,23 @@ func (m *Manager) StartAll() StartupReport {
 		m.wg.Add(1)          // monitor goroutine
 		m.mu.Unlock()
 		m.lifecycleMu.Unlock()
+		m.metrics.activeSet(m.countReady())
 		go m.monitor(e)
 	}
 	return finish()
+}
+
+// countReady 返回当前 State==Ready 的 plugin 数.
+func (m *Manager) countReady() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	n := 0
+	for _, e := range m.entries {
+		if e.State == StateReady {
+			n++
+		}
+	}
+	return n
 }
 
 // registerProxies 事务化注册 Tool proxy.

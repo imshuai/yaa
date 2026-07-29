@@ -73,12 +73,16 @@ func (a *rpcAdapter) InvokeTool(ctx context.Context, req ToolRequest) (ToolRespo
 		return ToolResponse{}, fmt.Errorf("InvokeTool args: %w", err)
 	}
 	out, err := a.c.InvokeTool(ctx, &pluginv1.ToolRequest{
+		RequestId: req.RequestID,
+		AgentId:   req.AgentID,
+		SessionId: req.SessionID,
 		Name:      req.Name,
 		Arguments: args,
 	})
 	if err != nil {
 		return ToolResponse{}, err
 	}
+	resp := ToolResponse{RequestID: out.GetRequestId()}
 	if res := out.GetResult(); res != nil {
 		m := map[string]any{
 			"content":  res.GetContent(),
@@ -87,13 +91,34 @@ func (a *rpcAdapter) InvokeTool(ctx context.Context, req ToolRequest) (ToolRespo
 		if meta := res.GetMeta(); meta != nil {
 			m["meta"] = meta.AsMap()
 		}
-		return ToolResponse{Result: m}, nil
+		resp.Result = m
+		return resp, nil
 	}
 	if e := out.GetError(); e != nil {
-		return ToolResponse{}, fmt.Errorf("plugin tool error: code=%v msg=%q retryable=%v",
-			e.GetCode(), e.GetMessage(), e.GetRetryable())
+		resp.Error = &ToolError{
+			Code:      toolErrorString(e.GetCode()),
+			Message:   e.GetMessage(),
+			Retryable: e.GetRetryable(),
+		}
+		return resp, nil
 	}
-	return ToolResponse{}, nil
+	return resp, ErrPluginProtocolIncompatible
+}
+
+// toolErrorString 把 gen ToolErrorCode enum 映射为稳定字符串.
+func toolErrorString(c pluginv1.ToolErrorCode) string {
+	switch c {
+	case pluginv1.ToolErrorCode_TOOL_ERROR_CODE_INVALID_ARGUMENT:
+		return "INVALID_ARGUMENT"
+	case pluginv1.ToolErrorCode_TOOL_ERROR_CODE_TIMEOUT:
+		return "TIMEOUT"
+	case pluginv1.ToolErrorCode_TOOL_ERROR_CODE_UNAVAILABLE:
+		return "UNAVAILABLE"
+	case pluginv1.ToolErrorCode_TOOL_ERROR_CODE_INTERNAL:
+		return "INTERNAL"
+	default:
+		return "UNSPECIFIED"
+	}
 }
 
 func (a *rpcAdapter) Close() error { return a.c.Close() }

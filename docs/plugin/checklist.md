@@ -28,7 +28,7 @@
 - [x] Handshake request 使用 `runtime_protocol`/`expected_plugin_id`；response 的 `protocol_version`/`plugin_id`/`plugin_version`/`startup_nonce` 全部与冻结 Descriptor 和启动 nonce 一致
 - [x] Start 依次执行 exec/Dial/Handshake/Init/Ready
 - [x] 每个 `cmd.Start` 成功路径恰有一个 `cmd.Wait` owner；失败统一 Terminate + endpoint cleanup
-- [ ] 无法解析 ID 的错误只进 diagnostics；已知 ID 的错误建立 error Entry
+- [x] 无法解析 ID 的错误只进 diagnostics；已知 ID 的错误建立 error Entry
 - [x] 重复 ID 全部拒绝，不按路径顺序覆盖
 - [x] `RPCClient` 私有持有 transport/process/endpoint；外部只用 Health/Stop/InvokeTool 转发和幂等生命周期方法
 
@@ -55,21 +55,21 @@
 
 - [x] `startup_timeout` 覆盖 exec 到 Ready
 - [x] `stop_timeout` 覆盖 Stop 到 Wait
-- [ ] `health_interval` / `health_timeout` 生效
+- [x] `health_interval` / `health_timeout` 生效
 - [x] `restart.enabled/max_attempts/backoff` 只用于运行中 unexpected exit
 - [ ] 所有 `plugins.*` 变更返回 restart_required，不热加载
-- [ ] v1 不实现远程 endpoint、动态库、下载/安装或签名信任库
-- [ ] Plugin 不接收 Runtime 指针、Manager、数据库连接或 internal Go object
+- [x] v1 不实现远程 endpoint、动态库、下载/安装或签名信任库
+- [x] Plugin 不接收 Runtime 指针、Manager、数据库连接或 internal Go object
 
 ## 集成与验证
 
-- [ ] Tool Proxy 保留 AgentID/SessionID scope、request ID、deadline、取消和错误码
-- [ ] 错 ID、非法 outcome、`UNSPECIFIED`/未知 enum 原子 invalidate 当前 handle，并由 `RPCClient.Terminate()` 回收
-- [ ] Agent/RBAC/配额在跨进程前执行，Plugin 不能绕过
-- [ ] Secret 不进入日志、错误、Health、指标或 API
-- [ ] 指标名称与 [observability.md](observability.md) 唯一表一致
-- [ ] 当前不宣称 Plugin Remote API、SSE endpoint 或未登记 Tool
-- [ ] 单元测试覆盖 Manifest/config schema/依赖图/能力冲突
+- [x] Tool Proxy 保留 AgentID/SessionID scope、request ID、deadline、取消和错误码
+- [x] 错 ID、非法 outcome、`UNSPECIFIED`/未知 enum 原子 invalidate 当前 handle，并由 `RPCClient.Terminate()` 回收
+- [x] Agent/RBAC/配额在跨进程前执行，Plugin 不能绕过
+- [x] Secret 不进入日志、错误、Health、指标或 API
+- [x] 指标名称与 [observability.md](observability.md) 唯一表一致
+- [x] 当前不宣称 Plugin Remote API、SSE endpoint 或未登记 Tool
+- [x] 单元测试覆盖 Manifest/config schema/依赖图/能力冲突
 - [ ] 集成测试覆盖启动失败、unexpected exit/restart、Stop timeout 和 Windows loopback
 
 ---

@@ -52,6 +52,15 @@ func (m *Manager) monitor(e *Entry) {
 				"protocol_version", e.Descriptor.Manifest.ProtocolVersion,
 				"kind", "unexpected",
 			)
+			// metrics: 进程退出 + unexpected 错误
+			exitCode := "unknown"
+			if exitErr == nil {
+				exitCode = "0"
+			} else {
+				exitCode = "non-zero"
+			}
+			m.metrics.processExitInc(e.Descriptor.Manifest.ID, exitCode)
+			m.metrics.errorInc(e.Descriptor.Manifest.ID, "unexpected_exit")
 			// 2. 失效 Proxy - in-flight 立即 ErrPluginUnavailable.
 			m.mu.Lock()
 			if e.Handle != nil {
@@ -82,8 +91,15 @@ func (m *Manager) monitor(e *Entry) {
 		case <-ticker.C:
 			// Health 调用 - 带 timeout. 失败只标 degraded, 不 kill.
 			ctx, cancel := context.WithTimeout(m.runCtx, healthTimeout)
+			hBegin := time.Now()
 			h, err := client.Health(ctx)
 			cancel()
+			m.metrics.rpcDurationObserve(e.Descriptor.Manifest.ID, "Health", time.Since(hBegin).Seconds())
+			if err != nil {
+				m.metrics.rpcInc(e.Descriptor.Manifest.ID, "Health", "failed")
+			} else {
+				m.metrics.rpcInc(e.Descriptor.Manifest.ID, "Health", "ok")
+			}
 			m.mu.Lock()
 			if err != nil {
 				if e.Health.Level != HealthLevelUnhealthy {
@@ -157,6 +173,7 @@ func (m *Manager) retryRestart(e *Entry, oldClient *RPCClient) bool {
 		newClient, err := m.loader.Start(startCtx, e.Descriptor, e.Config)
 		cancel()
 		if err != nil {
+			m.metrics.errorInc(e.Descriptor.Manifest.ID, "restart")
 			m.logger.Error("plugin.restart_failed",
 				err,
 				"plugin_id", e.Descriptor.Manifest.ID,
@@ -186,6 +203,7 @@ func (m *Manager) retryRestart(e *Entry, oldClient *RPCClient) bool {
 		e.LastError = nil
 		m.mu.Unlock()
 		m.lifecycleMu.Unlock()
+		m.metrics.activeSet(m.countReady())
 		m.logger.Info("plugin.ready",
 			"plugin_id", e.Descriptor.Manifest.ID,
 			"version", e.Descriptor.Manifest.Version,

@@ -107,14 +107,30 @@ type HandshakeResponse struct {
 }
 
 // ToolRequest 是 InvokeTool RPC 的请求.
+// docs/plugin/interface.md §3: wire 上 ToolRequest 包含 plugin_id/request_id/agent_id/session_id/name/arguments.
+// ponytail: request_id 和 plugin_id 由调用方在 wire 构造时填, internal interface 不暴露 plugin_id (client 自己知道) 但传 request_id 用于精确回显.
 type ToolRequest struct {
-	Name string
-	Args map[string]any
+	Name      string
+	Args      map[string]any
+	AgentID   string
+	SessionID string
+	RequestID string
+}
+
+// ToolError 是 Plugin Tool 业务错误载荷.
+// docs/plugin/interface.md §3 ToolError + ToolErrorCode enum.
+type ToolError struct {
+	Code      string // INVALID_ARGUMENT / TIMEOUT / UNAVAILABLE / INTERNAL / UNSPECIFIED
+	Message   string
+	Retryable bool
 }
 
 // ToolResponse 是 InvokeTool RPC 的响应.
+// outcome 必须恰好有 result 或 error 之一.
 type ToolResponse struct {
-	Result map[string]any
+	RequestID string       // 必须精确回显请求 ID, 不一致 → ErrPluginProtocolIncompatible
+	Result    map[string]any // 成功结果 (含 content/is_error/meta)
+	Error     *ToolError     // 非 nil 时为业务错误分支
 }
 
 // Entry 是 Manager 侧的单个 Plugin 条目. docs/plugin/manager.md §1.
