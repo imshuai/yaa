@@ -3204,3 +3204,81 @@ go test -count=1 -timeout 300s ./...   # 25 包全绿
 - **Manager 启动/重启/关闭** (行39, 41-52): StartAll/monitor/StopAll + RPCClient/ProxyHandle/PluginToolProxy
 - **配置边界** (行56-60): startup/stop/health timeout + restart config 校验
 - **集成与验证** (行62-73): Tool Proxy/RBAC/Secret/指标/单元+集成测试
+
+---
+
+## #54-#58 Plugin RPC + Manager 启动 (2025-07-29)
+
+### 进度
+- `4e4e195` #54 — 落地 api/plugin/v1/plugin.proto (checklist 行10)
+- `262ed1a` #55 — 生成 pkg/pluginrpc/gen gRPC Go 代码 (checklist 行11)
+- `58dd29b` #56 — RPCClient/ProxyHandle/transport/client adapter (checklist 行33)
+- `1dab899` #57 — Loader.Start exec/Dial/Handshake/Init/Ready + adapter (checklist 行15/16/25-30, 23/52)
+- `b0dc275` #58 — StartAll/StopAll/monitor/PluginToolProxy (checklist 行39/41-44/48/50-52/56-57, 34/52)
+
+**plugin checklist 34/52 ✅** (剩 18 项)
+
+### 关键实现
+
+#### 依赖引入
+- `google.golang.org/grpc v1.56.3` + `google.golang.org/protobuf v1.31.0` (Go 1.20 兼容)
+- `github.com/golang/protobuf v1.5.4` + `google.golang.org/genproto v0.0.0-20230410155749-daa745c078e1`
+- `golang.org/x/sys v0.9.0 / x/net v0.11.0 / x/text v0.15.0`
+- protoc 3.12.4 (apt), protoc-gen-go v1.28.1, protoc-gen-go-grpc v1.2.0 (go install)
+
+#### api/plugin/v1/plugin.proto (108行)
+- PluginService: Handshake/Init/Ready/Health/Stop/InvokeTool
+- 8 message + 3 enum (CapabilityType/HealthLevel/ToolErrorCode)
+
+#### pkg/pluginrpc/gen (1689行 gen)
+- plugin.pb.go: 8 message + structs/enum
+- plugin_grpc.pb.go: PluginServiceClient/Server interface + UnaryHandler
+
+#### pkg/pluginrpc/{transport,client}.go (161行)
+- AllocateLocalEndpoint: Unix Socket 0700 / Windows TCP loopback
+- DialPlugin + Client (grpc.DialContext + insecure + WithContextDialer + WithBlock + Handshake/Init/Ready/Health/Stop/InvokeTool/Close)
+
+#### internal/plugin/types.go (扩, +144)
+- RPCClient (rpc/cmd/Exited/Capabilities/cleanup + CloseTransport/KillAndWait/Terminate/WaitErr 幂等)
+- ProxyHandle (atomic.Pointer[RPCClient] + Load/Store/Invalidate CAS)
+- pluginRPCInterface (Handshake/Init/Ready/Health/Stop/InvokeTool/Close interface)
+
+#### internal/plugin/adapter.go (142行)
+- rpcAdapter (*pluginrpc.Client → pluginRPCInterface, HealthLevel enum→string, ToolResult→Result map)
+
+#### internal/plugin/start.go (213行)
+- Start: validateDescriptor + validateConfigSchema + AllocateLocalEndpoint + newStartupNonce 32b + exec.Command (非 Context - 不杀进程) + Wait goroutine + Dial + Handshake 校验 (ProtocolVersion/PluginID/PluginVersion/StartupNonce constant-time compare) + Init + Ready + matchCapabilities + fail Terminate
+- filteredPluginEnv (YAA_SECRET_/YAA_PRIVATE_ 过滤)
+
+#### internal/plugin/proxy.go (80行)
+- PluginToolProxy 实现 tool.Tool: Name/Description/Parameters/Execute 转发到 InvokeTool RPC
+
+#### internal/plugin/manager.go (扩, +329)
+- StartAll: lifecycleMu + resolveDependencies + AutoStart=false→Stopped + requireReadyDependencies + State=Starting + Loader.Start + registerProxies 事务 + State=Ready + Setup handle.Store + go monitor
+- StartupReport (Diagnostics 来源 discovery + FailedIDs 去重排序)
+- registerProxies: PluginToolProxy → tools.RegisterWithSource("plugin") + rollback
+- StopAll: lifecycleMu + stopping=true + Proxy avail-nil + runCancel + async teardown
+- teardown: wg.Wait → entryIDsStartupReverse → for each: Stop timeout → Kill+Wait → CloseTransport → CleanupEndpoint → unregister Proxies → state=Stopped (errors.Join)
+- Done/WaitStopped
+
+#### internal/plugin/monitor.go (96行)
+- monitor goroutine: select Exited + health ticker + runCtx.Done; Exit → stopping? INFO : ERROR + Invalidate Proxy + CloseTransport + CleanupEndpoint + state=Error; Health timeout → degraded snapshot in mu
+
+### 测试
+- 总 42 测试全绿 (plugin 包 + mcp flaky 独跑过)
+- lifecycle_test.go: 4 (StartAll AutoStart=false/diagnostics + StopAll No-op/idempotent)
+- start_test.go: 9 (validate bad/missing config + nonce + env filter + dial fail Terminate + Handshake mismatch Terminate + schema)
+- rpc_test.go: 4 (RPCClient CloseTransport/Terminate 幂等 + ProxyHandle Load/Invalidate)
+- manager_test.go: 12 (NewManager merge + ResolveDep + effectiveEnabled + clonePluginConfig)
+- loader_test.go: 9 (NewLoader + Discover)
+- version_test.go: 16 + manifest_test.go: 9
+
+### 下一步 (剩 18 项)
+- **行22** NewManager 消费 typed diagnostics (基本已实现, 但 type 化 untyped)
+- **行45-47** restart 退避策略 (重试/原子替换/请求不 replay)
+- **行49** mu coverage 解释 + RPC/Wait/退避锁外
+- **行58** health_interval/timeout 真正生效 (已用, 但 doc 明确生效)
+- **行59** restart.* 只用于 unexpected exit (已部分实现)
+- **行60** plugins.* 全增 restart_required (Phase 5 ReloadManager)
+- **行66-71** Tool Proxy/RBAC/Secret/指标/Remote API 边界承诺
+- **行72-73** 单元/集成测试覆盖
