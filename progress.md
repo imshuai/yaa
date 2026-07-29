@@ -3635,3 +3635,28 @@ go test -count=1 -timeout 300s ./...   # 25 包全绿
 - `internal/config/reload_test.go` (+3 测试)
 - `docs/plugin/checklist.md` (行60)
 - `docs/skill/checklist.md` (行23)
+
+---
+
+## #69 — Context Phase 5 reload 集成测试 (context 39→40/40 ✅)
+
+### 完成内容
+已有 3 类测试确认: TestBuildEstimateFailsReturnsErrorRestore / TestBuildRespectsContextCancellation / TestBuildHybridSummaryTimeoutFallsBackToTruncate
+
+补 2 个 config reload 集成测试 internal/context/manager_test.go:
+- TestBuildUsesReloadedConfigSnapshot: BuildInput.Config 注入 mock reload 前/后值 (max_tokens=0 → 7000),
+  验证 EffectiveWindow/InputBudget 反映新 budget (10000 → 7000)
+- TestBuildEndToEndWithReloadManager: 完整 yaml+ReloadManager 流程, 改 context.max_tokens,
+  Reload→Current().Context 注入 Build, Build 结果反映新 EffectiveWindow=7000
+
+import 顺序整理 (合并 import 块 + 加 os import)
+
+检查清单: context 勾选行59 (39→40/40 ✅)
+
+### 验证
+- go vet/build OK
+- internal/context + internal/config + internal/tool/builtin 测试全绿
+
+### 关键文件
+- `internal/context/manager_test.go` (+2 集成测试)
+- `docs/context/checklist.md` (行59)

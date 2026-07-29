@@ -2,12 +2,13 @@ package context
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/imshuai/yaa/internal/config"
-	"encoding/json"
 	"github.com/imshuai/yaa/internal/metrics"
 	"github.com/imshuai/yaa/internal/provider"
 )
@@ -693,5 +694,125 @@ func TestBuildHybridSummaryTimeoutFallsBackToTruncate(t *testing.T) {
 	// truncate 应该把请求压入预算
 	if out.InputTokens > out.InputBudget {
 		t.Fatalf("expected input <= budget, got %d > %d", out.InputTokens, out.InputBudget)
+	}
+}
+
+// TestBuildUsesReloadedConfigSnapshot 覆盖 checklist 行59 的 "config reload 集成":
+// 上层每次 Build 从 reload 最新 snapshot 取 ContextConfig, hot-reload 改 max_tokens 反映到 budget.
+func TestBuildUsesReloadedConfigSnapshot(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager()
+	fp := newTestProvider(10000, 1000)
+	maxTokens := 1000
+	msgs := []provider.Message{{Role: "user", Content: "x"}}
+
+	// 初始 ContextConfig: MaxTokens=0 → budget.Input = window - reserved = 10000 - 4096 = 5904
+	cfgBefore := config.ContextConfig{MaxTokens: 0, ReservedTokens: 4096, Strategy: "truncate"}
+	outBefore, err := m.Build(ctx, BuildInput{
+		Provider: fp, Model: fp.model,
+		Request: provider.ChatRequest{Model: "test-model", MaxTokens: &maxTokens, Messages: msgs},
+		Config: cfgBefore,
+	})
+	if err != nil {
+		t.Fatalf("build before: %v", err)
+	}
+	if outBefore.EffectiveWindow != 10000 {
+		t.Fatalf("EffectiveWindow before reload = %d, want 10000 (cfg.MaxTokens=0 means use model window)", outBefore.EffectiveWindow)
+	}
+
+	// 模拟 reload: 上层从 ReloadManager.Current() 取最新 ContextConfig
+	// 注入 cfgAfter, MaxTokens=7000 → window=min(7000, 10000)=7000, Input=7000-4096=2904
+	cfgAfter := config.ContextConfig{MaxTokens: 7000, ReservedTokens: 4096, Strategy: "truncate"}
+	outAfter, err := m.Build(ctx, BuildInput{
+		Provider: fp, Model: fp.model,
+		Request: provider.ChatRequest{Model: "test-model", MaxTokens: &maxTokens, Messages: msgs},
+		Config: cfgAfter,
+	})
+	if err != nil {
+		t.Fatalf("build after: %v", err)
+	}
+	if outAfter.EffectiveWindow != 7000 {
+		t.Fatalf("after reload EffectiveWindow = %d, want 7000 (cfg.MaxTokens=7000)", outAfter.EffectiveWindow)
+	}
+	if outAfter.InputBudget != 2904 {
+		t.Fatalf("after reload InputBudget = %d, want 2904", outAfter.InputBudget)
+	}
+}
+
+// TestBuildEndToEndWithReloadManager 覆盖真实 ReloadManager 协作:
+// 构造临时 yaml → ReloadManager → Reload 改 context.max_tokens → 注入 BuildInput.Config → Build 反映新 budget.
+// 与 TestBuildUsesReloadedConfigSnapshot 不同, 这里走完整配置文件 reload 路径.
+func TestBuildEndToEndWithReloadManager(t *testing.T) {
+	dir := t.TempDir()
+	p := dir + "/yaa.yaml"
+	// 注意: ContextConfig 字段是 yaml "context:" 段
+	if err := os.WriteFile(p, []byte(`config_version: "1.0"
+runtime:
+  storage: {}
+  api: {http: {addr: "127.0.0.1:8080"}, ws: {}, sse: {}}
+  auth: {enabled: false}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := config.Load(p, nil)
+	if err != nil {
+		t.Fatalf("Load initial: %v", err)
+	}
+	rm, err := config.NewReloadManager(initial, p, nil, nil)
+	if err != nil {
+		t.Fatalf("NewReloadManager: %v", err)
+	}
+	if err := rm.Activate(); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+
+	m := NewManager()
+	fp := newTestProvider(10000, 1000)
+	maxTokens := 1000
+	msgs := []provider.Message{{Role: "user", Content: "x"}}
+	// 注入 initial.Context → EffectiveWindow = 10000 (Default MaxTokens=0)
+	outBefore, err := m.Build(context.Background(), BuildInput{
+		Provider: fp, Model: fp.model,
+		Request: provider.ChatRequest{Model: "test-model", MaxTokens: &maxTokens, Messages: msgs},
+		Config: rm.Current().Context,
+	})
+	if err != nil {
+		t.Fatalf("build before: %v", err)
+	}
+	if outBefore.EffectiveWindow != 10000 {
+		t.Fatalf("EffectiveWindow before reload = %d, want 10000", outBefore.EffectiveWindow)
+	}
+
+	// Reload: 改 context.max_tokens = 7000 (在 hot-reload allowlist)
+	if err := os.WriteFile(p, []byte(`config_version: "1.0"
+runtime:
+  storage: {}
+  api: {http: {addr: "127.0.0.1:8080"}, ws: {}, sse: {}}
+  auth: {enabled: false}
+context:
+  max_tokens: 7000
+  reserved_tokens: 4096
+  strategy: truncate
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := rm.Reload()
+	if err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if !result.Applied {
+		t.Fatalf("context.max_tokens change should apply (hot-reloadable), result=%+v", result)
+	}
+	// 用 reload 后的 Current() Context 作为下次 Build 的 Config
+	outAfter, err := m.Build(context.Background(), BuildInput{
+		Provider: fp, Model: fp.model,
+		Request: provider.ChatRequest{Model: "test-model", MaxTokens: &maxTokens, Messages: msgs},
+		Config: rm.Current().Context,
+	})
+	if err != nil {
+		t.Fatalf("build after: %v", err)
+	}
+	if outAfter.EffectiveWindow != 7000 {
+		t.Fatalf("EffectiveWindow after reload = %d, want 7000", outAfter.EffectiveWindow)
 	}
 }

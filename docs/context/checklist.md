@@ -56,7 +56,7 @@
 - [x] 指标名称和标签与 [observability.md](observability.md) 一致
 - [x] 指标不使用 session/request ID 高基数标签
 - [x] 预算边界、受保护超限、完整 Tool unit、摘要 fallback 有单元测试
-- [ ] Provider 估算失败、取消、timeout 和 config reload 有集成测试
+- [x] Provider 估算失败、取消、timeout 和 config reload 有集成测试
 - [x] 使用多语言/UTF-8、Tool schema 和 ReasoningContent 请求做回归测试
 - [x] safe/hashed alias 与 `specific` ToolChoice 的估算值覆盖真实 Provider wire
 
