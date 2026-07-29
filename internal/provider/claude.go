@@ -49,17 +49,7 @@ func (p *claudeProvider) Close() error { return nil }
 
 // EstimateInputTokens 估算 char/4 的粗略估算。Anthropic 没有 tokenizer，与 openai 共享启发。
 func (p *claudeProvider) EstimateInputTokens(ctx context.Context, req *ChatRequest) (int, error) {
-	if req == nil {
-		return 0, nil
-	}
-	total := 0
-	for _, m := range req.Messages {
-		total += len(m.Content) + len(m.ReasoningContent)
-		for _, tc := range m.ToolCalls {
-			total += len(tc.Function.Name) + len(tc.Function.Arguments)
-		}
-	}
-	return (total + 3) / 4, nil
+	return estimateTokensFromChars(estimateRequestChars(req)), nil
 }
 
 // anthropicReq 是 Anthropic Messages API 请求体（最小字段）。

@@ -144,6 +144,10 @@ func (m *Manager) Build(ctx stdctx.Context, in BuildInput) (*BuildOutput, error)
 func (m *Manager) truncate(ctx stdctx.Context, in BuildInput, units []messageUnit, budget Budget, strategy string, originalCount int, start time.Time) (*BuildOutput, error) {
 	truncated := 0
 	for {
+		// docs/context checklist 行48: ctx.Done 在循环截断中及时生效
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrContextBuildFailed, err)
+		}
 		// 找最旧的可删除 unit
 		idx := -1
 		for i, u := range units {

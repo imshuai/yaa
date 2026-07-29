@@ -52,22 +52,7 @@ func (p *openaiProvider) Close() error { return nil }
 // EstimateInputTokens 给出粗略估算（4 字符/token）。
 // ponytail: char/4 启发，足够 Context 截断决策；上界为模型 ContextWindow，见 ModelInfo。
 func (p *openaiProvider) EstimateInputTokens(ctx context.Context, req *ChatRequest) (int, error) {
-	if req == nil {
-		return 0, nil
-	}
-	total := 0
-	for _, m := range req.Messages {
-		total += len(m.Content) + len(m.ReasoningContent)
-		for _, tc := range m.ToolCalls {
-			total += len(tc.Function.Name) + len(tc.Function.Arguments)
-		}
-	}
-	for _, t := range req.Tools {
-		if t.Function.Parameters != nil {
-			total += len(t.Function.Parameters)
-		}
-	}
-	return (total + 3) / 4, nil
+	return estimateTokensFromChars(estimateRequestChars(req)), nil
 }
 
 func (p *openaiProvider) buildBody(req *ChatRequest, stream bool) ([]byte, error) {

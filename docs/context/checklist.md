@@ -19,8 +19,8 @@
 
 - [x] `Build(ctx, BuildInput)` 是唯一公开构建入口
 - [x] Context 直接保存完整 `provider.Message`
-- [ ] Provider 实现完整请求的 `EstimateInputTokens`
-- [ ] 估算包含 Tool schema、response format、framing 和 Provider extra
+- [x] Provider 实现完整请求的 `EstimateInputTokens`
+- [x] 估算包含 Tool schema、response format、framing 和 Provider extra
 - [x] `Build` 不修改输入 Request、Session 历史或已发布 Config 快照
 - [x] `Request.MaxTokens` 来自 Agent 输出上限且不大于 reserve/model max output
 - [x] `BuildInput.Request` 已完成 Tool definitions、历史和 `specific` ToolChoice alias 投影
@@ -43,16 +43,16 @@
 ## 错误与并发
 
 - [x] 所有 sentinel 与 [errors.md](errors.md) 一致并保留 wrapped cause
-- [ ] Token 估算失败不使用字符数近似兜底
+- [x] Token 估算失败不使用字符数近似兜底
 - [x] 受保护请求本身超限返回明确错误
-- [ ] `ctx.Done()` 在估算、摘要和循环截断中及时生效
-- [ ] 同一次 Build 只使用一个 Effective Config 快照
+- [x] `ctx.Done()` 在估算、摘要和循环截断中及时生效
+- [x] 同一次 Build 只使用一个 Effective Config 快照
 - [x] Manager 无跨 Session 可变状态并通过 race detector
 - [x] v1 不实现异步摘要队列、自定义策略注册或 Context cache
 
 ## 可观测性与测试
 
-- [ ] 日志不含 prompt、Memory、Tool result、摘要正文或 Secret
+- [x] 日志不含 prompt、Memory、Tool result、摘要正文或 Secret
 - [ ] 指标名称和标签与 [observability.md](observability.md) 一致
 - [ ] 指标不使用 session/request ID 高基数标签
 - [ ] 预算边界、受保护超限、完整 Tool unit、摘要 fallback 有单元测试

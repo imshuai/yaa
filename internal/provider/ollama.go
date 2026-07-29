@@ -48,17 +48,7 @@ func (p *ollamaProvider) Models() []ModelInfo {
 func (p *ollamaProvider) Close() error { return nil }
 
 func (p *ollamaProvider) EstimateInputTokens(ctx context.Context, req *ChatRequest) (int, error) {
-	if req == nil {
-		return 0, nil
-	}
-	total := 0
-	for _, m := range req.Messages {
-		total += len(m.Content) + len(m.ReasoningContent)
-		for _, tc := range m.ToolCalls {
-			total += len(tc.Function.Name) + len(tc.Function.Arguments)
-		}
-	}
-	return (total + 3) / 4, nil
+	return estimateTokensFromChars(estimateRequestChars(req)), nil
 }
 
 // ollamaReq 是 /api/chat 请求体（与 OpenAI ChatRequest 几乎同结构，stream 放顶层）。

@@ -49,8 +49,8 @@
 
 ### 14.3 自定义 Tool
 
-- [ ] Plugin RPC Tool capability 与 Proxy 注册
-- [ ] 配置文件声明注册
+- [x] Plugin RPC Tool capability 与 Proxy 注册
+- [x] 配置文件声明注册
 - [x] Runtime 内置 Tool 的静态 Go 注册
 
 ### 14.4 Context 集成

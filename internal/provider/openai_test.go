@@ -304,3 +304,37 @@ func TestOpenAIBuildBodyStripsThinkingAndKeepsExtra(t *testing.T) {
 
 // 确保 io 至少被引用，避免未用 import（部分测试路径）
 var _ = io.Discard
+
+// TestEstimateInputTokensFullRequest 覆盖 checklist 行22/23: 估算含 Tool schema、response_format、extra.
+func TestEstimateInputTokensFullRequest(t *testing.T) {
+	p, _ := newTestOpenAI(t, openaiChatHandler("ok", 0))
+	n, err := p.EstimateInputTokens(context.Background(), &ChatRequest{
+		Messages: []Message{{Content: "hello world"}}, // 11 chars
+		Tools: []ToolDef{
+			{Function: ToolFunction{Name: "get_weather", Description: "Get current weather", Parameters: json.RawMessage(`{"type":"object","properties":{"location":{"type":"string"}}}`)}},
+		},
+		ResponseFormat: &ResponseFormat{Type: "json_schema", Name: "weather_out", JSONSchema: json.RawMessage(`{"type":"object"}`)},
+		Extra: map[string]any{"user_id": "alice123"},
+	})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	// 只验证估算 > 仅 message chars/4, 因为含 tools/response_format/extra 字符数
+	baseline, _ := p.EstimateInputTokens(context.Background(), &ChatRequest{
+		Messages: []Message{{Content: "hello world"}},
+	})
+	if n <= baseline {
+		t.Fatalf("expected estimate %d > baseline %d (must include tool schema+response_format+extra)", n, baseline)
+	}
+}
+
+func TestEstimateInputTokensNilReq(t *testing.T) {
+	p, _ := newTestOpenAI(t, openaiChatHandler("ok", 0))
+	n, err := p.EstimateInputTokens(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("nil req should return 0, got %d", n)
+	}
+}

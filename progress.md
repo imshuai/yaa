@@ -3433,3 +3433,54 @@ go test -count=1 -timeout 300s ./...   # 25 包全绿
 - `internal/memory/manager.go` (BeginOpForTest)
 - `internal/memory_test/manager_test.go` (2 新并发测试)
 - `docs/memory/checklist.md` (4 项勾选)
+
+---
+
+## Commit #64 — Provider estimate 完整 + context ctx.Done + tool §14.3 勾选 (2026-07-29)
+
+### 变更摘要
+
+**Provider EstimateInputTokens 完整 (context checklist 行22/23)**:
+- 新增 `internal/provider/estimate.go` 提供 `estimateRequestChars` + `estimateTokensFromChars` 共享 helper
+- 估算包含: messages(含 ToolCalls) + tools schema(Function name/description/Parameters JSON Schema) + ResponseFormat (Type/Name/JSONSchema) + Provider Extra (key/value marshal) + ToolChoice framing + Thinking Effort/Budget
+- 把 openai/claude/gemini/ollama 4 个 provider 的 EstimateInputTokens 切换到共享 helper, 估算精度统一
+- 新增 2 测试: TestEstimateInputTokensFullRequest (验证 Tools+ResponseFormat+Extra 让估算 > baseline), TestEstimateInputTokensNilReq (nil req 返回 0)
+
+**context ctx.Done 在循环截断中生效 (行48)**:
+- `internal/context/manager.go` truncate func 循环开头检查 `ctx.Err()`, 取消时返回 ErrContextBuildFailed wrap ctx.Cause
+- 新增 TestBuildRespectsContextCancellation (60 messages 触发 truncation + ctx 已取消 → 验证 ErrContextBuildFailed/context.Canceled)
+
+**context 其他勾选**:
+- 行46 "Token 估算失败不使用字符数近似兜底" — 已实现 (EstimateInputTokens 错误直接返回 ErrTokenEstimationFailed)
+- 行49 "同一次 Build 只使用一个 Effective Config 快照" — Build 中只读 in.Config, 由 caller 传入, 无再读 snapshot
+- 行55 "日志不含 prompt/Memory/Tool result/摘要正文/Secret" — context manager zero logger call, 无泄密风险
+
+**tool §14.3 勾选 (行52/53)**:
+- 行52 "Plugin RPC Tool capability 与 Proxy 注册" — PluginToolProxy 已实现 tool.Tool interface, registerProxies 用 m.tools.RegisterWithSource(proxy, "plugin")
+- 行53 "配置文件声明注册" — PluginsConfig.entries[].Enabled 控制 plugin 启动, Manifest provides.type="tool" 声明 tool capability, Ready→registerProxies 自动注册
+
+### 检查清单进度
+
+| 模块 | 之前 | 现在 |
+|------|------|------|
+| context | 25/40 | **31/40** ✅ (+6 项) |
+| tool    | 42/45 | **44/45** ✅ (+2 项) |
+
+剩余:
+- context 9 项: 行38/39/40 hybrid 摘要 (需 Provider Chat 调用), 行56/57 指标 (需 metrics 模块集成), 行58/59/60/61 测试覆盖
+- tool 1 项: 行39 Config Reload Tool (Phase 5)
+
+### 验证
+
+- `go vet ./...` OK
+- `go build ./...` OK
+- `go test -count=1 -timeout 300s ./...` 26 包全绿
+
+### 关键文件
+- `internal/provider/estimate.go` 新建 (estimateRequestChars + estimateTokensFromChars)
+- `internal/provider/openai.go/claude.go/gemini.go/ollama.go` (EstimateInputTokens 切换共享 helper)
+- `internal/provider/openai_test.go` (2 新测试)
+- `internal/context/manager.go` (truncate ctx.Err 检查)
+- `internal/context/manager_test.go` (TestBuildRespectsContextCancellation)
+- `docs/context/checklist.md` (6 项勾选)
+- `docs/tool/checklist.md` (2 项勾选)

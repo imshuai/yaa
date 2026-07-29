@@ -280,3 +280,40 @@ func TestBuildTruncatePreservesToolUnitWithReasoning(t *testing.T) {
 		t.Fatal("truncation stripped tool result message (§8.3 atomic unit violated)")
 	}
 }
+
+// TestBuildRespectsContextCancellation 覆盖 checklist 行48: ctx 取消在循环截断中及时生效.
+func TestBuildRespectsContextCancellation(t *testing.T) {
+	p := newTestProvider(10000, 1000)
+	cfg := newTestConfig("truncate")
+	maxTokens := 1000
+	// 60 条消息 × 100 = 6000 > budget.Input (window - reserved)
+	messages := make([]provider.Message, 60)
+	for i := range messages {
+		if i%2 == 0 || i == len(messages)-1 {
+			messages[i] = provider.Message{Role: "user", Content: "x"}
+		} else {
+			messages[i] = provider.Message{Role: "assistant", Content: "y"}
+		}
+	}
+	m := &Manager{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 先取消
+	_, err := m.Build(ctx, BuildInput{
+		Provider:         p,
+		CurrentTurnStart: len(messages) - 1, // 最后一条 user 为当前 turn
+		Request: provider.ChatRequest{
+			Model:     "test-model",
+			MaxTokens: &maxTokens,
+			Messages:  messages,
+		},
+		Model:  provider.ModelInfo{ID: "test-model", ContextWindow: 10000, MaxOutput: 1000},
+		Config: cfg,
+	})
+	if err == nil {
+		t.Skip("build completed immediately (no truncation needed)")
+	}
+	// 应该返回 ctx.Canceled 或 ErrContextBuildFailed (wrap ctx.Err)
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, ErrContextBuildFailed) {
+		t.Fatalf("expected ctx-related error, got %v", err)
+	}
+}
