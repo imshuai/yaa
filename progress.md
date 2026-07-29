@@ -3566,3 +3566,47 @@ go test -count=1 -timeout 300s ./...   # 25 包全绿
 - `internal/memory/manager.go` (Health + MarkDegradedForTest)
 - `internal/memory_test/health_test.go` 新建
 - `docs/memory/checklist.md` (行56)
+
+---
+
+## #67 — Config Phase 5 Reload 基础设施 + config_reload Tool (config 72→83/84, tool 44→45/45)
+
+### 完成内容
+- **fsnotify v1.6.0** 新增依赖 (兼容 Go 1.20, go 1.16 directive)
+- `internal/config/reload.go` 新建 (236 行):
+  - `ReloadResult` struct (Applied/Changed/RestartRequired/Paths)
+  - `ReloadManager`: NewReloadManager (拒 nil + flags 深拷贝) / Activate / Current / Reload / SetLogger
+  - `Reload()`: reload mutex 串行 → active 校验 → Load(path,flags) → validateBindings → diffAndClassify → restart 路径返回 Applied=false 不 Store / 无 restart 原子 Store Applied=true
+  - `hotReloadAllowlist` (28 前缀, 来自文档 §4 表格)
+  - `diffMaps/diffVal/leafPaths/normalizeArrayIndexPath`: 递归比较 map, 数组按 index 对齐 (长度变化→数组层级 restart)
+  - `pathIsHotReloadable` 前缀匹配
+  - 失败/Restart-required 都走 slog 结构化日志 (无 secret 值)
+- `internal/config/watcher.go` 新建 (105 行):
+  - `Watcher` + `NewWatcher` + `Run(ctx)`: fsnotify 监听目录, 300ms debounce, 筛目标路径, ctx 取消清理 fs/timer 生命周期
+  - 对 fs.Events/Errors 检查 ok 防止 nil chan 阻塞
+  - 同 goroutine 执行 reload (无残留 callback)
+- `internal/config/reload_test.go` 新建 (15 测试): New/BeforeActivate/Current/FlagsDeepCopy/ApplyHotReloadable/RestartRequired/Mixed/NoChange/ValidateBindingsFail/LoadFail/AgentModelHotReloadable/AgentAddRestart/Normalize/PathIsHot/DiffAndClassify
+- `internal/config/watcher_test.go` 新建 (6 测试): TriggersReloadOnWrite/DebouncesRapidWrites/IgnoresUnrelatedFiles/CtxCancelCleansUp/OnReloadCallback/OnErrorCallback
+- `internal/tool/builtin/config_reload.go` 新建: Tool Execute 调 ReloadManager.Reload() 返 ReloadResult JSON; 失败映射 IsError=true (不硬错)
+- `internal/tool/builtin/config_reload_test.go` 新建 (5 测试): NewRejectsNil/ApplyHotReloadable/RestartRequiredNotApplied/LoadFailureIsError/ParametersSchema
+- `docs/config/checklist.md` 勾选行50-57/59-61 (11 项)
+- `docs/tool/checklist.md` 勾选行39
+
+### 检查清单进度
+| 模块 | 之前 | 现在 |
+|------|------|------|
+| config | 72/84 | **83/84** (+11) |
+| tool | 44/45 | **45/45** ✅ (+1) |
+
+剩: config 行58 (组件从 Current() 复制 hot-reload 字段) — 消费方模块各自落地
+
+### 验证
+- go vet ./... OK
+- go build ./... OK
+- go test -count=1 -timeout 300s ./... 全绿 (mcp SSEClientEndpointParseAndMessageRoundTrip 已知 flaky 单跑 PASS, 全项目跑偶尔 FAIL)
+
+### 关键文件
+- `internal/config/reload.go` + `watcher.go` + 2 test 文件 (新建)
+- `internal/tool/builtin/config_reload.go` + test (新建)
+- `go.mod/go.sum` (fsnotify v1.6.0)
+- `docs/config/checklist.md` (11 项) + `docs/tool/checklist.md` (1 项)
