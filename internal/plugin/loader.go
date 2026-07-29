@@ -17,6 +17,7 @@ type Loader struct {
 	paths           []string
 	protocolVersion string // 固定 "1"
 	logger          *slog.Logger
+	dial            dialerFunc // 测试注入用, nil → defaultDialPlugin (定义于 start.go)
 }
 
 // NewLoader 校验 configDir 并规范化/去重 search paths. docs/plugin/loader.md §2.

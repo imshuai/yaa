@@ -12,8 +12,8 @@
 - [x] RPC major v1 只接受 `protocol_version: "1"`
 - [x] Manifest 完整字段和严格未知字段校验
 - [x] `provides[]` 只接受 `tool`，且 name/description/schema 必填
-- [ ] Manifest capabilities 与 Ready capabilities 的 type/name/description/schema 集合一致
-- [ ] `entries[].config` 在启动进程前通过 `config_schema`
+- [x] Manifest capabilities 与 Ready capabilities 的 type/name/description/schema 集合一致
+- [x] `entries[].config` 在启动进程前通过 `config_schema`
 - [x] `requires_runtime`、dependency version 使用 SemVer parser
 
 ## Loader
@@ -22,12 +22,12 @@
 - [ ] `NewLoader(configDir, paths, logger)` 校验依赖并固定 RPC major；`NewManager` 消费其 typed discovery diagnostics
 - [x] 每个直接子目录只读取一个 `plugin.yaml`
 - [x] entry 规范化后不得逃逸 Manifest 目录，并验证可执行权限
-- [ ] Unix Socket / Windows loopback TCP endpoint 与启动 nonce
-- [ ] 长期进程使用 `exec.Command`；startup context 取消不会杀死 Ready 进程
-- [ ] nonce 仅经 `YAA_PLUGIN_STARTUP_NONCE` 传入并由 HandshakeResponse constant-time 校验
-- [ ] Handshake request 使用 `runtime_protocol`/`expected_plugin_id`；response 的 `protocol_version`/`plugin_id`/`plugin_version`/`startup_nonce` 全部与冻结 Descriptor 和启动 nonce 一致
-- [ ] Start 依次执行 exec/Dial/Handshake/Init/Ready
-- [ ] 每个 `cmd.Start` 成功路径恰有一个 `cmd.Wait` owner；失败统一 Terminate + endpoint cleanup
+- [x] Unix Socket / Windows loopback TCP endpoint 与启动 nonce
+- [x] 长期进程使用 `exec.Command`；startup context 取消不会杀死 Ready 进程
+- [x] nonce 仅经 `YAA_PLUGIN_STARTUP_NONCE` 传入并由 HandshakeResponse constant-time 校验
+- [x] Handshake request 使用 `runtime_protocol`/`expected_plugin_id`；response 的 `protocol_version`/`plugin_id`/`plugin_version`/`startup_nonce` 全部与冻结 Descriptor 和启动 nonce 一致
+- [x] Start 依次执行 exec/Dial/Handshake/Init/Ready
+- [x] 每个 `cmd.Start` 成功路径恰有一个 `cmd.Wait` owner；失败统一 Terminate + endpoint cleanup
 - [ ] 无法解析 ID 的错误只进 diagnostics；已知 ID 的错误建立 error Entry
 - [x] 重复 ID 全部拒绝，不按路径顺序覆盖
 - [x] `RPCClient` 私有持有 transport/process/endpoint；外部只用 Health/Stop/InvokeTool 转发和幂等生命周期方法
