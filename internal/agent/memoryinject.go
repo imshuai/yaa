@@ -15,11 +15,11 @@ const memoryInjectMaxBytes = 32 * 1024
 // resolveMemoryPolicy 从 root MemoryConfig + 该 Agent override 解析 effective policy。
 // v1 不依赖 ReloadManager，每轮从 deps.Config 重新解析（与 resolveAgentContextConfig 同惯例）。
 func (m *Manager) resolveMemoryPolicy(a *agentBinding) config.MemoryPolicy {
-	root := m.deps.Config.Memory
+	root := m.currentCfg().Memory
 	var override *config.MemoryOverride
-	for i := range m.deps.Config.Agents {
-		if m.deps.Config.Agents[i].ID == a.id {
-			override = m.deps.Config.Agents[i].Memory
+	for i := range m.currentCfg().Agents {
+		if m.currentCfg().Agents[i].ID == a.id {
+			override = m.currentCfg().Agents[i].Memory
 			break
 		}
 	}

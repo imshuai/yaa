@@ -24,6 +24,9 @@ import (
 // Memory 为 nil 表示该 Agent 未启用 Memory（runDirectTurn 跳过检索注入）。
 type Dependencies struct {
 	Config    *config.Config
+	// Reloader 可选: 非 nil 时 op 通过 currentCfg() 取 Current() snapshot 而非旧 deps.Config 指针
+	// (docs/config hot-reload.md "组件每次 op 开始时从 Current() 复制 hot-reload 字段").
+	Reloader  *config.ReloadManager
 	Sessions  *session.Manager
 	Context   *ctxwindow.Manager
 	Providers *provider.Manager
@@ -55,6 +58,15 @@ type Manager struct {
 	mu     sync.Mutex
 	agents map[string]*agentBinding
 	closed bool
+}
+
+// currentCfg 返回当前 effective Config snapshot: 优先 Reloader.Current(), 否则固定 deps.Config.
+// docs/config hot-reload.md: 组件每次 op 开始时从 Current() 取 hot-reload 字段.
+func (m *Manager) currentCfg() *config.Config {
+	if m.deps.Reloader != nil {
+		return m.deps.Reloader.Current()
+	}
+	return m.deps.Config
 }
 
 // NewManager 构造 Agent Manager。
@@ -108,7 +120,7 @@ func NewManager(deps Dependencies) (*Manager, error) {
 		}
 		// Resolve planner config (docs/planner/integration.md §1 + config-ref §3).
 		// disabled 时 planner/runner 都为 nil, HandleTurn 走 runDirectTurn (docs §1 "if a.planner == nil").
-		effectiveCfg := config.ResolvePlannerConfig(m.deps.Config.Planner, a.Planner)
+		effectiveCfg := config.ResolvePlannerConfig(m.currentCfg().Planner, a.Planner)
 		var plan *planner.LLMPlanner
 		// 仅 Type=="llm" 才构造 LLMPlanner (docs/planner/config-ref.md §2 枚举 llm/disabled).
 		// 有效 cfg 走 config.Validate 时 Type="" 已被拒; 测试直构造 cfg 漏配 Planner 字段时

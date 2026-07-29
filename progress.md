@@ -3694,3 +3694,41 @@ import 顺序整理 (合并 import 块 + 加 os import)
 - `internal/config/memory_unknown_test.go` (新建, 2 测试)
 - `internal/memory_test/cleanup_reload_test.go` (新建, 3 测试) + policy_explicit_test.go (2 测试)
 - `docs/memory/checklist.md` (行52/53)
+
+---
+
+## #71 — Config Phase 5 行58: Agent.Dependencies.Reloader + Runtime ReloadManager 集成 (config 83→84/84 ✅)
+
+### 完成内容 (全部 checklist 收尾!)
+- **agent.Dependencies 新增 Reloader *config.ReloadManager**, agent.Manager 新增 `currentCfg()` helper:
+  - Reloader 非 nil → 返回 Reloader.Current() (hot reload 最新 snapshot)
+  - nil → 回退 deps.Config 旧指针 (向后兼容, 现有测试不动)
+  - handle_turn.go / memoryinject.go / manager.go 中所有 `m.deps.Config.X` 替换为 `m.currentCfg().X`
+  - 即 Agent turn resolveMemoryPolicy / resolveAgentContextConfig / ResolvePlannerConfig 均从 Current() 取 hot-reload 字段
+- **Runtime 集成 ReloadManager** internal/runtime/runtime.go:
+  - Runtime struct 新增 `reloadMgr *config.ReloadManager` 字段
+  - Start 中: 若 configPath 非 nil 且构造+Activate 成功 → rt.reloadMgr=rm + rt.cfg=rm.Current() (切到 ReloadManager 持有的 same snapshot)
+  - agent.Dependencies.Reloader = rt.reloadMgr (非 nil 时 Agent turn 从 Current() 取)
+  - 失败仅记录 warning, 不阻塞 Runtime 启动 (旧 cfg 有效)
+- **集成测试** `internal/agent/reloader_test.go` (1 个):
+  - TestAgentCurrentCfgReadsFromReloader: 注入 ReloadManager 给 Agent, Reload 改 memory.max_items=10→20, 验证 agm.currentCfg().Memory.MaxItems = 20 (Agent 反映新 snapshot)
+
+### 检查清单进度 (全部 100%!)
+| 模块 | 之前 | 现在 |
+|------|------|------|
+| config | 83/84 | **84/84 ✅** |
+
+**全部 11 模块 100% checklist 完成且全项目测试通过**:
+auth 30/30, config 84/84, context 40/40, mcp 82/82, memory 39/39, planner 34/34,
+plugin 52/52, session 58/58, skill 24/24, storage 23/23, tool 45/45
+
+### 验证
+- go vet/build OK
+- go test -count=1 -timeout 300s ./... 25 包全绿
+
+### 关键文件
+- `internal/agent/manager.go` (Dependencies + currentCfg)
+- `internal/agent/handle_turn.go` + `memoryinject.go` (deps.Config → currentCfg)
+- `internal/runtime/runtime.go` (reloadMgr 字段 + Start 构造 + 注入 agent.Dependencies.Reloader)
+- `internal/agent/reloader_test.go` (1 集成测试)
+- `docs/config/checklist.md` (行58)

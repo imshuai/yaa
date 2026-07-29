@@ -55,7 +55,7 @@
 - [x] 变更后重新加载 → 校验 → 原子替换
 - [x] 校验失败时保留旧配置（拒绝变更，记录 error 日志）
 - [x] 原子替换（`atomic.Value` 存储 Effective Config）
-- [ ] 组件在每次操作开始时从 `Current()` 复制所需 hot-reload 字段
+- [x] 组件在每次操作开始时从 `Current()` 复制所需 hot-reload 字段
 - [x] 热更新粒度控制（部分字段不可热更新，需重启）
 - [x] reload 结果/失败只记录脱敏结构化日志，不增加无路由支撑的全局 SSE
 - [x] `config_reload` Tool 与文件 watcher 共用唯一 Reload 流程；Remote API 不注册 reload 路由

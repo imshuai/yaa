@@ -33,6 +33,7 @@ type Runtime struct {
 	cfg        *config.Config
 	configPath string
 	store      storage.Storage
+	reloadMgr *config.ReloadManager // 非 nil 时启用 config hot reload (configPath 已设置时构造)
 	providers  *provider.Manager
 	sessions   *session.Manager
 	contextM   *ctxwindow.Manager
@@ -74,6 +75,21 @@ func (rt *Runtime) SetConfigPath(configPath string) {
 // Phase 1：Storage（sqlite|memory）→ API Server。
 func (rt *Runtime) Start(ctx context.Context) error {
 	rt.startedAt = time.Now()
+
+	// 如 configPath 已设置, 构造 ReloadManager 持有当前 snapshot (行58 集成).
+	// Activate 失败不阻塞 Runtime 启动 (旧 cfg 仍有效), 仅记录 warning 并保持 reloadMgr=nil.
+	if rt.configPath != "" && rt.reloadMgr == nil {
+		if rm, err := config.NewReloadManager(rt.cfg, rt.configPath, nil, nil); err == nil {
+			if aerr := rm.Activate(); aerr == nil {
+				rt.reloadMgr = rm
+				rt.cfg = rm.Current() // 切到 ReloadManager 持有的 same snapshot
+			} else {
+				rt.logger.Warn("runtime: config activate failed; reload disabled", "error", aerr)
+			}
+		} else {
+			rt.logger.Warn("runtime: ReloadManager construction failed; reload disabled", "error", err)
+		}
+	}
 
 	// Storage：未知类型/路径/migration 失败阻止 Ready。
 	store, derr := storage.New(rt.cfg.Runtime.Storage)
@@ -211,6 +227,7 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	// Agent Manager：冻结 Provider/Tool/Skill allowlist + effective policy。
 	am, aerr := agent.NewManager(agent.Dependencies{
 		Config:    rt.cfg,
+		Reloader:  rt.reloadMgr, // 非 nil 时 Agent turn 从 Current() 取 hot-reload 字段 (行58)
 		Sessions:  nil, // 先填 nil，下面 Restore+Start 完成后再注入
 		Context:   rt.contextM,
 		Providers: pm,

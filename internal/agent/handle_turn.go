@@ -401,12 +401,12 @@ func isValidArgsObject(s string) bool {
 
 // resolveAgentContextConfig 从 root + Agent override 解析 effective Context config。
 func (m *Manager) resolveAgentContextConfig(a *agentBinding) config.ContextConfig {
-	for _, ag := range m.deps.Config.Agents {
+	for _, ag := range m.currentCfg().Agents {
 		if ag.ID == a.id {
-			return config.ResolveContextConfig(m.deps.Config.Context, ag.Context)
+			return config.ResolveContextConfig(m.currentCfg().Context, ag.Context)
 		}
 	}
-	return m.deps.Config.Context
+	return m.currentCfg().Context
 }
 
 // callProvider 按 req.Stream 选择流式/非流式执行 Path；二者返回累积后的 assistant message + usage + 错误。
