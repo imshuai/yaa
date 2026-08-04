@@ -3732,3 +3732,60 @@ plugin 52/52, session 58/58, skill 24/24, storage 23/23, tool 45/45
 - `internal/runtime/runtime.go` (reloadMgr 字段 + Start 构造 + 注入 agent.Dependencies.Reloader)
 - `internal/agent/reloader_test.go` (1 集成测试)
 - `docs/config/checklist.md` (行58)
+
+---
+
+## #72 — Windows 7 交叉编译验证 (CGO_ENABLED=0, 验证 win/amd64 编译链可用)
+
+### 验证结论
+- **没有任何一处在 Windows 上运行过**; 之前所有开发与 go test 都在 Linux/arm64 (Go 1.20.14 Armbian aarch64) 完成.
+- 跨平台交叉编译目标 windows/amd64 全部成功.
+
+### 命令与结果
+1. `cmd/yaa` 主二进制:
+   ```
+   GOOS=windows GOARCH=amd64 go build -o /tmp/yaa.exe ./cmd/yaa
+   → /tmp/yaa.exe: PE32+ executable (console) x86-64 (stripped to external PDB), for MS Windows, 18 MB
+   ```
+2. 全模块:
+   ```
+   GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...
+   → EXIT 0 (无编译错误)
+   ```
+3. 全模块 vet:
+   ```
+   GOOS=windows GOARCH=amd64 go vet ./...
+   → EXIT 0
+   ```
+4. 测试包整体编译:
+   ```
+   GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go test -run xxxxxx ./...
+   → 所有 .test.exe 都生成; ERROR 仅为 "exec format error" (在 Linux 上无法执行 Windows PE 二进制, 非编译错误)
+   ```
+   grep 编译错误后: 0 条 (确认所有测试包都能在 Windows 上编译通过).
+
+### 关键 Windows 兼容设计已有代码
+- `cmd/yaa/main.go` 第 43-44 行: `signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)`,
+  Windows 上 syscall.SIGTERM 在 Go 中是被定义的内部常量 (不真正接受 os 信号);
+  Windows 上 Ctrl+C 由 os.Interrupt 处理, SIGTERM 信号被静默丢弃 → 运行行为可接受, 无编译失败.
+- `pkg/pluginrpc/transport.go`: AllocateLocalEndpoint 已 `runtime.GOOS == "windows"` 分支用 loopback TCP ("tcp://127.0.0.1:0"),
+  DialPlugin 用 scheme 分支 ("unix://" / "tcp://") 处理. 文档对应 docs/plugin/checklist.md 行25.
+- `internal/config/discover.go:33`: `runtime.GOOS != "windows"` 分支处理默认配置文件路径 (用户 home dir).
+- modernc.org/sqlite 是纯 Go 实现: `CGO_ENABLED=0` 完全可用, 无需 Windows 上安装 C 编译器.
+
+### Windows 7 官方支持情况 (已核实)
+- Go 1.20.14 doc/go1.20.html 中 Windows 一节原文:
+  "Go 1.20 is the last release that will run on any release of Windows 7, 8, Server 2008 and Server 2012.
+   Go 1.21 will require at least Windows 10 or Server 2016."
+- 即: **Go 1.20 是支持 Windows 7 的最后一个 Go 版本**, Go 1.21+ 不再支持 Win7.
+- 项目选 Go 1.20 是正确的, 在 Win7 上可编译可运行.
+- 注意: 官方支持指 Win7 SP1 (32 位/64 位均可); Win7 RTM 已 ESU, 不在保证范围.
+
+### 下一步建议 (如需在 Windows 7 实机验证)
+路径 1 (推荐): 拷贝已生成的 /tmp/yaa.exe 到 Win7 (需 x64 Win7 SP1), 写 yaa.yaml 配好 storage/api 后即可运行.
+  无需在 Win7 上装 Go 工具链 (modernc.org/sqlite 纯 Go, 不需 cgo, 不依赖 mingw).
+路径 2: 若想在 Win7 上亲自编译, 装 Go 1.20.x Windows 版本:
+  - `git clone http://192.168.3.20/hashqq/yaa.git`
+  - `go build -o yaa.exe ./cmd/yaa`
+  - `yaa.exe -config yaa.yaml`
+  (同样不需要 mingw / TDM-GCC, 因为 modernc.org/sqlite 无 cgo 依赖).
