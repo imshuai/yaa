@@ -124,8 +124,11 @@ func (r *retryingProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRes
 			retryAfter = pe.RetryAfter
 		}
 		if sleepErr := sleepRetry(callCtx, backoff(attempt, r.retryInterval, retryAfter)); sleepErr != nil {
-			break // ctx 已取消，返回 lastErr（分类为 timeout 等）。
+			break // ctx 已取消，返回 lastErr。
 		}
+	}
+	if callCtx.Err() != nil {
+		return nil, finalErr(lastErr)
 	}
 	return nil, lastErr
 }

@@ -183,7 +183,8 @@ func (w *wsConn) readLoop(ctx context.Context, done chan<- struct{}) {
 		}
 		switch f.Type {
 		case "message":
-			w.handleMessage(ctx, f)
+			// 异步执行: readLoop 必须继续读后续 frame, 否则运行中 turn 期间无法收到 cancel.
+			go w.handleMessage(ctx, f)
 		case "cancel":
 			w.handleCancel(f.TurnID)
 		default:

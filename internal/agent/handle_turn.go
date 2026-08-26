@@ -427,7 +427,7 @@ func (m *Manager) callProvider(
 func (m *Manager) callChat(ctx context.Context, req *provider.ChatRequest, p provider.Provider) (provider.Message, provider.Usage, error) {
 	resp, err := p.Chat(ctx, req)
 	if err != nil {
-		return provider.Message{}, resp.Usage, err
+		return provider.Message{}, provider.Usage{}, err
 	}
 	return provider.Message{
 		Role:             "assistant",

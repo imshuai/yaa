@@ -18,14 +18,14 @@ import (
 type EventName string
 
 const (
-	EventAdded     EventName = "memory.added"
-	EventUpdated   EventName = "memory.updated"
-	EventDeleted   EventName = "memory.deleted"
-	EventPromoted  EventName = "memory.promoted"
-	EventExpired   EventName = "memory.expired"
-	EventEvicted   EventName = "memory.evicted"
-	EventDegraded  EventName = "memory.degraded"
-	EventError     EventName = "memory.error"
+	EventAdded    EventName = "memory.added"
+	EventUpdated  EventName = "memory.updated"
+	EventDeleted  EventName = "memory.deleted"
+	EventPromoted EventName = "memory.promoted"
+	EventExpired  EventName = "memory.expired"
+	EventEvicted  EventName = "memory.evicted"
+	EventDegraded EventName = "memory.degraded"
+	EventError    EventName = "memory.error"
 )
 
 // Event 是 8 个 canonical event 共享 payload（observability.md §2）。
@@ -193,23 +193,6 @@ func (m *Manager) StartCleanupWithReload(ctx context.Context, snapshot func() (i
 	}()
 }
 
-// cleanupWorker 保留兼容入口 (内嵌 integer version 已在 StartCleanup 内联). 仅供旧调用方/测试.
-// ponytail: 不删除以避免破坏符号兼容; 内部等价 implementation inline 在 StartCleanup.
-func (m *Manager) cleanupWorker(ctx context.Context, interval time.Duration, batchSize int) {
-	defer close(m.workerDone)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			now := m.clock.Now()
-			_, _ = m.DeleteExpired(ctx, now, batchSize)
-		}
-	}
-}
-
 func (m *Manager) beginOp() error {
 	m.lifecycleMu.Lock()
 	defer m.lifecycleMu.Unlock()
@@ -363,7 +346,7 @@ func cloneAny(m map[string]any) map[string]any {
 // ponytail: v1 用 simple per-key sync.Mutex map + sync.Map；容量上限不强制，
 // 假定 Agent 数不超过数千；若超出 → 升级 hash-bucketed locks。
 type keyedMutex struct {
-	mu  sync.Mutex
+	mu    sync.Mutex
 	locks map[string]*sync.Mutex
 }
 
@@ -587,24 +570,30 @@ func refsFromItems(items []MemoryItem) []ItemRef {
 // victims 的 index refs 也会被删除（成功路径）。
 func (m *Manager) putIndex(ctx context.Context, stored MemoryItem, victims []MemoryItem, policy config.MemoryPolicy) IndexStatus {
 	ai := m.getOrCreateIndexState(stored.AgentID, policy, false)
+	if ai == nil || m.embedder == nil {
+		m.markDegraded(stored.AgentID, "embedder")
+		m.emit(Event{Type: EventDegraded, AgentID: stored.AgentID, At: m.clock.Now(), Reason: "embedder"})
+		m.degradedSet("embedder", 1)
+		return IndexDegraded
+	}
 	vectors, err := m.embedder.Embed(ctx, []string{stored.Content})
 	if err != nil || len(vectors) == 0 {
 		m.markDegraded(stored.AgentID, "embedder")
 		m.emit(Event{Type: EventDegraded, AgentID: stored.AgentID, At: m.clock.Now(), Reason: "embedder"})
-			m.degradedSet("embedder", 1)
+		m.degradedSet("embedder", 1)
 		return IndexDegraded
 	}
 	vec := vectors[0]
 	if m.embedder.Dimension() != 0 && len(vec) != m.embedder.Dimension() {
 		m.markDegraded(stored.AgentID, "embedder")
 		m.emit(Event{Type: EventDegraded, AgentID: stored.AgentID, At: time.Now(), Reason: "embedder"})
-			m.degradedSet("embedder", 1)
+		m.degradedSet("embedder", 1)
 		return IndexDegraded
 	}
 	if isZeroVector(vec) {
 		m.markDegraded(stored.AgentID, "embedder")
 		m.emit(Event{Type: EventDegraded, AgentID: stored.AgentID, At: time.Now(), Reason: "embedder"})
-			m.degradedSet("embedder", 1)
+		m.degradedSet("embedder", 1)
 		return IndexDegraded
 	}
 	ai.mu.Lock()
@@ -613,16 +602,16 @@ func (m *Manager) putIndex(ctx context.Context, stored MemoryItem, victims []Mem
 			ai.status = IndexDegraded
 			ai.mu.Unlock()
 			m.emit(Event{Type: EventDegraded, AgentID: stored.AgentID, At: time.Now(), Reason: "index_upsert"})
-				m.degradedSet("index", 1)
+			m.degradedSet("index", 1)
 			return IndexDegraded
+		}
+		// 删除 victims 的 index refs（失败只 emit degraded，不影响 content 已提交）。
+		// 在 ai.mu 内访问 ai.index, 避免与 Reindex 的 swap 竞争。
+		for _, v := range victims {
+			_ = ai.index.Delete(ctx, ItemRef{AgentID: v.AgentID, SessionID: v.SessionID, Layer: v.Layer, Key: v.Key, Version: v.Version})
 		}
 	}
 	ai.mu.Unlock()
-
-	// 删除 victims 的 index refs（失败只 emit degraded，不影响 content 已提交）
-	for _, v := range victims {
-		_ = ai.index.Delete(ctx, ItemRef{AgentID: v.AgentID, SessionID: v.SessionID, Layer: v.Layer, Key: v.Key, Version: v.Version})
-	}
 	return IndexReady
 }
 
@@ -713,30 +702,17 @@ func (m *Manager) Health(ctx context.Context) Health {
 	m.indexMu.RLock()
 	if len(m.indexes) > 0 {
 		allReady := true
-		anyAgentHasIndex := false
 		for _, ai := range m.indexes {
 			ai.mu.RLock()
 			if ai.status == IndexDegraded {
 				allReady = false
 			}
-			if ai.index != nil {
-				anyAgentHasIndex = true
-			}
 			ai.mu.RUnlock()
 		}
-		_ = anyAgentHasIndex
 		indexOK = &allReady
 	}
 	m.indexMu.RUnlock()
-	// 4. Items 计数 (未过期 items 总数) — ponytail: 全 Agent 聚合.
-	var totalItems int64
-	for agentID := range m.indexes {
-		_ = agentID
-		// ContentStore.Count 返回单个 Agent; 聚合全 Agent 开销大, 暂时不拉取.
-		// ponytail: v1 Items 默认 0, 调用方仍能得到其他状态.
-	}
-	_ = totalItems
-	// 5. status 判定
+	// 4. status 判定
 	status := "healthy"
 	if indexOK != nil && !*indexOK {
 		status = "degraded"
@@ -875,6 +851,9 @@ func (m *Manager) vectorSearch(ctx context.Context, req SearchRequest, limit int
 	if status == IndexDegraded {
 		return nil, ErrMemoryIndexDegraded
 	}
+	if m.embedder == nil {
+		return nil, ErrMemoryEmbeddingFailed
+	}
 
 	vectors, err := m.embedder.Embed(ctx, []string{req.Query})
 	if err != nil {
@@ -997,9 +976,14 @@ func (m *Manager) Delete(ctx context.Context, policy config.MemoryPolicy, scope 
 	m.emit(Event{Type: EventDeleted, AgentID: item.AgentID, Layer: item.Layer, SessionID: item.SessionID, Key: item.Key, Version: item.Version, At: m.clock.Now()})
 	if policy.Vector.Enabled {
 		ai := m.getOrCreateIndexState(scope.AgentID, policy, false)
-		if ai != nil && ai.index != nil {
-			ref := ItemRef{AgentID: item.AgentID, SessionID: item.SessionID, Layer: item.Layer, Key: item.Key, Version: item.Version}
-			_ = ai.index.Delete(ctx, ref)
+		if ai != nil {
+			ai.mu.RLock()
+			idx := ai.index
+			ai.mu.RUnlock()
+			if idx != nil {
+				ref := ItemRef{AgentID: item.AgentID, SessionID: item.SessionID, Layer: item.Layer, Key: item.Key, Version: item.Version}
+				_ = idx.Delete(ctx, ref)
+			}
 		}
 	}
 	return nil
@@ -1034,9 +1018,14 @@ func (m *Manager) Clear(ctx context.Context, policy config.MemoryPolicy, scope S
 	}
 	if policy.Vector.Enabled {
 		ai := m.getOrCreateIndexState(scope.AgentID, policy, false)
-		if ai != nil && ai.index != nil {
-			for _, it := range items {
-				_ = ai.index.Delete(ctx, ItemRef{AgentID: it.AgentID, SessionID: it.SessionID, Layer: it.Layer, Key: it.Key, Version: it.Version})
+		if ai != nil {
+			ai.mu.RLock()
+			idx := ai.index
+			ai.mu.RUnlock()
+			if idx != nil {
+				for _, it := range items {
+					_ = idx.Delete(ctx, ItemRef{AgentID: it.AgentID, SessionID: it.SessionID, Layer: it.Layer, Key: it.Key, Version: it.Version})
+				}
 			}
 		}
 	}
@@ -1152,11 +1141,18 @@ func (m *Manager) Reindex(ctx context.Context, policy config.MemoryPolicy, agent
 	l := m.agentLocks.acquire(agentID)
 	defer m.agentLocks.release(l)
 
+	if m.embedder == nil || m.indexFactory == nil {
+		m.markDegraded(agentID, "reindex")
+		m.emit(Event{Type: EventDegraded, AgentID: agentID, At: now, Reason: "reindex"})
+		m.degradedSet("index", 1)
+		return 0, fmt.Errorf("%w: embedder or index factory not configured", ErrMemoryReindexFailed)
+	}
+
 	items, err := m.store.List(ctx, Scope{AgentID: agentID, Layer: LayerLongTerm, SessionID: ""}, now)
 	if err != nil {
 		m.markDegraded(agentID, "reindex")
 		m.emit(Event{Type: EventDegraded, AgentID: agentID, At: now, Reason: "reindex"})
-			m.degradedSet("index", 1)
+		m.degradedSet("index", 1)
 		return 0, fmt.Errorf("%w: %v", ErrMemoryReindexFailed, err)
 	}
 	if len(items) == 0 {
@@ -1177,7 +1173,7 @@ func (m *Manager) Reindex(ctx context.Context, policy config.MemoryPolicy, agent
 	if err != nil || len(vectors) != len(items) {
 		m.markDegraded(agentID, "reindex")
 		m.emit(Event{Type: EventDegraded, AgentID: agentID, At: now, Reason: "reindex"})
-			m.degradedSet("index", 1)
+		m.degradedSet("index", 1)
 		return 0, fmt.Errorf("%w: %v", ErrMemoryReindexFailed, err)
 	}
 	// 临时 index
@@ -1187,7 +1183,7 @@ func (m *Manager) Reindex(ctx context.Context, policy config.MemoryPolicy, agent
 		if uerr := tmp.Upsert(ctx, ref, vec); uerr != nil {
 			m.markDegraded(agentID, "reindex")
 			m.emit(Event{Type: EventDegraded, AgentID: agentID, At: now, Reason: "reindex"})
-				m.degradedSet("index", 1)
+			m.degradedSet("index", 1)
 			return 0, fmt.Errorf("%w: %v", ErrMemoryReindexFailed, uerr)
 		}
 	}
@@ -1202,4 +1198,3 @@ func (m *Manager) Reindex(ctx context.Context, policy config.MemoryPolicy, agent
 }
 
 //================ helpers =================
-

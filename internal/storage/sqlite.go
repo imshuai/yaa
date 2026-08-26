@@ -24,7 +24,8 @@ type SQLiteStorage struct {
 	stop      chan struct{}
 	done      chan struct{}
 	closeOnce sync.Once
-	closed    atomic.Bool // docs/storage/sqlite.md §5: Close 开始后所有公开方法返回 ErrClosed
+	closed    atomic.Bool  // docs/storage/sqlite.md §5: Close 开始后所有公开方法返回 ErrClosed
+	writeMu   sync.RWMutex // Backup(写) 与 Set/Delete/cleanup(读) 互斥, 保证备份一致性
 }
 
 // NewSQLite 构造 SQLite 后端。Path 为空、打开失败、目录创建失败、PRAGMA/migration 失败均阻止 Ready。
@@ -134,6 +135,8 @@ func (s *SQLiteStorage) Set(key string, value []byte, ttl ...time.Duration) erro
 	if s.closed.Load() {
 		return ErrClosed
 	}
+	s.writeMu.RLock()
+	defer s.writeMu.RUnlock()
 	if err := validateKey(key); err != nil {
 		return err
 	}
@@ -159,6 +162,8 @@ func (s *SQLiteStorage) Delete(key string) error {
 	if s.closed.Load() {
 		return ErrClosed
 	}
+	s.writeMu.RLock()
+	defer s.writeMu.RUnlock()
 	if err := validateKey(key); err != nil {
 		return err
 	}
@@ -252,8 +257,8 @@ func (s *SQLiteStorage) cleanupLoop() {
 				}
 				n, err := s.cleanupExpired(1000)
 				if err != nil {
-					// ponytail: cleanup 失败不关闭 storage；Get/Has/Keys 的 expiry filter 保证不暴露过期值。
-					return
+					// cleanup 失败不关闭 storage；下次 tick 重试, 避免永久退出。
+					break
 				}
 				if n < 1000 {
 					break
@@ -266,6 +271,8 @@ func (s *SQLiteStorage) cleanupLoop() {
 }
 
 func (s *SQLiteStorage) cleanupExpired(batch int) (int, error) {
+	s.writeMu.RLock()
+	defer s.writeMu.RUnlock()
 	res, err := s.db.Exec(
 		`DELETE FROM root_kv
 		 WHERE key IN (
@@ -321,8 +328,10 @@ func (s *SQLiteStorage) Backup(dst string) error {
 	if err := ensureStorageDir(filepath.Dir(dst)); err != nil {
 		return err
 	}
-	// 短暂持有 cleanup loop: 不阻止但保证 checkpoint 与 copy 期间不被并发 cleanup 干扰.
-	// (cleanup 仅 DELETE 过期行, 与 backup 读不强冲突; 这里仅做 WAL 合并以保证 copy 是 self-contained.)
+	// 独占写锁: 保证 checkpoint 与 copy 期间没有并发 Set/Delete/cleanup 写入,
+	// 使复制出的主文件是自洽快照.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	_, err := s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`)
 	if err != nil {
 		// 非 WAL 模式返回 "no such function" 类错误, 视为可忽略 -> 继续 copy.

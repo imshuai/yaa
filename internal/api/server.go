@@ -212,6 +212,8 @@ func (s *Server) register(r *mux.Router) {
 	r.MethodNotAllowedHandler = http.HandlerFunc(s.methodNotAllowed)
 	// 未匹配兜底：gorilla/mux NotFoundHandler 返回的响应包成 envelope。
 	r.NotFoundHandler = http.HandlerFunc(s.notFound)
+	// 默认 WebUI 作为用户入口 (最后注册, 保证 /api/v1/* 优先).
+	registerWebUI(r)
 }
 
 // RegisteredRoutes 返回 register 时收集的全部 RouteSpec metadata。

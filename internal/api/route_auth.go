@@ -80,8 +80,13 @@ func (s *Server) registerProtected(r *mux.Router, spec routeSpec, h http.Handler
 			s.writeError(w, req, http.StatusMethodNotAllowed, 40501, "method not allowed")
 			return
 		}
-		if !enabled || authn == nil || authz == nil {
+		if !enabled {
 			h.ServeHTTP(w, req)
+			return
+		}
+		if authn == nil || authz == nil {
+			// enabled 但组件未注入属误配置: fail closed, 不放行.
+			s.writeError(w, req, http.StatusInternalServerError, 50001, "auth misconfigured")
 			return
 		}
 		if pub[req.URL.Path] {

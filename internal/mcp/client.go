@@ -62,7 +62,7 @@ type Client struct {
 	// onListChanged 由 Manager 设置; recvLoop 检测到 tools/list_changed notification 时
 	// 非阻塞调用本回调. 回调必须快速 (投递 cap-1 channel), 不得在 recvLoop 中发起 request
 	// (docs/mcp/client.md §recvLoop, docs/mcp/config-ref.md §7.2). nil 时 notification 被容忍丢弃.
-	onListChanged  func()
+	onListChanged func()
 
 	closeOnce sync.Once
 	failOnce  sync.Once
@@ -298,11 +298,11 @@ func (c *Client) fail(err error) {
 		c.pendingMu.Unlock()
 
 		for _, call := range calls {
-			// 容量 1：非阻塞投递不会因消费者已退出而阻塞；
-			// 消费者退出路径都会从 pending map 摘除自己后等待 ch，
-			// 但若 fail 摘除后 call 已 retire，ch 投递的接收方 select
-			// 已读出 retire 已收。安全投递。
-			call.ch <- clientResponse{err: err}
+			// 非阻塞投递: 已投递过响应或消费者已退出时跳过, 避免阻塞.
+			select {
+			case call.ch <- clientResponse{err: err}:
+			default:
+			}
 		}
 
 		c.mu.Lock()
@@ -339,12 +339,6 @@ func (c *Client) bestEffortCancel(id uint64, cause error) {
 	defer cancel()
 	// 固定 reason 文本，不注入 caller error 细节（避免把 caller cause 序列化进 wire）。
 	reason := "client cancelled"
-	if cause != nil {
-		reason = "client cancelled: " + cause.Error()
-		if len(reason) > 128 { // 上限保护，避免巨型 cause 进 wire
-			reason = reason[:128]
-		}
-	}
 	_ = c.transport.Send(ctx, &Message{
 		JSONRPC: "2.0",
 		Method:  "notifications/cancelled",

@@ -10,13 +10,6 @@ import (
 // ErrConfigSensitivePlain 验证敏感字段未使用 ${VAR} 注入.
 var ErrConfigSensitivePlain = errors.New("config: sensitive field must use ${VAR} environment reference")
 
-// sensitiveFieldPaths 是必须通过环境变量注入的字段路径列表.
-// ponytail: 用一组最小路径, 不引入动态 schema 注册.
-var sensitiveFieldPaths = []string{
-	"providers.api_key", // providers[].api_key — [] 是数组下标通配
-	"auth.jwt.secret",
-}
-
 // validateSensitiveSources 在 envvar 展开前校验 raw map: 敏感字段值必须为空或 ${...} 引用.
 // docs config checklist 行16: 敏感字段不在配置文件中明文存储.
 func validateSensitiveSources(raw map[string]any) error {
@@ -31,11 +24,30 @@ func validateSensitiveSources(raw map[string]any) error {
 			}
 		}
 	}
-	// auth.jwt.secret
-	if auth, ok := raw["auth"].(map[string]any); ok {
-		if jwt, ok := auth["jwt"].(map[string]any); ok {
-			if v, ok := jwt["secret"].(string); ok && v != "" && !isEnvRef(v) {
-				errs = append(errs, fmt.Errorf("%w: auth.jwt.secret", ErrConfigSensitivePlain))
+	// runtime.auth.{jwt.secret, tokens[].token}
+	if rt, ok := raw["runtime"].(map[string]any); ok {
+		if auth, ok := rt["auth"].(map[string]any); ok {
+			if jwt, ok := auth["jwt"].(map[string]any); ok {
+				if v, ok := jwt["secret"].(string); ok && v != "" && !isEnvRef(v) {
+					errs = append(errs, fmt.Errorf("%w: runtime.auth.jwt.secret", ErrConfigSensitivePlain))
+				}
+			}
+			if tokens, ok := auth["tokens"].([]any); ok {
+				for i, tk := range tokens {
+					if tm, ok := tk.(map[string]any); ok {
+						if v, ok := tm["token"].(string); ok && v != "" && !isEnvRef(v) {
+							errs = append(errs, fmt.Errorf("%w: runtime.auth.tokens[%d].token", ErrConfigSensitivePlain, i))
+						}
+					}
+				}
+			}
+		}
+	}
+	// memory.embedding.api_key
+	if mem, ok := raw["memory"].(map[string]any); ok {
+		if emb, ok := mem["embedding"].(map[string]any); ok {
+			if v, ok := emb["api_key"].(string); ok && v != "" && !isEnvRef(v) {
+				errs = append(errs, fmt.Errorf("%w: memory.embedding.api_key", ErrConfigSensitivePlain))
 			}
 		}
 	}

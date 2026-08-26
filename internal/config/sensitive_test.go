@@ -39,9 +39,11 @@ func TestValidateSensitiveSourcesAcceptsEnvRef(t *testing.T) {
 		"providers": []any{
 			map[string]any{"api_key": "${OPENAI_API_KEY}"},
 		},
-		"auth": map[string]any{
-			"jwt": map[string]any{
-				"secret": "${JWT_SECRET}",
+		"runtime": map[string]any{
+			"auth": map[string]any{
+				"jwt": map[string]any{
+					"secret": "${JWT_SECRET}",
+				},
 			},
 		},
 	}
@@ -67,9 +69,11 @@ func TestValidateSensitiveSourcesRejectsPlainText(t *testing.T) {
 
 func TestValidateSensitiveSourcesRejectsJwtSecret(t *testing.T) {
 	raw := map[string]any{
-		"auth": map[string]any{
-			"jwt": map[string]any{
-				"secret": "my-plain-secret",
+		"runtime": map[string]any{
+			"auth": map[string]any{
+				"jwt": map[string]any{
+					"secret": "my-plain-secret",
+				},
 			},
 		},
 	}

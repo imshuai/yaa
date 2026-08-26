@@ -64,13 +64,15 @@ func (r *Registry) Get(name string) Metric {
 func (r *Registry) WritePrometheus(w io.Writer) {
 	r.mu.RLock()
 	names := make([]string, 0, len(r.metrics))
-	for n := range r.metrics {
+	snapshot := make(map[string]Metric, len(r.metrics))
+	for n, m := range r.metrics {
 		names = append(names, n)
+		snapshot[n] = m
 	}
 	r.mu.RUnlock()
 	sort.Strings(names)
 	for _, n := range names {
-		r.metrics[n].WritePrometheus(w)
+		snapshot[n].WritePrometheus(w)
 	}
 }
 

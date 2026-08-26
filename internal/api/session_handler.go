@@ -380,6 +380,8 @@ func decodeBody(r *http.Request, dst any) error {
 	if r.Body == nil || r.ContentLength == 0 {
 		return nil
 	}
+	// 限制请求体大小, 防止内存 DoS (与 memory 端点 1 MiB 一致).
+	r.Body = http.MaxBytesReader(nil, r.Body, 1<<20)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	return dec.Decode(dst)

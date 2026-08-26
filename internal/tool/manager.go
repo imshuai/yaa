@@ -22,7 +22,7 @@ type Manager struct {
 	cfg       *config.Config
 	providers *provider.Manager
 	logger    *slog.Logger
-	metrics   *toolMetrics     // nil → nop; docs/tool/observability.md §10.2
+	metrics   *toolMetrics // nil → nop; docs/tool/observability.md §10.2
 
 	mu      sync.RWMutex
 	tools   map[string]Tool
@@ -33,8 +33,10 @@ type Manager struct {
 	agents map[string]agentBinding
 
 	// 并发Gate
-	global   sema
-	sessions map[string]sema // per-session gate, lazy。
+	global sema
+	// ponytail: per-session gate 懒构造后不清理; 高基数 sessionID 会累积内存.
+	// 升级路径: 由 Session 生命周期事件驱动 ReleaseSession 删除.
+	sessions map[string]sema
 }
 
 type agentBinding struct {
@@ -80,7 +82,7 @@ func NewManager(deps Dependencies) (*Manager, error) {
 		source:    map[string]string{},
 		agents:    map[string]agentBinding{},
 		global:    newSema(tc.MaxConcurrent),
-		sessions: map[string]sema{},
+		sessions:  map[string]sema{},
 	}
 	// 复制 builtin 配置（深拷贝 options）。
 	for name, bc := range tc.Builtin {
@@ -349,7 +351,7 @@ func (m *Manager) Execute(ctx context.Context, scope ExecutionScope, toolName st
 	beginAt := time.Now()
 	var result ToolResult
 	var err error
-	retryLoop:
+retryLoop:
 	for attempt := 0; attempt <= maxRetry; attempt++ {
 		result, err = t.Execute(callCtx, scope, params)
 		// docs §6 step 8: caller cause 先于 child cause 先于 retryable.
@@ -481,7 +483,7 @@ func (m *Manager) truncateResult(agentID, content string) string {
 	}
 	// UTF-8 边界对齐: 不切断 rune.
 	cut := byteLimit
-	for cut > 0 && !utf8.RuneStart(content[cut-1]) {
+	for cut > 0 && cut < len(content) && !utf8.RuneStart(content[cut]) {
 		cut--
 	}
 	return content[:cut] + "[…truncated]"

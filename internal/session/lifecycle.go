@@ -58,7 +58,7 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (sessOut *Sessi
 			active++
 		}
 	}
-	if active >= m.cfg.MaxSessionsPerAgent {
+	if m.cfg.MaxSessionsPerAgent > 0 && active >= m.cfg.MaxSessionsPerAgent {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: agent %s has %d active sessions", ErrCapacityExceeded, req.AgentID, active)
 	}

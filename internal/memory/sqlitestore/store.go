@@ -438,13 +438,13 @@ func (s *Store) DeleteExpired(ctx context.Context, before time.Time, limit int) 
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// ORDER BY expires_at ASC, agent_id, session_id, item_key（与 memstore 一致）。
+	// 取全部带 expires_at 的行, 在 Go 内用 parseTime 精确比较,
+	// 避免 RFC3339Nano 文本字典序在小数秒边界出错。
 	rows, err := tx.QueryContext(ctx,
 		`SELECT agent_id, layer, session_id, item_key, content, metadata, created_at, updated_at, expires_at, version
 		 FROM memory_items
-		 WHERE expires_at IS NOT NULL AND expires_at != '' AND expires_at <= ?
+		 WHERE expires_at IS NOT NULL AND expires_at != ''
 		 ORDER BY expires_at ASC, agent_id ASC, session_id ASC, item_key ASC;`,
-		formatTime(beforeUTC),
 	)
 	if err != nil {
 		return nil, storeErr(err)
@@ -456,7 +456,9 @@ func (s *Store) DeleteExpired(ctx context.Context, before time.Time, limit int) 
 			rows.Close()
 			return nil, corruptOrStoreErr(err)
 		}
-		all = append(all, item)
+		if item.ExpiresAt != nil && !item.ExpiresAt.After(beforeUTC) {
+			all = append(all, item)
+		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -504,6 +506,8 @@ func (s *Store) Count(ctx context.Context, agentID string, now time.Time) (int, 
 				if !t.After(nowUTC) {
 					continue
 				}
+			} else {
+				return 0, fmt.Errorf("%w: decode expires_at: %v", memory.ErrMemoryCorrupt, perr)
 			}
 		}
 		n++
@@ -571,7 +575,7 @@ func (s *Store) queryOneTx(tx *sql.Tx, ctx context.Context, query string, args .
 func scanItem(scan func(...any) error) (memory.MemoryItem, error) {
 	var (
 		agentID, layer, sessionID, key, content, metaStr string
-		createdAt, updatedAt                            string
+		createdAt, updatedAt                             string
 		expiresStr                                       sql.NullString
 		version                                          uint64
 	)

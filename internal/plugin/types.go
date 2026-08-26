@@ -263,3 +263,17 @@ func (h *ProxyHandle) Store(c *RPCClient) {
 func (h *ProxyHandle) Invalidate(c *RPCClient) bool {
 	return h.client.CompareAndSwap(c, nil)
 }
+
+// StoreIfNilOr 仅当当前为 nil 或 old 时替换为 c; 否则返回 false.
+// 用于 restart 场景: monitor 已先 Invalidate(old) 置 nil, 这里兼容 handle 仍为 nil 或 old 两种情况.
+func (h *ProxyHandle) StoreIfNilOr(old, c *RPCClient) bool {
+	for {
+		cur := h.client.Load()
+		if cur != nil && cur != old {
+			return false
+		}
+		if h.client.CompareAndSwap(cur, c) {
+			return true
+		}
+	}
+}

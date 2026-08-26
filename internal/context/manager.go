@@ -14,7 +14,7 @@ import (
 )
 
 // Manager 是 Context 窗口管理器；无内部状态，每次 Build 独立。
-type Manager struct{
+type Manager struct {
 	metrics *contextMetrics
 }
 
@@ -75,12 +75,12 @@ func (m *Manager) Build(ctx stdctx.Context, in BuildInput) (*BuildOutput, error)
 		return nil, err
 	}
 
-	stategy := in.Config.Strategy
-	if stategy == "" {
-		stategy = "hybrid"
+	strategy := in.Config.Strategy
+	if strategy == "" {
+		strategy = "hybrid"
 	}
-	if stategy != "hybrid" && stategy != "truncate" && stategy != "reject" {
-		return nil, fmt.Errorf("%w: unknown strategy %q", ErrContextConfigInvalid, stategy)
+	if strategy != "hybrid" && strategy != "truncate" && strategy != "reject" {
+		return nil, fmt.Errorf("%w: unknown strategy %q", ErrContextConfigInvalid, strategy)
 	}
 
 	// 构造并校验消息单元
@@ -99,14 +99,14 @@ func (m *Manager) Build(ctx stdctx.Context, in BuildInput) (*BuildOutput, error)
 	tokens, err := in.Provider.EstimateInputTokens(ctx, &in.Request)
 	if err != nil {
 		m.metrics.estimationFailedInc(providerID, model)
-		m.metrics.buildInc(providerID, model, stategy, "estimation_failed")
+		m.metrics.buildInc(providerID, model, strategy, "estimation_failed")
 		return nil, fmt.Errorf("%w: %v", ErrTokenEstimationFailed, err)
 	}
 
 	// 不超预算则直接返回
 	if tokens <= budget.Input {
-		m.metrics.buildInc(providerID, model, stategy, "ok")
-		m.metrics.buildDurationObserve(providerID, model, stategy, time.Since(start).Seconds())
+		m.metrics.buildInc(providerID, model, strategy, "ok")
+		m.metrics.buildDurationObserve(providerID, model, strategy, time.Since(start).Seconds())
 		m.metrics.inputTokensObserve(providerID, model, tokens)
 		if budget.Input > 0 {
 			m.metrics.utilRatioObserve(providerID, model, float64(tokens)/float64(budget.Input))
@@ -117,7 +117,7 @@ func (m *Manager) Build(ctx stdctx.Context, in BuildInput) (*BuildOutput, error)
 			InputBudget:     budget.Input,
 			EffectiveWindow: budget.EffectiveWindow,
 			Metadata: BuildMetadata{
-				Strategy:         stategy,
+				Strategy:         strategy,
 				OriginalMessages: originalCount,
 				FinalMessages:    originalCount,
 				BuildDuration:    time.Since(start),
@@ -136,25 +136,25 @@ func (m *Manager) Build(ctx stdctx.Context, in BuildInput) (*BuildOutput, error)
 			return nil, fmt.Errorf("%w: protected estimate: %v", ErrTokenEstimationFailed, perr)
 		}
 		if ptokens > budget.Input {
-			m.metrics.overflowInc(providerID, model, stategy, "protected")
-			m.metrics.buildInc(providerID, model, stategy, "overflow")
+			m.metrics.overflowInc(providerID, model, strategy, "protected")
+			m.metrics.buildInc(providerID, model, strategy, "overflow")
 			return nil, fmt.Errorf("%w: protected input %d > budget %d", ErrContextOverflow, ptokens, budget.Input)
 		}
 	}
 
-	switch stategy {
+	switch strategy {
 	case "reject":
-		m.metrics.overflowInc(providerID, model, stategy, "reject")
-		m.metrics.buildInc(providerID, model, stategy, "overflow")
+		m.metrics.overflowInc(providerID, model, strategy, "reject")
+		m.metrics.buildInc(providerID, model, strategy, "overflow")
 		return nil, fmt.Errorf("%w: reject strategy, tokens %d > budget %d", ErrContextOverflow, tokens, budget.Input)
 	case "truncate":
-		return m.truncate(ctx, in, units, budget, stategy, originalCount, start)
+		return m.truncate(ctx, in, units, budget, strategy, originalCount, start)
 	case "hybrid":
 		// hybrid: 同步摘要 → 失败/超过 target → fallback truncate. docs/context/manager.md §5.3.
 		if in.Config.Compression.Enabled && budget.Input > 0 {
 			util := float64(tokens) / float64(budget.Input)
 			if util >= in.Config.Compression.Threshold {
-				out, compressed, ok := m.summarize(ctx, in, units, budget, stategy, originalCount, start, tokens)
+				out, compressed, ok := m.summarize(ctx, in, units, budget, strategy, originalCount, start, tokens)
 				if ok {
 					return out, nil
 				}
@@ -165,14 +165,14 @@ func (m *Manager) Build(ctx stdctx.Context, in BuildInput) (*BuildOutput, error)
 			}
 		}
 		// 摘要未启用 / 未达阈值 / 摘要失败 → fallback truncate
-		out, err := m.truncate(ctx, in, units, budget, stategy, originalCount, start)
+		out, err := m.truncate(ctx, in, units, budget, strategy, originalCount, start)
 		if err != nil {
 			return nil, err
 		}
 		out.Metadata.CompressionFailed = true
 		return out, nil
 	}
-	return nil, fmt.Errorf("%w: unhandled strategy %q", ErrContextBuildFailed, stategy)
+	return nil, fmt.Errorf("%w: unhandled strategy %q", ErrContextBuildFailed, strategy)
 }
 
 // truncate 按 unit 截断最旧的可删除 unit 直到不超限。
@@ -408,7 +408,7 @@ func (m *Manager) summarize(ctx stdctx.Context, in BuildInput, units []messageUn
 	}
 	timeout := cfg.Timeout
 	if timeout <= 0 {
-		timeout = 20 * time.Minute // 防御: docs 默认 20s, 但若 cfg 未正确 init 用足够大值
+		timeout = 20 * time.Second // docs 默认 20s
 	}
 	sumCtx, cancel := stdctx.WithTimeout(ctx, timeout)
 	defer cancel()

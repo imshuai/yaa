@@ -20,7 +20,10 @@ func TestHTTPExecuteBasic(t *testing.T) {
 		_, _ = w.Write([]byte("the body"))
 	}))
 	defer srv.Close()
-	h, _ := NewHTTP(newShellCfg(nil))
+	u, _ := url.Parse(srv.URL)
+	h, _ := NewHTTP(config.ToolConfig{Enabled: true, Options: map[string]any{
+		"allowed_hosts": []any{u.Hostname()},
+	}})
 	r, err := h.Execute(context.Background(), tool.ExecutionScope{AgentID: "a"}, map[string]any{
 		"url":    srv.URL + "/x",
 		"method": "GET",
@@ -78,7 +81,10 @@ func TestHTTPExecutePostBody(t *testing.T) {
 		_, _ = w.Write([]byte("got:" + strings.TrimSpace(string(buf[:n]))))
 	}))
 	defer srv.Close()
-	h, _ := NewHTTP(newShellCfg(nil))
+	u, _ := url.Parse(srv.URL)
+	h, _ := NewHTTP(config.ToolConfig{Enabled: true, Options: map[string]any{
+		"allowed_hosts": []any{u.Hostname()},
+	}})
 	r, _ := h.Execute(context.Background(), tool.ExecutionScope{AgentID: "a"}, map[string]any{
 		"url":    srv.URL,
 		"method": "POST",
@@ -167,8 +173,10 @@ func TestHTTPRedirectExceedsMaxRedirects(t *testing.T) {
 		http.Redirect(w, r, "/r", http.StatusFound)
 	}))
 	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
 	h, _ := NewHTTP(config.ToolConfig{Enabled: true, Options: map[string]any{
 		"max_redirects": 2,
+		"allowed_hosts": []any{u.Hostname()},
 	}})
 	r, err := h.Execute(context.Background(), tool.ExecutionScope{AgentID: "a"}, map[string]any{
 		"url": srv.URL + "/r",

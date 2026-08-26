@@ -51,6 +51,8 @@ func run(configPath string) error {
 	if err := rt.Start(ctx); err != nil {
 		return fmt.Errorf("start runtime: %w", err)
 	}
+	// logCloser 先注册, 保证 LIFO 下最后执行 (runtime shutdown 之后才关日志).
+	defer logCloser()
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout(cfg))
 		defer cancel()
@@ -59,7 +61,6 @@ func run(configPath string) error {
 		}
 	}()
 
-	defer logCloser()
 	logger.Info("runtime started", "addr", cfg.Runtime.API.HTTP.Addr)
 
 	<-ctx.Done()

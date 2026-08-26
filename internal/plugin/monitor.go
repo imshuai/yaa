@@ -189,7 +189,7 @@ func (m *Manager) retryRestart(e *Entry, oldClient *RPCClient) bool {
 			return false
 		}
 		m.mu.Lock()
-		if !e.Handle.Invalidate(oldClient) {
+		if !e.Handle.StoreIfNilOr(oldClient, newClient) {
 			// handle 已被其他 goroutine 替换 — Term 这个 newClient 防泄漏.
 			m.mu.Unlock()
 			m.lifecycleMu.Unlock()
@@ -197,7 +197,6 @@ func (m *Manager) retryRestart(e *Entry, oldClient *RPCClient) bool {
 			return false
 		}
 		e.Client = newClient
-		e.Handle.Store(newClient)
 		e.State = StateReady
 		e.StartedAt = time.Now()
 		e.LastError = nil

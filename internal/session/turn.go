@@ -144,8 +144,7 @@ func (t *Turn) Append(inputs []AppendInput) ([]SessionMessage, error) {
 			return nil, fmt.Errorf("%w: %d > %d", ErrMessageLimitExceeded, len(cand.Messages), cand.Policy.MaxMessages)
 		}
 		cand.UpdatedAt = now
-		// user 提交才更新 LastActivityAt；Append 不刷新（文档：成功追加消息更新 LastActivityAt；
-		// 但要区分 user turn）。为简化且符合，assistant/tool append 也算活动，但文档说 Pause/Close 不刷新 LastActivityAt；AppendUser/Append 都刷新。参考“LastActivityAt: Create、成功追加消息、Resume 更新”
+		// 成功追加消息也更新 LastActivityAt（与 AppendUser 一致）。
 		cand.LastActivityAt = now
 		result = batch
 		return cand, nil

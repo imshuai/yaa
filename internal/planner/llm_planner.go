@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -239,10 +240,8 @@ func decodePlanResponse(content string) (planResponse, error) {
 		return raw, err
 	}
 	// 拒绝 trailing token: 解码后再读必须 io.EOF.
-	if dec.More() {
+	if _, err := dec.Token(); err != io.EOF {
 		return raw, fmt.Errorf("unexpected trailing tokens after plan object")
 	}
 	return raw, nil
 }
-
-

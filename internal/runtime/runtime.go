@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,7 +34,7 @@ type Runtime struct {
 	cfg        *config.Config
 	configPath string
 	store      storage.Storage
-	reloadMgr *config.ReloadManager // 非 nil 时启用 config hot reload (configPath 已设置时构造)
+	reloadMgr  *config.ReloadManager // 非 nil 时启用 config hot reload (configPath 已设置时构造)
 	providers  *provider.Manager
 	sessions   *session.Manager
 	contextM   *ctxwindow.Manager
@@ -45,9 +46,10 @@ type Runtime struct {
 	api        *api.Server
 	logger     *slog.Logger
 
-	ready      atomic.Bool
-	startedAt  time.Time
-	components map[string]string
+	ready        atomic.Bool
+	startedAt    time.Time
+	components   map[string]string
+	componentsMu sync.RWMutex
 }
 
 // New 构造 Runtime，但不启动任何组件。
@@ -228,7 +230,7 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	am, aerr := agent.NewManager(agent.Dependencies{
 		Config:    rt.cfg,
 		Reloader:  rt.reloadMgr, // 非 nil 时 Agent turn 从 Current() 取 hot-reload 字段 (行58)
-		Sessions:  nil, // 先填 nil，下面 Restore+Start 完成后再注入
+		Sessions:  nil,          // 先填 nil，下面 Restore+Start 完成后再注入
 		Context:   rt.contextM,
 		Providers: pm,
 		Logger:    rt.logger,
@@ -342,10 +344,15 @@ func (rt *Runtime) Ready() bool { return rt.ready.Load() }
 
 // Health 实现 api.HealthProvider，返回当前运行态快照。
 func (rt *Runtime) Health() api.HealthData {
+	rt.componentsMu.RLock()
+	storageDegraded := rt.components["storage"] == "degraded"
+	components := cloneComponents(rt.components)
+	rt.componentsMu.RUnlock()
+
 	status := "healthy"
 	if !rt.ready.Load() {
 		status = "not_ready"
-	} else if rt.components["storage"] == "degraded" {
+	} else if storageDegraded {
 		// 关键组件 ready 但 storage 降级（memory 后端）→ degraded、ready=true。
 		status = "degraded"
 	}
@@ -367,7 +374,7 @@ func (rt *Runtime) Health() api.HealthData {
 		Status:     status,
 		Ready:      rt.ready.Load(),
 		Agents:     agentCounts,
-		Components: cloneComponents(rt.components),
+		Components: components,
 	}
 }
 
@@ -426,7 +433,9 @@ func (rt *Runtime) Shutdown(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
+	rt.componentsMu.Lock()
 	rt.components = map[string]string{}
+	rt.componentsMu.Unlock()
 	return errors.Join(errs...)
 }
 
@@ -467,7 +476,9 @@ func (rt *Runtime) rollback() {
 	rt.contextM = nil
 	rt.providers = nil
 	rt.store = nil
+	rt.componentsMu.Lock()
 	rt.components = map[string]string{}
+	rt.componentsMu.Unlock()
 }
 
 // agentExists 判断某 Agent ID 是否在配置中注册。

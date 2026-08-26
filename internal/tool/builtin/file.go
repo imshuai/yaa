@@ -280,14 +280,14 @@ func validatePath(path string, allowed, blocked []string) (string, error) {
 			return "", fmt.Errorf("path is blocked")
 		}
 	}
-	if len(allowed) > 0 {
-		for _, root := range allowed {
-			if within(target, root) {
-				return target, nil
-			}
-		}
-		return "", fmt.Errorf("path is not in allowed paths")
+	if len(allowed) == 0 {
+		return "", fmt.Errorf("no allowed paths configured")
 	}
-	return target, nil
+	for _, root := range allowed {
+		if within(target, root) {
+			return target, nil
+		}
+	}
+	return "", fmt.Errorf("path is not in allowed paths")
 }
 

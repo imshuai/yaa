@@ -64,17 +64,18 @@ func NewHTTP(cfg config.ToolConfig) (*HTTPTool, error) {
 						return errRedirectBlocked
 					}
 				}
-				if len(o.AllowedHosts) > 0 {
-					ok := false
-					for _, a := range o.AllowedHosts {
-						if strings.ToLower(a) == host {
-							ok = true
-							break
-						}
+				if len(o.AllowedHosts) == 0 {
+					return errRedirectNotAllowed
+				}
+				ok := false
+				for _, a := range o.AllowedHosts {
+					if strings.ToLower(a) == host {
+						ok = true
+						break
 					}
-					if !ok {
-						return errRedirectNotAllowed
-					}
+				}
+				if !ok {
+					return errRedirectNotAllowed
 				}
 				return nil
 			},
@@ -116,7 +117,7 @@ func (h *HTTPTool) Execute(ctx context.Context, scope tool.ExecutionScope, param
 	if h.isBlocked(parsed.Hostname()) {
 		return tool.ToolResult{Content: "host blocked", IsError: true}, nil
 	}
-	if len(h.opts.AllowedHosts) > 0 && !h.isAllowed(parsed.Hostname()) {
+	if len(h.opts.AllowedHosts) == 0 || !h.isAllowed(parsed.Hostname()) {
 		return tool.ToolResult{Content: "host not allowed", IsError: true}, nil
 	}
 

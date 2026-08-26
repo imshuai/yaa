@@ -90,7 +90,7 @@ func (s *ShellTool) Execute(ctx context.Context, scope tool.ExecutionScope, para
 	if s.isBlocked(canon) {
 		return tool.ToolResult{Content: "command blocked", IsError: true}, nil
 	}
-	if len(s.opts.AllowedCommands) > 0 && !s.isAllowed(canon) {
+	if len(s.opts.AllowedCommands) == 0 || !s.isAllowed(canon) {
 		return tool.ToolResult{Content: "command not allowed", IsError: true}, nil
 	}
 

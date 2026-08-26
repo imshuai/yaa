@@ -113,7 +113,7 @@ func (p *claudeProvider) buildAnthropicReq(req *ChatRequest, stream bool) (*anth
 	case req.ToolChoice != nil && req.ToolChoice.Mode == "auto":
 		out.ToolChoice = map[string]any{"type": "auto"}
 	case req.ToolChoice != nil && req.ToolChoice.Mode == "none":
-		out.ToolChoice = map[string]any{"type": "any", "disable_parallel_tool_use": true}
+		out.ToolChoice = map[string]any{"type": "none"}
 	case req.ToolChoice != nil && req.ToolChoice.Mode == "required":
 		out.ToolChoice = map[string]any{"type": "any"}
 	case req.ToolChoice != nil && req.ToolChoice.Mode == "specific" && req.ToolChoice.Tool != "":
@@ -328,13 +328,14 @@ func (p *claudeProvider) streamLoop(ctx context.Context, resp *http.Response, ou
 	const maxLine = 1 << 20
 	scanner.Buffer(make([]byte, 0, maxLine), maxLine)
 	var (
-		model       string
-		inputToks   int
-		usage       *Usage
-		finish      string
-		blockIdx    int = -1
-		blockType   string
-		blockToolID string
+		model         string
+		inputToks     int
+		usage         *Usage
+		finish        string
+		blockIdx      int = -1
+		blockType     string
+		blockToolID   string
+		blockToolName string
 	)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -377,8 +378,8 @@ func (p *claudeProvider) streamLoop(ctx context.Context, resp *http.Response, ou
 				// 发出 assistant_start chunk 由 Agent 主导，不在此首送 text delta。
 				if blockType == "tool_use" && blk["name"] != nil {
 					name, _ := blk["name"].(string)
+					blockToolName = name
 					last = ChatChunk{ID: nopID(ev), Model: model, Delta: Delta{Role: "assistant"}}
-					_ = name
 				}
 			}
 		case "content_block_delta":
@@ -395,7 +396,7 @@ func (p *claudeProvider) streamLoop(ctx context.Context, resp *http.Response, ou
 						delta.ToolCalls = []ToolCall{{
 							ID:       blockToolID,
 							Type:     "function",
-							Function: ToolCallFunction{Arguments: argv},
+							Function: ToolCallFunction{Name: blockToolName, Arguments: argv},
 						}}
 					}
 				case "thinking_delta":
