@@ -464,6 +464,17 @@ func (s *Store) DeleteExpired(ctx context.Context, before time.Time, limit int) 
 	if err := rows.Err(); err != nil {
 		return nil, storeErr(err)
 	}
+	// RFC3339Nano 文本序与时间序不一致(小数秒), 按解析后的时间排序保证 expires_at ASC.
+	sort.SliceStable(all, func(i, j int) bool {
+		ti, tj := time.Time{}, time.Time{}
+		if all[i].ExpiresAt != nil {
+			ti = *all[i].ExpiresAt
+		}
+		if all[j].ExpiresAt != nil {
+			tj = *all[j].ExpiresAt
+		}
+		return ti.Before(tj)
+	})
 	if limit > 0 && limit < len(all) {
 		all = all[:limit]
 	}

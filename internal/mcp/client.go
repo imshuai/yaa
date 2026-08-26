@@ -457,7 +457,11 @@ func (c *Client) dispatchResponse(msg *Message) {
 		// late / duplicate：丢弃；不毒化连接（docs recvLoop）。
 		return
 	}
-	call.ch <- clientResponse{msg: msg}
+	// 非阻塞投递: 若 fail() 已抢先塞入 error, 丢弃本响应, 避免 recvLoop 永久阻塞.
+	select {
+	case call.ch <- clientResponse{msg: msg}:
+	default:
+	}
 }
 
 // runControlLoop 回应 server 端 request：ping 返 ping 响应，

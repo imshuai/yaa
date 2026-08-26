@@ -11,6 +11,7 @@ import (
 
 	"github.com/imshuai/yaa/internal/agent"
 	"github.com/imshuai/yaa/internal/api"
+	"github.com/imshuai/yaa/internal/auth"
 	"github.com/imshuai/yaa/internal/config"
 	ctxwindow "github.com/imshuai/yaa/internal/context"
 	"github.com/imshuai/yaa/internal/mcp"
@@ -100,10 +101,10 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	}
 	rt.store = store
 	if rt.cfg.Runtime.Storage.Type == "memory" {
-		rt.components["storage"] = "degraded"
+		rt.setComponent("storage", "degraded")
 		rt.logger.Warn("root storage using memory backend", "durable", false)
 	} else {
-		rt.components["storage"] = "ready"
+		rt.setComponent("storage", "ready")
 	}
 
 	// Provider：未知类型/重复 ID/构造失败阻止 Ready。
@@ -113,7 +114,7 @@ func (rt *Runtime) Start(ctx context.Context) error {
 		return perr
 	}
 	rt.providers = pm
-	rt.components["provider"] = "ready"
+	rt.setComponent("provider", "ready")
 
 	// Memory Manager：架构 §3.1 顺序 Provider → Memory。v1 仅启用根配置的 enabled
 	// 时构造；关闭时为 nil，Runtime 不向 Agent/Remote 注入检索能力。
@@ -161,7 +162,7 @@ func (rt *Runtime) Start(ctx context.Context) error {
 		// ponytail: v1 暂不接入 EventEmitter/AuditLogger；事件 sink 为 nil。
 		mmMgr := mm.NewManager(ms, embedder, indexFactory, mm.SystemClock{}, nil)
 		rt.memory = mmMgr
-		rt.components["memory"] = "ready"
+		rt.setComponent("memory", "ready")
 		// vector 启用时启动期对每个 Agent Reindex; 失败仅 warn 让 health 显 degraded。
 		if rt.cfg.Memory.Vector.Enabled {
 			for _, ag := range rt.cfg.Agents {
@@ -183,7 +184,7 @@ func (rt *Runtime) Start(ctx context.Context) error {
 		// docs/memory checklist 行32: 后台周期 cleanup worker
 		mmMgr.StartCleanup(ctx, rt.cfg.Memory.ExpireInterval, rt.cfg.Memory.ExpireBatchSize)
 	} else {
-		rt.components["memory"] = "disabled"
+		rt.setComponent("memory", "disabled")
 	}
 
 	// Tool Manager：注册 builtin → 每 Agent 空历史 projection binding 校验（docs/tool/manager.md §2.2）。
@@ -205,7 +206,7 @@ func (rt *Runtime) Start(ctx context.Context) error {
 		}
 	}
 	rt.tools = tm
-	rt.components["tool"] = "ready"
+	rt.setComponent("tool", "ready")
 
 	// Skill Manager：启动期 all-or-nothing 加载 SKILL.md + Agent binding 校验
 	// （docs/skill/manager.md §3）。baseDir 取自主配置文件目录；未设置时相对 cwd。
@@ -221,7 +222,7 @@ func (rt *Runtime) Start(ctx context.Context) error {
 		return fmt.Errorf("runtime: load skills: %w", serr)
 	}
 	rt.skills = skm
-	rt.components["skill"] = "ready"
+	rt.setComponent("skill", "ready")
 
 	// Context 窗口管理器
 	rt.contextM = ctxwindow.NewManager()
@@ -254,7 +255,7 @@ func (rt *Runtime) Start(ctx context.Context) error {
 		return serr
 	}
 	rt.sessions = sm
-	rt.components["session_restore"] = "ready"
+	rt.setComponent("session_restore", "ready")
 
 	// 将 Session Manager / Tool Manager / Skill Manager 注入 Agent（先前构造时为 nil，此处补全指针）
 	am.SetSessions(sm)
@@ -262,7 +263,13 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	am.SetSkills(rt.skills)
 	am.SetMemory(rt.memory)
 	rt.agents = am
-	rt.components["agent"] = "ready"
+	rt.setComponent("agent", "ready")
+
+	authn, authz, publicPaths, aerr := buildAuth(rt.cfg.Runtime.Auth)
+	if aerr != nil {
+		rt.rollback()
+		return aerr
+	}
 
 	rt.api = api.NewServer(rt.cfg.Runtime.API.HTTP.Addr, rt, rt.logger)
 	rt.api.SetSessionProvider(sm, rt.agentAPIShim())
@@ -274,6 +281,9 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	rt.api.SetProviderManager(rt.providers)
 	// 注入 Config snapshot 供 GET /api/v1/config 使用 config.RedactedView。
 	rt.api.SetConfigSnapshot(rt.cfg)
+	if authn != nil {
+		rt.api.SetAuth(true, authn, authz, publicPaths)
+	}
 
 	// MCP Manager 构造并注入 Remote API mcp/servers 端点。
 	// v1 起：仅缓存配置以供 List/Get 投影；尚不启动任何上游 Client / 本地 Serve
@@ -294,7 +304,7 @@ func (rt *Runtime) Start(ctx context.Context) error {
 	}
 	rt.mcpMgr = mcpMgr
 	rt.api.SetMCPServerProvider(mcpMgr)
-	rt.components["mcp"] = "ready"
+	rt.setComponent("mcp", "ready")
 
 	// 注册依赖 MCP Manager 快照的 introspection Tool (docs/tool/introspection.md §10 mcp_list).
 	// 在 mcpMgr Prepare/Activate 完成 (ServerStatus 快照可读) 后注册;
@@ -332,7 +342,7 @@ func (rt *Runtime) Start(ctx context.Context) error {
 		rt.rollback()
 		return err
 	}
-	rt.components["api"] = "ready"
+	rt.setComponent("api", "ready")
 
 	rt.ready.Store(true)
 	rt.logger.Info("runtime ready", "addr", rt.cfg.Runtime.API.HTTP.Addr, "storage", rt.cfg.Runtime.Storage.Type)
@@ -549,6 +559,39 @@ func (rt *Runtime) APIAddr() string {
 		return rt.api.Addr()
 	}
 	return rt.cfg.Runtime.API.HTTP.Addr
+}
+
+// setComponent 在锁内更新组件状态, 避免 Start 写入与 Health 读并发竞争.
+func (rt *Runtime) setComponent(name, status string) {
+	rt.componentsMu.Lock()
+	rt.components[name] = status
+	rt.componentsMu.Unlock()
+}
+
+// buildAuth 按配置构造 Authenticator/Authorizer (docs/auth/checklist.md 行42).
+// enabled=false 返回 nil; 构造失败由调用方中止启动 (fail closed).
+func buildAuth(cfg config.AuthConfig) (auth.Authenticator, auth.Authorizer, []string, error) {
+	if !cfg.Enabled {
+		return nil, nil, nil, nil
+	}
+	var authn auth.Authenticator
+	var err error
+	switch cfg.TokenType {
+	case "static":
+		authn, err = auth.NewStaticAuthenticator(cfg.Tokens)
+	case "jwt":
+		authn, err = auth.NewJWTAuthenticator(cfg.JWT)
+	default:
+		return nil, nil, nil, fmt.Errorf("runtime: unknown auth token_type %q", cfg.TokenType)
+	}
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("runtime: build authenticator: %w", err)
+	}
+	authz, err := auth.NewRBACAuthorizer(cfg.Roles)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("runtime: build authorizer: %w", err)
+	}
+	return authn, authz, cfg.PublicPaths, nil
 }
 
 func cloneComponents(m map[string]string) map[string]string {

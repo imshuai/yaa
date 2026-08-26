@@ -99,7 +99,7 @@ func newToolLoopEnv(t *testing.T, handler func(callIdx int) map[string]any, tota
 		Session: sessCfg,
 		// 修复 test env flake：DefaultTimeout=0 会导致 time.AfterFunc(0) 立即 fire cancel
 		// 让 echo Execute 在 goroutine 调度下偶发被判超时（生产 cfg 经 validation 必 >0）。
-		Tools:   config.DefaultToolsConfig(),
+		Tools: config.DefaultToolsConfig(),
 	}
 
 	tm, err := tool.NewManager(tool.Dependencies{Config: cfg, Providers: pm})
@@ -354,7 +354,7 @@ func newSkillTestEnv(t *testing.T, skillsDir string, agentSkills []string, sysPr
 		Session: sessCfg,
 		Skills:  config.SkillsConfig{Dir: skillsDir, PerSkill: map[string]config.SkillItemConfig{}},
 		// 同 newToolLoopEnv：补合法 tools.timeout 避免 zero-timeout flake。
-		Tools:   config.DefaultToolsConfig(),
+		Tools: config.DefaultToolsConfig(),
 	}
 
 	// Tool Manager（Agent.Skill 无 Tool 依赖时也需存在以便 Agent.Deps 字段类型匹配，可空注册）。
@@ -482,4 +482,44 @@ func indexOf(items []string, pred func(string) bool) int {
 		}
 	}
 	return -1
+}
+
+// TestMergeToolCallFragment 流式分片按 ID 聚合为单个完整调用。
+func TestMergeToolCallFragment(t *testing.T) {
+	var calls []provider.ToolCall
+	fragments := []provider.ToolCall{
+		{ID: "t1", Type: "function", Function: provider.ToolCallFunction{Name: "get_weather", Arguments: `{"ci`}},
+		{ID: "t1", Type: "function", Function: provider.ToolCallFunction{Arguments: `ty":"北京"}`}},
+		{ID: "t2", Type: "function", Function: provider.ToolCallFunction{Name: "echo", Arguments: `{"x":1}`}},
+	}
+	for _, f := range fragments {
+		calls = mergeToolCallFragment(calls, f)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("calls=%d want 2", len(calls))
+	}
+	if calls[0].Function.Name != "get_weather" || calls[0].Function.Arguments != `{"city":"北京"}` {
+		t.Fatalf("t1=%+v", calls[0])
+	}
+	if calls[1].Function.Name != "echo" {
+		t.Fatalf("t2=%+v", calls[1])
+	}
+	// 完整 JSON object 校验通过
+	m := Manager{}
+	if !m.canResolve(calls, map[string]string{"get_weather": "get_weather", "echo": "echo"}) {
+		t.Fatal("resolve should pass")
+	}
+}
+
+// canResolve 用 resolveToolCalls 的参数校验逻辑验证聚合结果。
+func (m *Manager) canResolve(calls []provider.ToolCall, aliases map[string]string) bool {
+	for _, c := range calls {
+		if !isValidArgsObject(c.Function.Arguments) {
+			return false
+		}
+		if _, ok := aliases[c.Function.Name]; !ok {
+			return false
+		}
+	}
+	return true
 }

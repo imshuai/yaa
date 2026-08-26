@@ -149,10 +149,10 @@ func (m *Manager) runDirectTurn(
 		if rounds == 0 && m.deps.Memory != nil {
 			policy := m.resolveMemoryPolicy(a)
 			results, merr := m.deps.Memory.Search(ctx, policy, mm.SearchRequest{
-				Scope: mm.Scope{AgentID: a.id, SessionID: req.SessionID, Layer: mm.LayerLongTerm},
-				Query:           req.Content,
-				Limit:           0,
-				IncludeGlobal:   true,
+				Scope:         mm.Scope{AgentID: a.id, SessionID: req.SessionID, Layer: mm.LayerLongTerm},
+				Query:         req.Content,
+				Limit:         0,
+				IncludeGlobal: true,
 			})
 			if merr != nil {
 				if !errors.Is(merr, mm.ErrMemoryDisabled) {
@@ -302,7 +302,7 @@ func (m *Manager) runDirectTurn(
 			batch = append(batch, session.AppendInput{
 				Message: provider.Message{
 					Role:       "tool",
-					Name:        calls[i].Function.Name, // canonical name (docs/tool/context.md §8.1)
+					Name:       calls[i].Function.Name, // canonical name (docs/tool/context.md §8.1)
 					ToolCallID: calls[i].ID,
 					Content:    r.Content,
 				},
@@ -475,8 +475,8 @@ func (m *Manager) callStream(
 		out.Content += d.Content
 		out.ReasoningContent += d.ReasoningContent
 		out.Refusal += d.Refusal
-		if len(d.ToolCalls) > 0 {
-			out.ToolCalls = append(out.ToolCalls, d.ToolCalls...)
+		for _, tc := range d.ToolCalls {
+			out.ToolCalls = mergeToolCallFragment(out.ToolCalls, tc)
 		}
 		if emit != nil {
 			if d.ReasoningContent != "" {
@@ -494,6 +494,32 @@ func (m *Manager) callStream(
 		out.Role = "assistant"
 	}
 	return out, usage, nil
+}
+
+// mergeToolCallFragment 按 ToolCall.ID 聚合流式增量：同名首见 Name 保留，
+// Arguments 追加拼接。provider 流式协议（OpenAI index 分片 / Claude input_json_delta）
+// 会把一次调用的 arguments 拆成多个 fragment，必须合并后才是完整 JSON object。
+func mergeToolCallFragment(calls []provider.ToolCall, tc provider.ToolCall) []provider.ToolCall {
+	if tc.ID != "" {
+		for i := range calls {
+			if calls[i].ID == tc.ID {
+				if calls[i].Function.Name == "" {
+					calls[i].Function.Name = tc.Function.Name
+				}
+				calls[i].Function.Arguments += tc.Function.Arguments
+				return calls
+			}
+		}
+	} else if len(calls) > 0 {
+		// 无 ID 的尾随 fragment 归并到最后一个 call（OpenAI 兜底 ID 缺失场景）。
+		i := len(calls) - 1
+		if calls[i].Function.Name == "" {
+			calls[i].Function.Name = tc.Function.Name
+		}
+		calls[i].Function.Arguments += tc.Function.Arguments
+		return calls
+	}
+	return append(calls, tc)
 }
 
 // pickNonEmpty 若 b 非空则返回 b，否则返回 a。用于累积 role。

@@ -181,6 +181,10 @@ func (r *retryingProvider) StreamChat(ctx context.Context, req *ChatRequest) (<-
 						}
 						break // 进入下一次 attempt。
 					}
+					if callCtx.Err() != nil {
+						out <- ChatChunk{Error: finalErr(chunk.Error)}
+						return
+					}
 					out <- chunk
 					return
 				}

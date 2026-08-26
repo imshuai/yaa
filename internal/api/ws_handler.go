@@ -15,9 +15,7 @@ import (
 	"github.com/imshuai/yaa/internal/session"
 )
 
-// wsMaxOutstanding 限制同一 WS 连接同 Session 内的同时在途 turn 数。
-// 文档：每个连接最多一个运行中 turn，其余由 Session FIFO 排队。
-// 我们按 turn 跟踪，使用 map 让 cancel 路径也能定位 HandleTurn 调用。
+// turns 按 turnID 跟踪在途 turn，cancel 路径据此定位 HandleTurn 的 ctx。
 const (
 	wsReadLimit = 1 << 20 // 1 MiB
 	wsWriteWait = 10 * time.Second
@@ -208,17 +206,14 @@ func (w *wsConn) handleMessage(parent context.Context, f wsClientFrame) {
 		return
 	}
 
-	// 先做 turnID 重复检查，再创建 ctx 和注册 cancel 句柄。
+	// turnID 重复检查与注册必须在同一临界区, 避免并发同 ID frame 互相覆盖 cancel.
 	w.turnsMu.Lock()
 	if _, dup := w.turns[f.TurnID]; dup {
 		w.turnsMu.Unlock()
 		w.sendError(f.TurnID, "40001", "turn id already used")
 		return
 	}
-	w.turnsMu.Unlock()
-
 	turnCtx, cancel := context.WithCancel(parent)
-	w.turnsMu.Lock()
 	w.turns[f.TurnID] = cancel
 	w.turnsMu.Unlock()
 	defer func() {

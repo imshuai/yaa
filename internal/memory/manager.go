@@ -597,19 +597,23 @@ func (m *Manager) putIndex(ctx context.Context, stored MemoryItem, victims []Mem
 		return IndexDegraded
 	}
 	ai.mu.Lock()
-	if ai.index != nil {
-		if uerr := ai.index.Upsert(ctx, ItemRef{AgentID: stored.AgentID, SessionID: stored.SessionID, Layer: stored.Layer, Key: stored.Key, Version: stored.Version}, vec); uerr != nil {
-			ai.status = IndexDegraded
-			ai.mu.Unlock()
-			m.emit(Event{Type: EventDegraded, AgentID: stored.AgentID, At: time.Now(), Reason: "index_upsert"})
-			m.degradedSet("index", 1)
-			return IndexDegraded
-		}
-		// 删除 victims 的 index refs（失败只 emit degraded，不影响 content 已提交）。
-		// 在 ai.mu 内访问 ai.index, 避免与 Reindex 的 swap 竞争。
-		for _, v := range victims {
-			_ = ai.index.Delete(ctx, ItemRef{AgentID: v.AgentID, SessionID: v.SessionID, Layer: v.Layer, Key: v.Key, Version: v.Version})
-		}
+	if ai.index == nil {
+		// indexFactory 未注入: 无法维护索引, 如实返回 degraded 而非 ready.
+		ai.status = IndexDegraded
+		ai.mu.Unlock()
+		m.degradedSet("index", 1)
+		return IndexDegraded
+	}
+	if uerr := ai.index.Upsert(ctx, ItemRef{AgentID: stored.AgentID, SessionID: stored.SessionID, Layer: stored.Layer, Key: stored.Key, Version: stored.Version}, vec); uerr != nil {
+		ai.status = IndexDegraded
+		ai.mu.Unlock()
+		m.emit(Event{Type: EventDegraded, AgentID: stored.AgentID, At: time.Now(), Reason: "index_upsert"})
+		m.degradedSet("index", 1)
+		return IndexDegraded
+	}
+	// 删除 victims 的 index refs（失败只 emit degraded，不影响 content 已提交）。
+	for _, v := range victims {
+		_ = ai.index.Delete(ctx, ItemRef{AgentID: v.AgentID, SessionID: v.SessionID, Layer: v.Layer, Key: v.Key, Version: v.Version})
 	}
 	ai.mu.Unlock()
 	return IndexReady
@@ -691,9 +695,9 @@ func (m *Manager) Health(ctx context.Context) Health {
 	}
 	// 2. Embedder 检查: 仅当 embedder != nil. embedder 没有 Ping 接口, 用 Dimension 做 sanity 检查
 	//   (runtime 成功调用 Embed 时会 markDegraded; 此处只反映 embedder 存在性).
-	var embedderOK *bool
+	var embedderOK *bool // nil = vector 未启用 (N/A), 不参与 degraded 判定.
 	if m.embedder != nil {
-		// embedder 可用性由 markDegraded("embedder") 反映 — ponies: 暂以非 nil 判定 ok
+		// embedder 可用性由 markDegraded("embedder") 反映; 此处仅反映注入存在性.
 		ok := true
 		embedderOK = &ok
 	}
@@ -841,13 +845,16 @@ func (m *Manager) keywordSearch(ctx context.Context, req SearchRequest, limit in
 
 func (m *Manager) vectorSearch(ctx context.Context, req SearchRequest, limit int, policy config.MemoryPolicy) ([]SearchResult, error) {
 	ai := m.getOrCreateIndexState(req.Scope.AgentID, policy, false)
-	if ai == nil || ai.index == nil {
+	if ai == nil {
 		return nil, ErrMemoryIndexUnavailable
 	}
 	ai.mu.RLock()
 	status := ai.status
 	idx := ai.index
 	ai.mu.RUnlock()
+	if idx == nil {
+		return nil, ErrMemoryIndexUnavailable
+	}
 	if status == IndexDegraded {
 		return nil, ErrMemoryIndexDegraded
 	}

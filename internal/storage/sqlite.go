@@ -232,6 +232,9 @@ func (s *SQLiteStorage) Keys(prefix string) ([]string, error) {
 func (s *SQLiteStorage) Close() error {
 	var firstErr error
 	s.closeOnce.Do(func() {
+		// 与 Backup/Set/Delete/cleanup 互斥: 等在途写完成后才置 closed 并关 DB.
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
 		s.closed.Store(true) // 置位在 close(stop) 之前, 让并发方法快速拒绝
 		close(s.stop)
 		<-s.done
